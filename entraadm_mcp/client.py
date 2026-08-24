@@ -104,6 +104,24 @@ def _translate_permission_error(body: dict) -> str:
     return f"{code or 'permission denied'}: {message}"
 
 
+def _parse_retry_after(value: str | None) -> float:
+    """Parse a Retry-After header value into a delay in seconds.
+
+    RFC 9110 permits either a delay-seconds integer or an HTTP-date; Graph
+    is documented to send only the former, but a defensively-written client
+    doesn't crash if that ever changes. An unparsable value degrades to a
+    modest fixed backoff rather than raising -- a ValueError here would
+    escape as a bare exception, the same class of bug as an uncaught
+    httpx.RequestError.
+    """
+    if value is None:
+        return 1.0
+    try:
+        return float(value)
+    except ValueError:
+        return 1.0
+
+
 class GraphClient:
     """Thin Microsoft Graph client: token handling, paging, permission translation.
 
@@ -142,8 +160,17 @@ class GraphClient:
 
     def _request(self, method: str, url: str, params: dict | None = None) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._access_token()}"}
-        resp = None
-        for attempt in range(3):
+        # Independent budgets per failure kind, not one shared attempt
+        # counter: a network error (or a 5xx) consuming an early "attempt"
+        # must not leave a *later* 429 unretried -- each kind gets its own
+        # guarantee ("429 retried once", "5xx retried twice") regardless of
+        # what happened before it on this call. Termination is still
+        # guaranteed: every branch either returns/raises or spends from a
+        # budget that monotonically decreases to zero.
+        network_retries_left = 2
+        server_retries_left = 2
+        retried_429 = False
+        while True:
             try:
                 resp = self._http.request(method, url, params=params, headers=headers)
             except httpx.RequestError as e:
@@ -151,19 +178,20 @@ class GraphClient:
                 # without this it would propagate as a bare httpx exception --
                 # none of the GraphError family a tool's except clause
                 # catches, crashing the tool call instead of degrading it.
-                if attempt < 2:
-                    time.sleep(2**attempt)
+                if network_retries_left > 0:
+                    time.sleep(2 ** (2 - network_retries_left))
+                    network_retries_left -= 1
                     continue
                 raise GraphError(f"Graph request failed: network error ({type(e).__name__})") from e
-            if resp.status_code == 429 and attempt == 0:
-                retry_after = float(resp.headers.get("Retry-After", "1"))
-                time.sleep(retry_after)
+            if resp.status_code == 429 and not retried_429:
+                retried_429 = True
+                time.sleep(_parse_retry_after(resp.headers.get("Retry-After")))
                 continue
-            if resp.status_code >= 500 and attempt < 2:
-                time.sleep(2**attempt)
+            if resp.status_code >= 500 and server_retries_left > 0:
+                time.sleep(2 ** (2 - server_retries_left))
+                server_retries_left -= 1
                 continue
             return resp
-        return resp
 
     def get(self, path: str, params: dict | None = None) -> dict:
         """GET a single Graph resource (no paging). ``path`` is relative to the v1.0 root, e.g. "/users"."""

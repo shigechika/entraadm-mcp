@@ -57,7 +57,7 @@ class FakeGraphClient:
         return response
 
     def get_paged(self, path, params=None, max_pages=5):
-        self.calls.append(("get_paged", path, params))
+        self.calls.append(("get_paged", path, params, max_pages))
         response = self._paged_responses.get(path, self._paged_responses.get("*"))
         if isinstance(response, Exception):
             raise response
@@ -162,18 +162,46 @@ def test_health_check_is_degraded_when_graph_ok_but_signin_probe_fails(inject):
     assert result["signin_probe"]["auth"] == "error"
 
 
-def test_health_check_is_error_when_graph_unreachable(inject):
-    inject(FakeGraphClient(check_result={"auth": "error", "detail": "network unreachable"}))
+def test_health_check_is_degraded_when_graph_fails_but_signin_probe_succeeds(inject):
+    # The bug this guards: health_check must not fabricate signin_probe's
+    # result from graph's failure. If AuditLog.Read.All is granted before
+    # the baseline User.Read.All (an unusual but real staged-permission
+    # rollout), Graph is demonstrably reachable -- signin_probe proves it --
+    # so this must not report "graph unreachable" for signin_probe, nor an
+    # overall "error" status.
+    inject(
+        FakeGraphClient(
+            check_result={"auth": "error", "detail": "insufficient privileges: ..."},
+            signin_probe_result={"auth": "ok", "detail": None},
+        )
+    )
+    result = server.health_check()
+    assert result["status"] == "degraded"
+    assert result["graph"]["auth"] == "error"
+    assert result["signin_probe"] == {"auth": "ok", "detail": None}
+
+
+def test_health_check_is_error_when_both_probes_fail(inject):
+    inject(
+        FakeGraphClient(
+            check_result={"auth": "error", "detail": "network unreachable"},
+            signin_probe_result={"auth": "error", "detail": "network unreachable"},
+        )
+    )
     result = server.health_check()
     assert result["status"] == "error"
-    assert result["signin_probe"]["auth"] == "error"
 
 
 def test_health_check_shape_is_identical_across_all_statuses(inject):
     healthy = server.health_check()
     inject(FakeGraphClient(signin_probe_result={"auth": "error", "detail": "x"}))
     degraded = server.health_check()
-    inject(FakeGraphClient(check_result={"auth": "error", "detail": "y"}))
+    inject(
+        FakeGraphClient(
+            check_result={"auth": "error", "detail": "y"},
+            signin_probe_result={"auth": "error", "detail": "y"},
+        )
+    )
     errored = server.health_check()
     for result in (healthy, degraded, errored):
         assert set(result.keys()) == {"service", "version", "status", "auth_mode", "graph", "signin_probe"}
@@ -258,6 +286,19 @@ def test_get_user_falls_back_to_raw_sku_id_when_subscribedskus_fails(inject):
 
     result = server.get_user("user@example.edu")
     assert result["licenses"] == ["sku-1"]  # best-effort fallback, not a crash
+
+
+def test_get_user_license_lookup_honors_max_pages_default_env(inject, monkeypatch):
+    monkeypatch.setenv("ENTRAADM_MAX_PAGES_DEFAULT", "17")
+    client = inject(
+        FakeGraphClient(
+            get_responses={"/users": {"value": [_user_row()]}},
+            paged_responses={"/subscribedSkus": ([], False)},
+        )
+    )
+    server.get_user("user@example.edu")
+    paged_calls = [c for c in client.calls if c[0] == "get_paged"]
+    assert paged_calls[0][3] == 17  # not the hardcoded 5 this used to bypass the env with
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +407,26 @@ def test_signin_logs_capped_true_when_top_is_hit_mid_page_with_no_nextlink(injec
     assert result["capped"] is True
 
 
+def test_signin_logs_capped_false_when_trailing_rows_would_not_have_matched(inject):
+    # Reaching `top` mid-page must not by itself force capped=true: if the
+    # remaining, unread rows in that same page would never have matched the
+    # result filter anyway (they're successes, and result="failure"), the
+    # scan genuinely was complete. Over-reporting capped here would make a
+    # correct, exhaustive answer look untrustworthy.
+    page = {
+        "value": [
+            _signin_row(),  # failure, matches
+            _signin_row(),  # failure, matches
+            _signin_row(),  # failure, matches -- top=3 reached here
+            _signin_row(status={"errorCode": 0}),  # success, would not match
+        ]
+    }
+    inject(FakeGraphClient(get_responses={"/auditLogs/signIns": page}))
+    result = server.signin_logs("user@example.edu", top=3, max_pages=5)
+    assert result["count"] == 3
+    assert result["capped"] is False
+
+
 def test_signin_logs_hours_are_clamped(inject):
     inject(FakeGraphClient(get_responses={"/auditLogs/signIns": {"value": []}}))
     result = server.signin_logs("user@example.edu", hours=999999)
@@ -375,6 +436,17 @@ def test_signin_logs_hours_are_clamped(inject):
 # ---------------------------------------------------------------------------
 # signin_failure_stats
 # ---------------------------------------------------------------------------
+
+
+def test_signin_failure_stats_distinct_failing_users_is_not_truncated_to_top_10(inject):
+    # distinct_failing_users must reflect the full Counter, not len() of the
+    # most_common(10)-truncated top_failing_users list -- otherwise a
+    # 15-user incident silently reports "10 users affected".
+    rows = [_signin_row(userPrincipalName=f"user{i}@example.edu") for i in range(15)]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_failure_stats()
+    assert result["distinct_failing_users"] == 15
+    assert len(result["top_failing_users"]) == 10
 
 
 def test_signin_failure_stats_flags_a_spray_suspect(inject):
@@ -469,6 +541,19 @@ def test_directory_audits_top_truncation_sets_capped(inject):
 # ---------------------------------------------------------------------------
 # get_user_auth_methods
 # ---------------------------------------------------------------------------
+
+
+def test_get_user_auth_methods_honors_max_pages_default_env(inject, monkeypatch):
+    monkeypatch.setenv("ENTRAADM_MAX_PAGES_DEFAULT", "23")
+    client = inject(
+        FakeGraphClient(
+            get_responses={"/users": {"value": [_user_row()]}},
+            paged_responses={"*": ([], False)},
+        )
+    )
+    server.get_user_auth_methods("user@example.edu")
+    paged_calls = [c for c in client.calls if c[0] == "get_paged"]
+    assert paged_calls[0][3] == 23  # not get_paged's own hardcoded default of 5
 
 
 def test_get_user_auth_methods_mfa_registered_true_with_non_password_method(inject):

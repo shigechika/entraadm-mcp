@@ -18,6 +18,7 @@ from entraadm_mcp.client import (
     GraphClient,
     GraphError,
     GraphPermissionError,
+    _parse_retry_after,
     odata_quote,
     validate_upn,
 )
@@ -82,6 +83,18 @@ def test_validate_upn_accepts_a_normal_address():
 def test_validate_upn_rejects_non_upn_shapes(value):
     with pytest.raises(GraphError, match="is not a user principal name"):
         validate_upn(value)
+
+
+def test_parse_retry_after_accepts_delay_seconds():
+    assert _parse_retry_after("5") == 5.0
+
+
+def test_parse_retry_after_falls_back_on_http_date_form():
+    assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") == 1.0
+
+
+def test_parse_retry_after_falls_back_when_header_absent():
+    assert _parse_retry_after(None) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +324,42 @@ def test_network_error_recovers_on_retry(monkeypatch):
     monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda s: None)
     route = respx.get(f"{GRAPH_BASE}/organization")
     route.side_effect = [httpx.ReadTimeout("timed out"), httpx.Response(200, json={"ok": True})]
+    client, _cred = _client(monkeypatch=monkeypatch)
+    assert client.get("/organization") == {"ok": True}
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_429_is_still_retried_after_an_earlier_network_error(monkeypatch):
+    # Regression: a shared attempt counter across failure kinds meant a
+    # network error on attempt 0 left a 429 on attempt 1 unretried, since
+    # the old check was "attempt == 0" rather than "haven't retried a 429
+    # yet". Each failure kind must get its own independent budget.
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda s: None)
+    route = respx.get(f"{GRAPH_BASE}/organization")
+    route.side_effect = [
+        httpx.ConnectError("connection refused"),
+        httpx.Response(429, headers={"Retry-After": "1"}),
+        httpx.Response(200, json={"ok": True}),
+    ]
+    client, _cred = _client(monkeypatch=monkeypatch)
+    assert client.get("/organization") == {"ok": True}
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_retry_after_falls_back_to_a_default_delay_when_not_numeric(monkeypatch):
+    # RFC 9110 also permits an HTTP-date form for Retry-After. Graph is
+    # documented to send only delay-seconds, but a non-numeric value must
+    # degrade to a fixed backoff instead of raising ValueError -- which
+    # would escape as a bare exception, same class of bug as an uncaught
+    # httpx.RequestError.
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda s: None)
+    route = respx.get(f"{GRAPH_BASE}/organization")
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+        httpx.Response(200, json={"ok": True}),
+    ]
     client, _cred = _client(monkeypatch=monkeypatch)
     assert client.get("/organization") == {"ok": True}
     assert route.call_count == 2

@@ -159,10 +159,14 @@ def health_check() -> dict:
     with ``$top=1`` -- needs only ``User.Read.All``, the minimum permission
     every deployment of this server needs anyway). ``signin_probe`` additionally confirms the current
     credential can read sign-in logs -- the permission every other tool here
-    except ``get_user`` depends on. A tenant where the credential has Graph
-    access but not AuditLog.Read.All (app-only) or the Reports Reader
-    directory role (azure-cli) reports ``status: "degraded"``: the server is
-    up, but most tools will return a permission error.
+    except ``get_user`` depends on. Both probes always run, independently of
+    each other: a tenant that has AuditLog.Read.All but not (yet) the
+    baseline User.Read.All would otherwise have this report "Graph
+    unreachable" -- a fabricated diagnosis, since Graph plainly *is*
+    reachable if the other probe succeeds. ``status`` is derived from the
+    two outcomes: ``healthy`` when both succeed, ``degraded`` when exactly
+    one does (Graph is reachable but some permission is missing), ``error``
+    only when neither does.
 
     Read-only. Always returns the same keys regardless of outcome (``detail``
     is null on success, a translated message on failure), so a caller never
@@ -182,18 +186,10 @@ def health_check() -> dict:
         }
 
     graph = client.check()
-    if graph["auth"] != "ok":
-        return {
-            "service": "entraadm-mcp",
-            "version": __version__,
-            "status": "error",
-            "auth_mode": client.mode,
-            "graph": graph,
-            "signin_probe": {"auth": "error", "detail": "graph unreachable"},
-        }
-
     signin_probe = client.probe_signin_access()
-    status = "healthy" if signin_probe["auth"] == "ok" else "degraded"
+    ok_count = sum(1 for probe in (graph, signin_probe) if probe["auth"] == "ok")
+    status = "healthy" if ok_count == 2 else "degraded" if ok_count == 1 else "error"
+
     return {
         "service": "entraadm-mcp",
         "version": __version__,
@@ -233,7 +229,7 @@ def _resolve_license_names(client: GraphClient, sku_ids: list[str]) -> list[str]
     unresolved = [s for s in sku_ids if s not in _license_cache]
     if unresolved:
         try:
-            skus, _capped = client.get_paged("/subscribedSkus", max_pages=5)
+            skus, _capped = client.get_paged("/subscribedSkus", max_pages=_resolve_max_pages(None))
         except GraphError:
             # Best effort: license names are a convenience, not the point of
             # get_user. Unresolved ids fall back to the raw id below.
@@ -341,6 +337,13 @@ def _error_code_of(row: dict) -> Any:
     return (row.get("status") or {}).get("errorCode")
 
 
+def _row_matches(row: dict, result: str) -> bool:
+    if result == "all":
+        return True
+    is_failure = _error_code_of(row) not in (0, None)
+    return is_failure if result == "failure" else not is_failure
+
+
 def _signin_entry(s: dict) -> dict:
     status = s.get("status") or {}
     device = s.get("deviceDetail") or {}
@@ -426,23 +429,25 @@ def signin_logs(
         "$orderby": "createdDateTime desc",
     }
     pages = 0
-    # Set when `top` is reached mid-page (see the `break` below) -- a page
-    # already in hand can hold more matching rows than `top` even when Graph
-    # never offers a next page, and `url is not None` alone misses that case.
+    # Set when `top` is reached mid-page AND at least one further row in
+    # that same already-fetched page also matches the filter -- a page can
+    # hold more matching rows than `top` even when Graph never offers a
+    # next page, so `url is not None` alone misses that case. Checking
+    # `rows[i:]` costs nothing extra (already in memory) and avoids the
+    # opposite mistake: marking capped=true just because trailing rows were
+    # left unread, when none of them would have matched anyway.
     truncated_within_page = False
     try:
         while url is not None and pages < pages_budget and len(matched) < top:
             body = client.get(url, params=query)
-            for row in body.get("value", []):
+            rows = body.get("value", [])
+            for i, row in enumerate(rows):
                 if len(matched) >= top:
-                    truncated_within_page = True
+                    if any(_row_matches(r, result) for r in rows[i:]):
+                        truncated_within_page = True
                     break
-                is_failure = _error_code_of(row) not in (0, None)
-                if result == "failure" and not is_failure:
-                    continue
-                if result == "success" and is_failure:
-                    continue
-                matched.append(_signin_entry(row))
+                if _row_matches(row, result):
+                    matched.append(_signin_entry(row))
             url = body.get("@odata.nextLink")
             query = None  # nextLink already carries the full query string
             pages += 1
@@ -558,6 +563,12 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
         "window_hours": hours,
         "capped": capped,
         "total_failures": sum(error_counts.values()),
+        # len(user_counts), not len(top_failing_users): the latter is
+        # truncated to most_common(10), which would silently cap this count
+        # at 10 regardless of how many distinct users actually failed --
+        # understating incident/spray blast radius in the one field a
+        # morning triage skim reads first.
+        "distinct_failing_users": len(user_counts),
         "top_error_codes": top_error_codes,
         "top_failing_users": top_failing_users,
         "top_apps": top_apps,
@@ -737,7 +748,9 @@ def get_user_auth_methods(upn: str) -> dict:
         return {"found": False, "user_principal_name": upn}
 
     try:
-        methods, capped = client.get_paged(f"/users/{user_id}/authentication/methods")
+        methods, capped = client.get_paged(
+            f"/users/{user_id}/authentication/methods", max_pages=_resolve_max_pages(None)
+        )
     except GraphPermissionError as e:
         return {"error": str(e), "missing_permission": "UserAuthenticationMethod.Read.All"}
     except GraphError as e:
@@ -784,7 +797,7 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
     else:
         summary = {
             "sign_in_failures": stats["total_failures"],
-            "distinct_failing_users": len(stats["top_failing_users"]),
+            "distinct_failing_users": stats["distinct_failing_users"],
             "top_error_codes": stats["top_error_codes"][:5],
             "spray_suspects": stats["spray_suspects"],
             "capped": stats["capped"],
