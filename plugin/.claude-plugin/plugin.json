@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "entraadm-mcp",
+  "displayName": "entraadm-mcp",
+  "description": "Microsoft Entra ID sign-in and audit-log triage MCP for Claude Code. Investigate why a sign-in failed (AADSTS-annotated), tenant-wide failure trends and password-spray suspects, who changed what in the directory, and whether MFA is registered for an account, plus a one-shot daily_brief. Read-only — no write calls anywhere in this package. Needs either app-only credentials (ENTRAADM_TENANT_ID/_CLIENT_ID/_CLIENT_SECRET) or an existing `az login` session already present on the machine; the plugin cannot create or supply those for you.",
+  "author": {
+    "name": "AIKAWA Shigechika",
+    "url": "https://github.com/shigechika"
+  },
+  "homepage": "https://shigechika.github.io/entraadm-mcp/",
+  "repository": "https://github.com/shigechika/entraadm-mcp",
+  "license": "MIT",
+  "keywords": [
+    "microsoft-entra-id",
+    "azure-ad",
+    "microsoft-graph",
+    "sign-in-logs",
+    "audit",
+    "security"
+  ]
+}
