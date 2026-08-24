@@ -287,6 +287,35 @@ def test_5xx_gives_up_after_three_attempts(monkeypatch):
     assert route.call_count == 3
 
 
+@respx.mock
+def test_network_error_is_retried_then_raises_grapherror(monkeypatch):
+    # httpx.RequestError (DNS failure, connection refused, timeout) is
+    # raised by the transport before any httpx.Response exists, so it never
+    # reaches _parse() -- without a dedicated catch here it would propagate
+    # as a bare httpx exception past every tool's `except GraphError`.
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda s: None)
+    route = respx.get(f"{GRAPH_BASE}/organization")
+    route.side_effect = [
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectError("connection refused"),
+    ]
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(GraphError, match="network error"):
+        client.get("/organization")
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_network_error_recovers_on_retry(monkeypatch):
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda s: None)
+    route = respx.get(f"{GRAPH_BASE}/organization")
+    route.side_effect = [httpx.ReadTimeout("timed out"), httpx.Response(200, json={"ok": True})]
+    client, _cred = _client(monkeypatch=monkeypatch)
+    assert client.get("/organization") == {"ok": True}
+    assert route.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # check() / probe_signin_access()
 # ---------------------------------------------------------------------------
@@ -294,18 +323,31 @@ def test_5xx_gives_up_after_three_attempts(monkeypatch):
 
 @respx.mock
 def test_check_reports_ok(monkeypatch):
-    respx.get(f"{GRAPH_BASE}/organization").mock(return_value=httpx.Response(200, json={"value": []}))
+    respx.get(f"{GRAPH_BASE}/users").mock(return_value=httpx.Response(200, json={"value": []}))
     client, _cred = _client(monkeypatch=monkeypatch)
     assert client.check() == {"auth": "ok", "detail": None}
 
 
 @respx.mock
 def test_check_reports_detail_on_failure(monkeypatch):
-    respx.get(f"{GRAPH_BASE}/organization").mock(return_value=httpx.Response(401, json={}))
+    respx.get(f"{GRAPH_BASE}/users").mock(return_value=httpx.Response(401, json={}))
     client, _cred = _client(monkeypatch=monkeypatch)
     result = client.check()
     assert result["auth"] == "error"
     assert result["detail"]
+
+
+@respx.mock
+def test_check_only_needs_user_read_all_not_organization_read_all(monkeypatch):
+    # A deployment holding exactly the documented minimum permissions
+    # (User.Read.All) must pass this probe -- Organization.Read.All is a
+    # different, undocumented permission and must never be required here.
+    respx.get(f"{GRAPH_BASE}/organization").mock(
+        return_value=httpx.Response(403, json={"error": {"code": "Authorization_RequestDenied"}})
+    )
+    respx.get(f"{GRAPH_BASE}/users").mock(return_value=httpx.Response(200, json={"value": []}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    assert client.check() == {"auth": "ok", "detail": None}
 
 
 @respx.mock

@@ -8,7 +8,7 @@ from entraadm_mcp import __version__
 
 
 def _check() -> int:
-    """Config + auth + Graph smoke test. Exit 0 = organization endpoint reachable."""
+    """Config + auth + Graph smoke test. Exit 0 = Graph reachable."""
     from entraadm_mcp.client import GraphClient
     from entraadm_mcp.config import AuthConfig, ConfigError
 
@@ -23,7 +23,7 @@ def _check() -> int:
     if graph.get("auth") != "ok":
         print(f"Error: Graph unreachable — {graph.get('detail')}")
         return 1
-    print("OK: Graph reachable (/organization)")
+    print("OK: Graph reachable")
     signin = client.probe_signin_access()
     if signin.get("auth") == "ok":
         print("OK: sign-in log access confirmed")

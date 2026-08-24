@@ -144,7 +144,17 @@ class GraphClient:
         headers = {"Authorization": f"Bearer {self._access_token()}"}
         resp = None
         for attempt in range(3):
-            resp = self._http.request(method, url, params=params, headers=headers)
+            try:
+                resp = self._http.request(method, url, params=params, headers=headers)
+            except httpx.RequestError as e:
+                # A connection/DNS/timeout failure never reaches _parse(), so
+                # without this it would propagate as a bare httpx exception --
+                # none of the GraphError family a tool's except clause
+                # catches, crashing the tool call instead of degrading it.
+                if attempt < 2:
+                    time.sleep(2**attempt)
+                    continue
+                raise GraphError(f"Graph request failed: network error ({type(e).__name__})") from e
             if resp.status_code == 429 and attempt == 0:
                 retry_after = float(resp.headers.get("Retry-After", "1"))
                 time.sleep(retry_after)
@@ -182,9 +192,19 @@ class GraphClient:
         return items, capped
 
     def check(self) -> dict:
-        """Cheapest possible Graph round-trip, for health_check's `graph` probe. Not permission-sensitive."""
+        """Cheapest possible Graph round-trip, for health_check's `graph` probe.
+
+        Deliberately ``GET /users`` (not ``/organization``): every deployment
+        of this server needs ``User.Read.All`` regardless of auth mode (it's
+        the permission ``get_user`` itself needs), so this probe only
+        requires what the documented minimum permissions already grant.
+        ``/organization`` looks equally cheap but needs the undocumented
+        ``Organization.Read.All`` -- an app-only registration holding exactly
+        the permissions this README lists would fail that probe and report
+        ``status: "error"`` even though every tool actually works.
+        """
         try:
-            self.get("/organization", params={"$select": "id"})
+            self.get("/users", params={"$top": 1, "$select": "id"})
         except GraphError as e:
             return {"auth": "error", "detail": str(e)}
         return {"auth": "ok", "detail": None}

@@ -30,7 +30,7 @@ page cap for the log-scanning tools when a tool call doesn't pass
 
 No parameters. Returns `{service, version, status, auth_mode, graph,
 signin_probe}`. `graph` probes basic Graph reachability
-(`GET /organization`); `signin_probe` additionally checks sign-in log
+(`GET /users` with `$top=1` -- needs only `User.Read.All`); `signin_probe` additionally checks sign-in log
 access. `status` is `"healthy"` when both succeed, `"degraded"` when Graph
 is reachable but sign-in log access is not, `"error"` when Graph itself is
 unreachable or auth is misconfigured. `graph`/`signin_probe` are each

@@ -155,9 +155,9 @@ def _resolve_user_id(client: GraphClient, upn: str) -> str | None:
 def health_check() -> dict:
     """Fleet-standard health probe: service/version/status plus two independent Graph probes.
 
-    ``graph`` confirms Microsoft Graph is reachable at all (``GET
-    /organization``, a permission-agnostic endpoint any authenticated
-    identity can read). ``signin_probe`` additionally confirms the current
+    ``graph`` confirms Microsoft Graph is reachable at all (``GET /users``
+    with ``$top=1`` -- needs only ``User.Read.All``, the minimum permission
+    every deployment of this server needs anyway). ``signin_probe`` additionally confirms the current
     credential can read sign-in logs -- the permission every other tool here
     except ``get_user`` depends on. A tenant where the credential has Graph
     access but not AuditLog.Read.All (app-only) or the Reports Reader
@@ -426,11 +426,16 @@ def signin_logs(
         "$orderby": "createdDateTime desc",
     }
     pages = 0
+    # Set when `top` is reached mid-page (see the `break` below) -- a page
+    # already in hand can hold more matching rows than `top` even when Graph
+    # never offers a next page, and `url is not None` alone misses that case.
+    truncated_within_page = False
     try:
         while url is not None and pages < pages_budget and len(matched) < top:
             body = client.get(url, params=query)
             for row in body.get("value", []):
                 if len(matched) >= top:
+                    truncated_within_page = True
                     break
                 is_failure = _error_code_of(row) not in (0, None)
                 if result == "failure" and not is_failure:
@@ -450,7 +455,7 @@ def signin_logs(
         "window_hours": hours,
         "result_filter": result,
         "count": len(matched),
-        "capped": url is not None,
+        "capped": url is not None or truncated_within_page,
         "events": matched,
     }
 

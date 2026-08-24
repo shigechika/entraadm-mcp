@@ -28,7 +28,7 @@ app-only 用3変数のうち1つか2つだけの設定は、起動時に設定�
 ### `health_check()`
 
 引数なし。`{service, version, status, auth_mode, graph, signin_probe}` を返す。
-`graph` は基本的な Graph 到達性（`GET /organization`）を、`signin_probe` は
+`graph` は基本的な Graph 到達性（`GET /users`、`$top=1` — `User.Read.All` のみで通る）を、`signin_probe` は
 サインインログ読み取り可否を追加でプローブする。`status` は両方成功で
 `"healthy"`、Graph到達可だがサインインログ読み取り不可で `"degraded"`、
 Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`signin_probe` は

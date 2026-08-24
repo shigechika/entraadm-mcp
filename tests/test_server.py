@@ -354,6 +354,18 @@ def test_signin_logs_capped_false_when_window_fully_scanned(inject):
     assert result["capped"] is False
 
 
+def test_signin_logs_capped_true_when_top_is_hit_mid_page_with_no_nextlink(inject):
+    # A single page with no @odata.nextLink still needs capped=true if it
+    # holds more matching rows than `top` -- Graph already handed over the
+    # extra rows, but the loop stopped reading them once `top` was reached,
+    # so "the whole window was scanned" would be a false claim.
+    page = {"value": [_signin_row() for _ in range(5)]}  # no @odata.nextLink at all
+    inject(FakeGraphClient(get_responses={"/auditLogs/signIns": page}))
+    result = server.signin_logs("user@example.edu", top=3, max_pages=5)
+    assert result["count"] == 3
+    assert result["capped"] is True
+
+
 def test_signin_logs_hours_are_clamped(inject):
     inject(FakeGraphClient(get_responses={"/auditLogs/signIns": {"value": []}}))
     result = server.signin_logs("user@example.edu", hours=999999)
