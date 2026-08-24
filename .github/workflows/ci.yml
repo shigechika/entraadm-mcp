@@ -1,0 +1,70 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Kept as a matrix key (even though runs-on is now hardcoded below) so
+        # this job keeps reporting as "test (ubuntu-latest, 3.1X)" -- the exact
+        # string the branch ruleset requires. Dropping it would rename the
+        # check and re-trigger the same required-status-check breakage this
+        # PR just fixed for the Windows leg.
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv python install ${{ matrix.python-version }}
+      - run: uv sync --dev --python ${{ matrix.python-version }}
+      - run: uv run pytest -v
+
+  # Separate job (not folded into the `test` matrix) so this check's name
+  # never changes: `uv python install`/`uv sync --python` don't understand
+  # setup-python's "3.x" x-ranges syntax, so the actual interpreter version
+  # has to be resolved by actions/setup-python first and handed to uv as a
+  # concrete value. If that resolved value leaked into this job's name
+  # (matrix-style), bumping the underlying Python each cycle would silently
+  # break the required status check binding in the branch ruleset.
+  #
+  # Guards against stdio newline regressions
+  # (cf. modelcontextprotocol/python-sdk#2433) -- platform-level, not
+  # version-specific, so tracking the current stable release here is enough.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - id: pyver
+        shell: bash
+        run: echo "v=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --dev --python ${{ steps.pyver.outputs.v }}
+      - run: uv run pytest -v

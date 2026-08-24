@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entraadm-mcp"
+dynamic = ["version"]
+description = "MCP server for Microsoft Entra ID sign-in and audit-log triage (read-only)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    {name = "AIKAWA Shigechika"},
+]
+keywords = ["entra-id", "azure-ad", "microsoft-graph", "mcp", "model-context-protocol", "security", "audit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+dependencies = [
+    "mcp>=1.2,<2",
+    "azure-identity>=1.17",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+entraadm-mcp = "entraadm_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/shigechika/entraadm-mcp"
+Repository = "https://github.com/shigechika/entraadm-mcp"
+Issues = "https://github.com/shigechika/entraadm-mcp/issues"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "respx",
+    "ruff",
+]
+
+[tool.setuptools]
+packages = ["entraadm_mcp"]
+
+[tool.setuptools.dynamic]
+version = {attr = "entraadm_mcp.__version__"}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+# The smoke-test engine is shared verbatim with the other servers that use this
+# harness and is formatted at a narrower width there. Reformatting it here would
+# make every future sync produce a spurious diff and invite the copies to drift
+# apart, so it is excluded from *formatting* only -- `ruff check` does not consult
+# this list, so its lint rules still apply.
+format.exclude = ["scripts/smoke_harness.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

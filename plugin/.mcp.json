@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "entraadm-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["entraadm-mcp"],
+      "env": {
+        "ENTRAADM_TENANT_ID": "${ENTRAADM_TENANT_ID:-}",
+        "ENTRAADM_CLIENT_ID": "${ENTRAADM_CLIENT_ID:-}",
+        "ENTRAADM_CLIENT_SECRET": "${ENTRAADM_CLIENT_SECRET:-}"
+      }
+    }
+  }
+}

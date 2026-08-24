@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    ignore:
+      # The mcp <2 pin is deliberate: SDK 2.0 is a breaking rewrite that took
+      # down every server in this fleet when it shipped. Major bumps are a
+      # manual migration, not a dependency update.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"

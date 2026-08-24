@@ -1,0 +1,98 @@
+name: release
+
+# Fires when release-please publishes the GitHub Release after its release PR is
+# merged. release-please creates the tag/Release via a PAT (see release-please.yml)
+# so the release.published event propagates here — the default GITHUB_TOKEN cannot
+# trigger downstream workflows. The released commit was already tested by ci.yml on
+# its way into main, so this pipeline only verifies, builds and publishes.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Fail loudly if the version files disagree with the tag (e.g. a hand-cut
+      # tag, or a release-please updater that silently missed a file) rather than
+      # shipping a mismatched version to PyPI / the MCP Registry.
+      - name: Verify versions match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          init=$(grep -E '^__version__' entraadm_mcp/__init__.py | cut -d'"' -f2)
+          sver=$(jq -r '.version' server.json)
+          pver=$(jq -r '.packages[0].version' server.json)
+          echo "tag=$tag __init__=$init server.json=$sver packages[0]=$pver"
+          if [ "$init" != "$tag" ] || [ "$sver" != "$tag" ] || [ "$pver" != "$tag" ]; then
+            echo "::error::version mismatch (tag=$tag __init__=$init server.json=$sver packages[0]=$pver)"
+            exit 1
+          fi
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  publish:
+    needs: testpypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  mcp-registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # mcp-publisher login github-oidc
+      contents: read    # actions/checkout (a job-level permissions block drops the default, so re-grant it)
+    steps:
+      - uses: actions/checkout@v7
+      # server.json is already at the released version on the tagged commit
+      # (release-please updates it in the release PR; the verify job guards it).
+      - name: Install mcp-publisher
+        run: |
+          curl -sL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz | tar xz
+          sudo mv mcp-publisher /usr/local/bin/
+      - name: Publish to MCP Registry
+        run: |
+          mcp-publisher login github-oidc
+          mcp-publisher publish
