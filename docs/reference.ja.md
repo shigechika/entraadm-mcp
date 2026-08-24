@@ -40,6 +40,9 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 最終パスワード変更日時、オンプレ同期状態、解決済みライセンス名、
 （`AuditLog.Read.All`／Reports Reader が利用可能なら）`sign_in_activity`。
 存在しないアカウントはエラーではなく `{"found": false, "user_principal_name": upn}` を返す。
+`licenses_capped: true` は、このアカウント自身のライセンスを解決する前に SKU カタログの
+走査が打ち切られた場合にのみ現れる——このキーがある場合、`licenses` の一部は
+解決済みの名前ではなく生の skuId のまま。
 
 ### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None)`
 

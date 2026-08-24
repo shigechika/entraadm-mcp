@@ -43,6 +43,10 @@ password-change timestamps, on-premises sync status, resolved license
 names, and (if `AuditLog.Read.All`/Reports Reader is available)
 `sign_in_activity`. A nonexistent account returns
 `{"found": false, "user_principal_name": upn}` rather than an error.
+`licenses_capped: true` appears only when the SKU catalog scan was cut
+short before resolving one of this account's own licenses -- when
+present, one or more `licenses` entries is a raw skuId rather than a
+friendly name.
 
 ### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None)`
 

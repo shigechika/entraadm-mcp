@@ -301,6 +301,37 @@ def test_get_user_license_lookup_honors_max_pages_default_env(inject, monkeypatc
     assert paged_calls[0][3] == 17  # not the hardcoded 5 this used to bypass the env with
 
 
+def test_get_user_flags_licenses_capped_when_scan_cut_short_before_own_sku(inject):
+    # A low ENTRAADM_MAX_PAGES_DEFAULT (set to bound the cost of scanning
+    # sign-in/audit logs) has nothing to do with the size of the tenant's
+    # SKU catalog. If /subscribedSkus is capped before this user's own
+    # license shows up, `licenses` silently falls back to a raw skuId --
+    # that must be flagged, not presented as if it were a resolved name.
+    inject(
+        FakeGraphClient(
+            get_responses={"/users": {"value": [_user_row(assignedLicenses=[{"skuId": "sku-never-fetched"}])]}},
+            paged_responses={"/subscribedSkus": ([{"skuId": "sku-1", "skuPartNumber": "ENTERPRISEPACK"}], True)},
+        )
+    )
+    result = server.get_user("user@example.edu")
+    assert result["licenses"] == ["sku-never-fetched"]
+    assert result["licenses_capped"] is True
+
+
+def test_get_user_does_not_flag_licenses_capped_when_scan_covered_everything_needed(inject):
+    # The scan being capped is not itself the problem -- only a capped scan
+    # that left one of *this user's* licenses unresolved is.
+    inject(
+        FakeGraphClient(
+            get_responses={"/users": {"value": [_user_row(assignedLicenses=[{"skuId": "sku-1"}])]}},
+            paged_responses={"/subscribedSkus": ([{"skuId": "sku-1", "skuPartNumber": "ENTERPRISEPACK"}], True)},
+        )
+    )
+    result = server.get_user("user@example.edu")
+    assert result["licenses"] == ["ENTERPRISEPACK"]
+    assert "licenses_capped" not in result
+
+
 # ---------------------------------------------------------------------------
 # signin_logs
 # ---------------------------------------------------------------------------

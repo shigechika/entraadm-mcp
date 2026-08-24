@@ -225,11 +225,24 @@ _USER_SELECT = ",".join(
 _license_cache: dict[str, str] = {}
 
 
-def _resolve_license_names(client: GraphClient, sku_ids: list[str]) -> list[str]:
+def _resolve_license_names(client: GraphClient, sku_ids: list[str]) -> tuple[list[str], bool]:
+    """Resolve skuIds to skuPartNumbers, reporting whether any requested id is still unresolved due to a capped scan.
+
+    ``ENTRAADM_MAX_PAGES_DEFAULT`` is honored here like every other paged
+    call (consistency), but a low value set to bound log-scanning cost has
+    nothing to do with the size of the tenant's SKU catalog -- a capped
+    ``/subscribedSkus`` fetch must not silently show a raw GUID in place of
+    a license name with no indication anything was cut short. The returned
+    bool is True only when the fetch was actually capped *and* at least one
+    of the caller's own ``sku_ids`` is still unresolved after it -- a capped
+    scan that happened to cover everything the caller needed is not
+    misleading and shouldn't be flagged.
+    """
     unresolved = [s for s in sku_ids if s not in _license_cache]
+    fetch_capped = False
     if unresolved:
         try:
-            skus, _capped = client.get_paged("/subscribedSkus", max_pages=_resolve_max_pages(None))
+            skus, fetch_capped = client.get_paged("/subscribedSkus", max_pages=_resolve_max_pages(None))
         except GraphError:
             # Best effort: license names are a convenience, not the point of
             # get_user. Unresolved ids fall back to the raw id below.
@@ -238,11 +251,12 @@ def _resolve_license_names(client: GraphClient, sku_ids: list[str]) -> list[str]
             sku_id = sku.get("skuId")
             if sku_id:
                 _license_cache[sku_id] = sku.get("skuPartNumber", sku_id)
-    return [_license_cache.get(s, s) for s in sku_ids]
+    still_unresolved = any(s not in _license_cache for s in sku_ids)
+    return [_license_cache.get(s, s) for s in sku_ids], fetch_capped and still_unresolved
 
 
-def _user_entry(u: dict, license_names: list[str]) -> dict:
-    return {
+def _user_entry(u: dict, license_names: list[str], licenses_capped: bool) -> dict:
+    entry = {
         "found": True,
         "id": u.get("id"),
         "display_name": u.get("displayName"),
@@ -255,6 +269,12 @@ def _user_entry(u: dict, license_names: list[str]) -> dict:
         "on_premises_last_sync_date_time": u.get("onPremisesLastSyncDateTime"),
         "licenses": license_names,
     }
+    if licenses_capped:
+        # Present only when true: a raw skuId slipped into `licenses` above
+        # because the tenant's SKU catalog scan was capped before this
+        # user's license(s) could be resolved to a friendly name.
+        entry["licenses_capped"] = True
+    return entry
 
 
 @mcp.tool()
@@ -269,6 +289,12 @@ def get_user(upn: str) -> dict:
     ``on_premises_sync_enabled=true`` means this account is synced from an
     on-premises directory (Entra Connect) -- Entra is a downstream copy of
     its password via Password Hash Sync, not the source of truth.
+    ``licenses`` names are resolved from the tenant's SKU catalog
+    (``/subscribedSkus``, page budget from ``ENTRAADM_MAX_PAGES_DEFAULT``);
+    ``licenses_capped: true`` appears only when that scan was cut short
+    before resolving one of this account's own licenses -- when present,
+    one or more ``licenses`` entries is a raw skuId rather than a friendly
+    name.
 
     ``sign_in_activity`` needs an additional Graph read (AuditLog.Read.All
     application permission, or -- for azure-cli auth -- the Reports Reader
@@ -300,8 +326,8 @@ def get_user(upn: str) -> dict:
         return {"found": False, "user_principal_name": upn}
 
     sku_ids = [lic.get("skuId") for lic in user.get("assignedLicenses") or [] if lic.get("skuId")]
-    license_names = _resolve_license_names(client, sku_ids)
-    entry = _user_entry(user, license_names)
+    license_names, licenses_capped = _resolve_license_names(client, sku_ids)
+    entry = _user_entry(user, license_names, licenses_capped)
 
     try:
         activity = _find_user(client, upn, "signInActivity")
