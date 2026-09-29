@@ -250,7 +250,7 @@ def test_no_tenant_specific_literals_in_specs():
     )
 
 
-def test_in_process_result_decodes_to_plain_data_on_the_installed_sdk():
+def test_in_process_result_decodes_to_plain_data_on_the_installed_sdk(monkeypatch):
     """The live smoke run decodes whatever this SDK's in-process call_tool returns.
 
     mcp 1.x hands back content blocks; mcp 2.x hands back a CallToolResult (with
@@ -259,6 +259,10 @@ def test_in_process_result_decodes_to_plain_data_on_the_installed_sdk():
     daily smoke run.
     """
     import smoke_test  # noqa: E402 - needs the sys.path line above
+
+    # health_check must not reach a real backend from a developer machine.
+    for name in ["ENTRAADM_TENANT_ID", "ENTRAADM_CLIENT_ID", "ENTRAADM_CLIENT_SECRET"]:
+        monkeypatch.delenv(name, raising=False)
 
     raw = asyncio.run(mcp.call_tool("health_check", {}))
     decoded = smoke_test._decode(raw)

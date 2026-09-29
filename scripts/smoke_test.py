@@ -51,10 +51,10 @@ from smoke_harness import (  # noqa: E402 - needs the sys.path line above
 def _decode(result: Any) -> Any:
     """Normalise an MCP tool result into plain Python data.
 
-    ``mcp.server.fastmcp`` hands back ``(content_blocks, structured_result)``
-    when it converts a result, and bare content blocks otherwise; the
-    standalone FastMCP client used by --stdio hands back a ``CallToolResult``.
-    Everything downstream expects a str/dict/list, so unwrap all three here
+    mcp 2.x's in-process ``MCPServer.call_tool`` and the standalone client used
+    by --stdio both hand back a ``CallToolResult``; the other shapes below are
+    what older SDKs returned (content blocks, or ``(content_blocks, structured)``).
+    Everything downstream expects a str/dict/list, so unwrap them all here
     rather than teaching the engine about SDK shapes.
     """
     # --stdio: the standalone client returns a CallToolResult object rather
