@@ -7,12 +7,12 @@
     "url": "https://github.com/shigechika/entraadm-mcp",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "1.0.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "entraadm-mcp",
-      "version": "0.2.0",
+      "version": "1.0.0",
       "transport": {
         "type": "stdio"
       }
