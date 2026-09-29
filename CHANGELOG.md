@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/shigechika/entraadm-mcp/compare/v1.0.0...v1.0.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* report a tool exception message to the model on mcp 2.x ([#8](https://github.com/shigechika/entraadm-mcp/issues/8)) ([9eeeedd](https://github.com/shigechika/entraadm-mcp/commit/9eeeedd4554370226290ce07c03e03c9a316d198))
+
 ## [1.0.0](https://github.com/shigechika/entraadm-mcp/compare/v0.2.0...v1.0.0) (2026-09-29)
 
 
