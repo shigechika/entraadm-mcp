@@ -86,3 +86,6 @@ def test_deadline_seconds_default_and_overrides():
     assert deadline_seconds({"ENTRAADM_DEADLINE": "-1"}) is None
     assert deadline_seconds({"ENTRAADM_DEADLINE": "abc"}) == DEFAULT_DEADLINE_SECONDS
     assert deadline_seconds({"ENTRAADM_DEADLINE": ""}) == DEFAULT_DEADLINE_SECONDS
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "nan"}) == DEFAULT_DEADLINE_SECONDS
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "inf"}) == DEFAULT_DEADLINE_SECONDS
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "-inf"}) == DEFAULT_DEADLINE_SECONDS

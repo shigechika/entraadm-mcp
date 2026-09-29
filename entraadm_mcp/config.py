@@ -8,6 +8,7 @@ one app registration; everything else has a safe default.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -100,4 +101,6 @@ def deadline_seconds(env: dict | None = None) -> float | None:
         value = float(raw)
     except ValueError:
         return DEFAULT_DEADLINE_SECONDS
+    if not math.isfinite(value):
+        return DEFAULT_DEADLINE_SECONDS  # nan / inf must not silently disable the budget
     return value if value > 0 else None

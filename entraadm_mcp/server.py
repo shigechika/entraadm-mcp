@@ -31,8 +31,8 @@ from mcp.server.fastmcp import FastMCP
 
 from entraadm_mcp import __version__
 from entraadm_mcp.client import (
-    GraphDeadline,
     GraphClient,
+    GraphDeadline,
     GraphError,
     GraphPermissionError,
     odata_quote,

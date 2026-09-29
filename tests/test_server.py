@@ -402,7 +402,10 @@ def test_signin_logs_stops_paging_once_top_is_reached(inject):
     page2 = {"value": [_signin_row() for _ in range(3)]}
     responses = iter([page1, page2])
     client = FakeGraphClient()
-    client.get = lambda path, params=None, deadline=None: (client.calls.append(("get", path, params)), next(responses))[1]
+    client.get = lambda path, params=None, deadline=None: (
+        client.calls.append(("get", path, params)),
+        next(responses),
+    )[1]
     inject(client)
 
     result = server.signin_logs("user@example.edu", top=2, max_pages=5)

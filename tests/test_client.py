@@ -484,3 +484,29 @@ def test_no_deadline_keeps_the_default_timeout(monkeypatch):
     monkeypatch.setattr(client._http, "request", spy)
     client.get("/users")
     assert seen["has_timeout"] is False
+
+
+@respx.mock
+def test_request_timeout_has_no_one_second_floor(monkeypatch):
+    import time
+
+    route = respx.get(f"{GRAPH_BASE}/users").mock(return_value=httpx.Response(200, json={"value": []}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    client.get("/users", deadline=time.monotonic() + 0.3)
+    assert route.calls.last.request.extensions["timeout"]["read"] <= 0.3
+
+
+@respx.mock
+def test_deadline_passed_during_token_acquisition_is_partial(monkeypatch):
+    import time
+
+    class SlowCredential:
+        def get_token(self, *scopes, **kwargs):
+            time.sleep(0.3)  # a cold token that eats the budget
+            return AccessToken("tok", 10_000_000_000)
+
+    route = respx.get(f"{GRAPH_BASE}/auditLogs/signIns").mock(return_value=httpx.Response(200, json={"value": []}))
+    client, _cred = _client(credential=SlowCredential(), monkeypatch=monkeypatch)
+    items, capped = client.get_paged("/auditLogs/signIns", deadline=time.monotonic() + 0.1)
+    assert items == [] and capped is True
+    assert route.call_count == 0

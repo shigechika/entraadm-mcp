@@ -166,6 +166,10 @@ class GraphClient:
         self, method: str, url: str, params: dict | None = None, deadline: float | None = None
     ) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._access_token()}"}
+        # Token acquisition (azure-identity, synchronous) cannot itself be bounded: a
+        # cold token that blocks past the deadline is noticed here, before any request.
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise GraphDeadline("deadline passed while obtaining the access token")
         # Independent budgets per failure kind, not one shared attempt
         # counter: a network error (or a 5xx) consuming an early "attempt"
         # must not leave a *later* 429 unretried -- each kind gets its own
@@ -182,7 +186,7 @@ class GraphClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise GraphDeadline("deadline passed before the request could start")
-                timeout = min(30.0, max(remaining, 1.0))
+                timeout = min(30.0, max(remaining, 0.05))  # httpx needs a positive value
             try:
                 if timeout is None:
                     resp = self._http.request(method, url, params=params, headers=headers)
