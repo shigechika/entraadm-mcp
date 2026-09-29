@@ -31,6 +31,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from entraadm_mcp import __version__
+from entraadm_mcp import __version__ as _version
 from entraadm_mcp.client import (
     GraphClient,
     GraphDeadline,
@@ -47,8 +48,6 @@ from entraadm_mcp.config import (
     deadline_seconds,
     max_pages_default,
 )
-
-from entraadm_mcp import __version__ as _version
 
 mcp = MCPServer("entraadm-mcp", version=_version)
 
