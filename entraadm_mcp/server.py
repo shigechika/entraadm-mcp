@@ -28,7 +28,7 @@ import re
 import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from entraadm_mcp import __version__
 from entraadm_mcp.client import (
@@ -48,7 +48,7 @@ from entraadm_mcp.config import (
     max_pages_default,
 )
 
-mcp = FastMCP("entraadm-mcp")
+mcp = MCPServer("entraadm-mcp", version=__version__)
 
 #: Injection point for tests: monkeypatch.setitem(server._state, "client", FakeGraphClient(...)).
 _state: dict[str, Any] = {"client": None}
