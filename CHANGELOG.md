@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/shigechika/entraadm-mcp/compare/v0.2.0...v1.0.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* require mcp 2.x (MCPServer) and drop 1.x support ([#6](https://github.com/shigechika/entraadm-mcp/issues/6))
+
+### Features
+
+* require mcp 2.x (MCPServer) and drop 1.x support ([#6](https://github.com/shigechika/entraadm-mcp/issues/6)) ([b8bf5a9](https://github.com/shigechika/entraadm-mcp/commit/b8bf5a9d3a29635670e4ea302dbe9c63668db4dd))
+
 ## [0.2.0](https://github.com/shigechika/entraadm-mcp/compare/v0.1.0...v0.2.0) (2026-09-29)
 
 
