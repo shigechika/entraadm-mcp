@@ -222,9 +222,11 @@ class GraphClient:
         with self._http.stream(method, url, params=params, headers=headers, timeout=timeout) as resp:
             chunks = []
             for chunk in resp.iter_raw():
-                chunks.append(chunk)
+                # Checked before taking the next chunk: a body that has just finished
+                # arriving is kept even if it ended a little past the deadline.
                 if time.monotonic() >= deadline:
                     raise GraphDeadline("deadline passed while reading the response")
+                chunks.append(chunk)
             return httpx.Response(
                 resp.status_code, headers=resp.headers, content=b"".join(chunks), request=resp.request
             )

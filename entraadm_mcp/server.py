@@ -887,8 +887,11 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
 
     token = _CALL_DEADLINE.set(_new_deadline())
     try:
-        stats = signin_failure_stats(hours=hours, max_pages=max_pages)
+        # The audit log is the small, fast scan and the sign-in scan is the one that can use
+        # the whole budget, so audits run first: a slow sign-in scan cannot leave the audit
+        # section starting with an expired budget and reporting an empty list.
         audits = directory_audits(hours=hours, max_pages=max_pages)
+        stats = signin_failure_stats(hours=hours, max_pages=max_pages)
     finally:
         _CALL_DEADLINE.reset(token)
 

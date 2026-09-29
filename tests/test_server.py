@@ -767,3 +767,18 @@ def test_get_user_and_auth_methods_share_one_deadline_per_call(inject, monkeypat
     server.get_user_auth_methods("user@example.edu")
     deadlines = {d for _, d in seen}
     assert len(seen) >= 2 and None not in deadlines and len(deadlines) == 1
+
+
+def test_daily_brief_runs_the_audit_scan_before_the_signin_scan(inject):
+    order = []
+    client = FakeGraphClient()
+    orig = client.get_paged
+
+    def get_paged(path, params=None, max_pages=5, deadline=None):
+        order.append(path)
+        return orig(path, params, max_pages)
+
+    client.get_paged = get_paged
+    inject(client)
+    server.daily_brief(hours=1)
+    assert order == ["/auditLogs/directoryAudits", "/auditLogs/signIns"]
