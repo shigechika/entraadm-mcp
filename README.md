@@ -95,8 +95,12 @@ Or leave all three unset and run `az login` first for local development.
 Optional:
 
 ```bash
-# Default page cap for the log-scanning tools (1-50, default 5).
-export ENTRAADM_MAX_PAGES_DEFAULT=5
+# Default page cap for the log-scanning tools (1-50, default 50).
+export ENTRAADM_MAX_PAGES_DEFAULT=50
+# Wall-clock budget per tool call in seconds (default 45; 0 disables). A hosted MCP
+# client cuts a call off at about 60 s, so a scan stops at the budget and returns
+# what it has with capped=true.
+export ENTRAADM_DEADLINE=45
 ```
 
 ## Usage

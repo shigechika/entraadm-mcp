@@ -86,8 +86,10 @@ export ENTRAADM_CLIENT_SECRET=your-client-secret
 任意:
 
 ```bash
-# ログ走査系ツールのページ上限の既定値（1-50、既定 5）
-export ENTRAADM_MAX_PAGES_DEFAULT=5
+# ログ走査系ツールのページ上限の既定値（1-50、既定 50）
+export ENTRAADM_MAX_PAGES_DEFAULT=50
+# 1 回のツール呼び出しの持ち時間（秒、既定 45、0 で無効）。ホスト型クライアントは約 60 秒で打ち切る
+export ENTRAADM_DEADLINE=45
 ```
 
 ## 使い方

@@ -12,8 +12,14 @@
 app-only 用3変数のうち1つか2つだけの設定は、起動時に設定エラーとなる
 （黙って別モードへフォールバックしない）。
 
-任意: `ENTRAADM_MAX_PAGES_DEFAULT`（1-50、既定 5）は、ツール呼び出しで
+任意: `ENTRAADM_MAX_PAGES_DEFAULT`（1-50、既定 50）は、ツール呼び出しで
 `max_pages` を明示しなかった場合のログ走査系ツールのページ上限既定値。
+
+任意: `ENTRAADM_DEADLINE`（秒、既定 45、`0` で無効）は、1 回のツール呼び出しの
+持ち時間。ホスト型の MCP クライアントは約 60 秒で呼び出しを打ち切るので，走査は
+この時間で止まり，1 回の要求のタイムアウトも残り時間で切り，それまでに取れた分を
+`capped=true` で返す。`daily_brief` は 2 つの節で 1 つの持ち時間を共有する。
+`directory_audits` は `category`（例: `UserManagement`）で Graph 側の絞り込みもできる。
 
 ### 必要な Graph 権限
 
