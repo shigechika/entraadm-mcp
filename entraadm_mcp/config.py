@@ -14,7 +14,8 @@ from dataclasses import dataclass
 #: Env vars that together select app-only auth. All three or none -- see AuthConfig.from_env.
 _APP_ONLY_VARS = ("ENTRAADM_TENANT_ID", "ENTRAADM_CLIENT_ID", "ENTRAADM_CLIENT_SECRET")
 
-DEFAULT_MAX_PAGES = 5
+DEFAULT_MAX_PAGES = 50
+DEFAULT_DEADLINE_SECONDS = 45.0
 MIN_MAX_PAGES = 1
 MAX_MAX_PAGES = 50
 
@@ -81,3 +82,22 @@ def max_pages_default(env: dict | None = None) -> int:
     except ValueError:
         return DEFAULT_MAX_PAGES
     return max(MIN_MAX_PAGES, min(MAX_MAX_PAGES, value))
+
+
+def deadline_seconds(env: dict | None = None) -> float | None:
+    """Per-call wall-clock budget from ENTRAADM_DEADLINE (default 45 s).
+
+    A hosted MCP client cuts a tool call off at about 60 s, so a paged scan stops
+    at this budget and returns what it has (``capped=true``). ``0`` or a negative
+    value disables the budget (page count only); a non-numeric value falls back to
+    the default.
+    """
+    e = os.environ if env is None else env
+    raw = e.get("ENTRAADM_DEADLINE")
+    if raw is None or raw == "":
+        return DEFAULT_DEADLINE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_DEADLINE_SECONDS
+    return value if value > 0 else None

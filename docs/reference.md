@@ -12,9 +12,16 @@ Two modes, selected by which environment variables are set:
 Setting one or two of the three app-only variables raises a configuration
 error at startup rather than silently falling back to a different mode.
 
-Optional: `ENTRAADM_MAX_PAGES_DEFAULT` (1-50, default 5) sets the default
+Optional: `ENTRAADM_MAX_PAGES_DEFAULT` (1-50, default 50) sets the default
 page cap for the log-scanning tools when a tool call doesn't pass
 `max_pages` explicitly.
+
+Optional: `ENTRAADM_DEADLINE` (seconds, default 45; `0` disables) is the
+wall-clock budget of one tool call. A hosted MCP client cuts a call off at
+about 60 s, so a scan stops at the budget, each request's timeout is capped at
+the time left, and the pages fetched so far come back with `capped=true`.
+`daily_brief` shares one budget between its two sections. `directory_audits`
+also takes `category` (for example `UserManagement`) to filter on the Graph side.
 
 ### Required Graph permissions
 

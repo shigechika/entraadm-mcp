@@ -47,7 +47,7 @@ class FakeGraphClient:
         self.mode = mode
         self.calls = []
 
-    def get(self, path, params=None):
+    def get(self, path, params=None, deadline=None):
         self.calls.append(("get", path, params))
         response = self._get_responses.get(path, self._get_responses.get("*"))
         if isinstance(response, Exception):
@@ -56,7 +56,7 @@ class FakeGraphClient:
             return {"value": []}
         return response
 
-    def get_paged(self, path, params=None, max_pages=5):
+    def get_paged(self, path, params=None, max_pages=5, deadline=None):
         self.calls.append(("get_paged", path, params, max_pages))
         response = self._paged_responses.get(path, self._paged_responses.get("*"))
         if isinstance(response, Exception):
@@ -234,7 +234,7 @@ def test_get_user_projects_lifecycle_fields(inject):
 def test_get_user_degrades_sign_in_activity_without_reports_role(inject):
     client = FakeGraphClient()
 
-    def get(path, params=None):
+    def get(path, params=None, deadline=None):
         client.calls.append(("get", path, params))
         select = (params or {}).get("$select", "")
         if select == "signInActivity":
@@ -273,11 +273,11 @@ def test_get_user_rejects_invalid_upn(inject):
 def test_get_user_falls_back_to_raw_sku_id_when_subscribedskus_fails(inject):
     client = FakeGraphClient()
 
-    def get(path, params=None):
+    def get(path, params=None, deadline=None):
         client.calls.append(("get", path, params))
         return {"value": [_user_row()]}
 
-    def get_paged(path, params=None, max_pages=5):
+    def get_paged(path, params=None, max_pages=5, deadline=None):
         raise GraphError("boom")
 
     client.get = get
@@ -402,7 +402,7 @@ def test_signin_logs_stops_paging_once_top_is_reached(inject):
     page2 = {"value": [_signin_row() for _ in range(3)]}
     responses = iter([page1, page2])
     client = FakeGraphClient()
-    client.get = lambda path, params=None: (client.calls.append(("get", path, params)), next(responses))[1]
+    client.get = lambda path, params=None, deadline=None: (client.calls.append(("get", path, params)), next(responses))[1]
     inject(client)
 
     result = server.signin_logs("user@example.edu", top=2, max_pages=5)
@@ -694,3 +694,52 @@ def test_daily_brief_capped_is_the_or_of_both_sections(inject):
     )
     result = server.daily_brief()
     assert result["summary"]["capped"] is True
+
+
+# --- deadline and category -------------------------------------------------
+
+
+def test_directory_audits_category_filter_goes_server_side(inject):
+    client = FakeGraphClient()
+    inject(client)
+    server.directory_audits(hours=72, category="UserManagement")
+    paged = [c for c in client.calls if c[0] == "get_paged"][0]
+    assert "and category eq 'UserManagement'" in paged[2]["$filter"]
+
+
+def test_directory_audits_rejects_odd_category(inject):
+    inject(FakeGraphClient())
+    result = server.directory_audits(category="x' or 1 eq 1 or category eq '")
+    assert "error" in result
+
+
+def test_daily_brief_shares_one_deadline_between_sections(inject, monkeypatch):
+    seen = []
+    client = FakeGraphClient()
+    orig = client.get_paged
+
+    def get_paged(path, params=None, max_pages=5, deadline=None):
+        seen.append(deadline)
+        return orig(path, params, max_pages)
+
+    client.get_paged = get_paged
+    inject(client)
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "30")
+    server.daily_brief(hours=1)
+    assert len(seen) == 2 and seen[0] is not None and seen[0] == seen[1]
+
+
+def test_deadline_disabled_by_zero(inject, monkeypatch):
+    seen = []
+    client = FakeGraphClient()
+    orig = client.get_paged
+
+    def get_paged(path, params=None, max_pages=5, deadline=None):
+        seen.append(deadline)
+        return orig(path, params, max_pages)
+
+    client.get_paged = get_paged
+    inject(client)
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "0")
+    server.signin_failure_stats(hours=1)
+    assert seen == [None]

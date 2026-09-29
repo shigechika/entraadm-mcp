@@ -75,3 +75,14 @@ def test_max_pages_default_falls_back_on_non_integer():
     # A typo in the env degrades to the safe default instead of crashing the
     # whole server at startup.
     assert max_pages_default({"ENTRAADM_MAX_PAGES_DEFAULT": "not-a-number"}) == DEFAULT_MAX_PAGES
+
+
+def test_deadline_seconds_default_and_overrides():
+    from entraadm_mcp.config import DEFAULT_DEADLINE_SECONDS, deadline_seconds
+
+    assert deadline_seconds({}) == DEFAULT_DEADLINE_SECONDS == 45.0
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "20"}) == 20.0
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "0"}) is None
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "-1"}) is None
+    assert deadline_seconds({"ENTRAADM_DEADLINE": "abc"}) == DEFAULT_DEADLINE_SECONDS
+    assert deadline_seconds({"ENTRAADM_DEADLINE": ""}) == DEFAULT_DEADLINE_SECONDS

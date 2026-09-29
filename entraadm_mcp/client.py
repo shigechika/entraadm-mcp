@@ -31,6 +31,10 @@ class GraphError(Exception):
     """Base error for anything that goes wrong talking to Microsoft Graph."""
 
 
+class GraphDeadline(GraphError):
+    """The caller's wall-clock budget ran out before a request could finish."""
+
+
 class GraphAuthError(GraphError):
     """The credential could not produce a usable access token, or Graph rejected it outright."""
 
@@ -158,7 +162,9 @@ class GraphClient:
         self._token_expires_at = token.expires_on
         return self._token
 
-    def _request(self, method: str, url: str, params: dict | None = None) -> httpx.Response:
+    def _request(
+        self, method: str, url: str, params: dict | None = None, deadline: float | None = None
+    ) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._access_token()}"}
         # Independent budgets per failure kind, not one shared attempt
         # counter: a network error (or a 5xx) consuming an early "attempt"
@@ -171,46 +177,75 @@ class GraphClient:
         server_retries_left = 2
         retried_429 = False
         while True:
+            timeout: float | None = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GraphDeadline("deadline passed before the request could start")
+                timeout = min(30.0, max(remaining, 1.0))
             try:
-                resp = self._http.request(method, url, params=params, headers=headers)
+                if timeout is None:
+                    resp = self._http.request(method, url, params=params, headers=headers)
+                else:
+                    resp = self._http.request(method, url, params=params, headers=headers, timeout=timeout)
             except httpx.RequestError as e:
                 # A connection/DNS/timeout failure never reaches _parse(), so
                 # without this it would propagate as a bare httpx exception --
                 # none of the GraphError family a tool's except clause
                 # catches, crashing the tool call instead of degrading it.
                 if network_retries_left > 0:
-                    time.sleep(2 ** (2 - network_retries_left))
+                    self._sleep_within(2 ** (2 - network_retries_left), deadline)
                     network_retries_left -= 1
                     continue
                 raise GraphError(f"Graph request failed: network error ({type(e).__name__})") from e
             if resp.status_code == 429 and not retried_429:
                 retried_429 = True
-                time.sleep(_parse_retry_after(resp.headers.get("Retry-After")))
+                self._sleep_within(_parse_retry_after(resp.headers.get("Retry-After")), deadline)
                 continue
             if resp.status_code >= 500 and server_retries_left > 0:
-                time.sleep(2 ** (2 - server_retries_left))
+                self._sleep_within(2 ** (2 - server_retries_left), deadline)
                 server_retries_left -= 1
                 continue
             return resp
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    @staticmethod
+    def _sleep_within(seconds: float, deadline: float | None) -> None:
+        """Sleep, or raise GraphDeadline when the wait would end past ``deadline``."""
+        if deadline is not None and time.monotonic() + seconds >= deadline:
+            raise GraphDeadline("deadline reached while waiting to retry")
+        time.sleep(seconds)
+
+    def get(self, path: str, params: dict | None = None, deadline: float | None = None) -> dict:
         """GET a single Graph resource (no paging). ``path`` is relative to the v1.0 root, e.g. "/users"."""
-        resp = self._request("GET", path, params=params)
+        resp = self._request("GET", path, params=params, deadline=deadline)
         return self._parse(resp)
 
-    def get_paged(self, path: str, params: dict | None = None, max_pages: int = DEFAULT_MAX_PAGES) -> tuple[list, bool]:
+    def get_paged(
+        self,
+        path: str,
+        params: dict | None = None,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        deadline: float | None = None,
+    ) -> tuple[list, bool]:
         """GET a Graph collection, following ``@odata.nextLink`` up to ``max_pages``.
 
         Returns ``(items, capped)`` where ``capped`` is True iff a nextLink
         still existed when the page budget ran out -- callers must surface
         this so a partial scan is never reported as if it were exhaustive.
+
+        ``deadline`` is an absolute ``time.monotonic()`` timestamp. When it passes
+        (between pages, or while a request or its retry wait is in flight) the pages
+        fetched so far are returned with ``capped=True``.
         """
         items: list = []
         url: str | None = path
         query = params
         pages = 0
         while url is not None and pages < max_pages:
-            resp = self._request("GET", url, params=query)
+            try:
+                resp = self._request("GET", url, params=query, deadline=deadline)
+            except GraphDeadline:
+                return items, True
             body = self._parse(resp)
             items.extend(body.get("value", []))
             url = body.get("@odata.nextLink")

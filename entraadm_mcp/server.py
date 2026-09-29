@@ -21,14 +21,17 @@ failure degrades only the section that hit it (``{"error": ...,
 from __future__ import annotations
 
 import collections
+import contextvars
 import datetime
 import re
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from entraadm_mcp import __version__
 from entraadm_mcp.client import (
+    GraphDeadline,
     GraphClient,
     GraphError,
     GraphPermissionError,
@@ -40,6 +43,7 @@ from entraadm_mcp.config import (
     MIN_MAX_PAGES,
     AuthConfig,
     ConfigError,
+    deadline_seconds,
     max_pages_default,
 )
 
@@ -96,6 +100,22 @@ def _resolve_max_pages(max_pages: int | None) -> int:
     if max_pages is None:
         return max_pages_default()
     return max(MIN_MAX_PAGES, min(MAX_MAX_PAGES, max_pages))
+
+
+# One wall-clock budget per tool call. daily_brief sets it once so its two
+# sections share it instead of each taking the full budget.
+_CALL_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar("entraadm_deadline", default=None)
+
+
+def _new_deadline() -> float | None:
+    secs = deadline_seconds()
+    return None if secs is None else time.monotonic() + secs
+
+
+def _current_deadline() -> float | None:
+    """The budget set by an enclosing daily_brief, else a fresh one for this call."""
+    inherited = _CALL_DEADLINE.get()
+    return inherited if inherited is not None else _new_deadline()
 
 
 def _since(hours: int) -> str:
@@ -463,9 +483,13 @@ def signin_logs(
     # opposite mistake: marking capped=true just because trailing rows were
     # left unread, when none of them would have matched anyway.
     truncated_within_page = False
+    deadline = _current_deadline()
     try:
         while url is not None and pages < pages_budget and len(matched) < top:
-            body = client.get(url, params=query)
+            try:
+                body = client.get(url, params=query, deadline=deadline)
+            except GraphDeadline:
+                break
             rows = body.get("value", [])
             for i, row in enumerate(rows):
                 if len(matched) >= top:
@@ -502,6 +526,10 @@ _STATS_SELECT = ",".join(["createdDateTime", "userPrincipalName", "appDisplayNam
 def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
     """Tenant-wide sign-in failure aggregation -- the Entra ID counterpart to the RADIUS failure patrol.
 
+    Time-bounded (ENTRAADM_DEADLINE, default 45 s): on a wide window or a busy day the scan
+    stops early and ``capped=true`` marks the counts as a lower bound; narrow ``hours`` for a
+    full count.
+
     Aggregates failed sign-ins across the whole tenant into four views: top
     AADSTS error codes (with the same meaning annotations as
     ``signin_logs``), top failing users, top applications, and top source
@@ -536,6 +564,7 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
             "/auditLogs/signIns",
             params={"$filter": filter_expr, "$select": _STATS_SELECT},
             max_pages=pages_budget,
+            deadline=_current_deadline(),
         )
     except GraphPermissionError as e:
         return {"error": str(e), "missing_permission": "AuditLog.Read.All"}
@@ -654,7 +683,13 @@ def _matches_user(a: dict, user: str) -> bool:
 
 
 @mcp.tool()
-def directory_audits(user: str | None = None, hours: int = 24, top: int = 25, max_pages: int | None = None) -> dict:
+def directory_audits(
+    user: str | None = None,
+    hours: int = 24,
+    top: int = 25,
+    max_pages: int | None = None,
+    category: str | None = None,
+) -> dict:
     """Who did what to the directory, and when -- the operator-side counterpart to signin_logs.
 
     Every admin action against a user object (block/unblock, password reset,
@@ -679,7 +714,15 @@ def directory_audits(user: str | None = None, hours: int = 24, top: int = 25, ma
     auth -- the Reports Reader directory role). Entra ID retains directory
     audit logs for 30 days, same as sign-in logs.
 
+    Time-bounded: the scan stops after ENTRAADM_DEADLINE seconds (default 45)
+    and returns what it has with ``capped=true``. Over several days the log is
+    dominated by device-registration noise ("Update device"), so pass
+    ``category`` (for example ``UserManagement``, ``RoleManagement``,
+    ``GroupManagement``, ``ApplicationManagement``) to have Graph filter
+    server-side; that keeps a multi-day window inside the budget.
+
     Args:
+        category: Only this Graph audit category (letters only; default: all).
         user: Restrict to audits naming this userPrincipalName as actor or target (default: all).
         hours: How far back to look, clamped to [1, 720] (30 days).
         top: Maximum records to return, clamped to [1, 500].
@@ -695,6 +738,10 @@ def directory_audits(user: str | None = None, hours: int = 24, top: int = 25, ma
     top = _clamp_top(top)
     pages_budget = _resolve_max_pages(max_pages)
     filter_expr = f"activityDateTime ge {_since(hours)}"
+    if category is not None:
+        if not re.fullmatch(r"[A-Za-z]{1,40}", category):
+            return {"error": "category must be letters only (e.g. UserManagement)"}
+        filter_expr += f" and category eq {odata_quote(category)}"
 
     try:
         client = _client()
@@ -702,6 +749,7 @@ def directory_audits(user: str | None = None, hours: int = 24, top: int = 25, ma
             "/auditLogs/directoryAudits",
             params={"$filter": filter_expr, "$select": _AUDIT_SELECT},
             max_pages=pages_budget,
+            deadline=_current_deadline(),
         )
     except GraphPermissionError as e:
         return {"error": str(e), "missing_permission": "AuditLog.Read.All"}
@@ -815,8 +863,12 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
     del samples  # accepted for shape-parity with the fleet's daily_brief tools; not yet used
     hours = _clamp_hours(hours)
 
-    stats = signin_failure_stats(hours=hours, max_pages=max_pages)
-    audits = directory_audits(hours=hours, max_pages=max_pages)
+    token = _CALL_DEADLINE.set(_new_deadline())
+    try:
+        stats = signin_failure_stats(hours=hours, max_pages=max_pages)
+        audits = directory_audits(hours=hours, max_pages=max_pages)
+    finally:
+        _CALL_DEADLINE.reset(token)
 
     if "error" in stats:
         summary: dict = {"sign_in_failures": stats}

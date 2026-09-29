@@ -420,3 +420,67 @@ def test_probe_signin_access_degrades_on_permission_error(monkeypatch):
 def test_mode_property_reflects_config():
     client = GraphClient(AuthConfig(mode="azure-cli"), credential=FakeCredential([AccessToken("t", 9_999_999_999)]))
     assert client.mode == "azure-cli"
+
+
+# ---------------------------------------------------------------------------
+# wall-clock deadline
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_get_paged_returns_partial_when_deadline_passes_between_pages(monkeypatch):
+    import time
+
+    page2_url = f"{GRAPH_BASE}/auditLogs/signIns?$skiptoken=abc"
+    route = respx.get(f"{GRAPH_BASE}/auditLogs/signIns")
+    route.side_effect = [
+        httpx.Response(200, json={"value": [{"id": "1"}], "@odata.nextLink": page2_url}),
+        httpx.Response(200, json={"value": [{"id": "2"}]}),
+    ]
+    client, _cred = _client(monkeypatch=monkeypatch)
+    real = client._request
+
+    def slow_first(method, url, params=None, deadline=None):
+        resp = real(method, url, params=params, deadline=deadline)
+        time.sleep(0.25)  # the first page eats the whole budget
+        return resp
+
+    monkeypatch.setattr(client, "_request", slow_first)
+
+    items, capped = client.get_paged("/auditLogs/signIns", max_pages=5, deadline=time.monotonic() + 0.2)
+
+    assert [i["id"] for i in items] == ["1"]
+    assert capped is True
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_request_does_not_retry_past_the_deadline(monkeypatch):
+    import time
+
+    route = respx.get(f"{GRAPH_BASE}/auditLogs/signIns")
+    route.side_effect = httpx.ConnectTimeout("slow")
+    client, _cred = _client(monkeypatch=monkeypatch)
+    started = time.monotonic()
+
+    items, capped = client.get_paged("/auditLogs/signIns", deadline=time.monotonic() + 1.0)
+
+    assert items == [] and capped is True
+    assert route.call_count <= 2  # the 2 s retry wait would end past the 1 s deadline
+    assert time.monotonic() - started < 3.0
+
+
+@respx.mock
+def test_no_deadline_keeps_the_default_timeout(monkeypatch):
+    respx.get(f"{GRAPH_BASE}/users").mock(return_value=httpx.Response(200, json={"value": []}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    seen = {}
+    real = client._http.request
+
+    def spy(method, url, **kwargs):
+        seen["has_timeout"] = "timeout" in kwargs
+        return real(method, url, **kwargs)
+
+    monkeypatch.setattr(client._http, "request", spy)
+    client.get("/users")
+    assert seen["has_timeout"] is False
