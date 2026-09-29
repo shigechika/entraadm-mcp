@@ -28,7 +28,14 @@ import re
 import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp 2.x renamed FastMCP to MCPServer
+    from mcp.server.mcpserver import MCPServer as FastMCP
+
+    MCP_SDK_MAJOR = 2
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP
+
+    MCP_SDK_MAJOR = 1
 
 from entraadm_mcp import __version__
 from entraadm_mcp.client import (
@@ -48,7 +55,13 @@ from entraadm_mcp.config import (
     max_pages_default,
 )
 
-mcp = FastMCP("entraadm-mcp")
+if MCP_SDK_MAJOR >= 2:
+    # 2.x takes the version for serverInfo here (1.x reports the SDK's own).
+    from entraadm_mcp import __version__ as _version
+
+    mcp = FastMCP("entraadm-mcp", version=_version)
+else:
+    mcp = FastMCP("entraadm-mcp")
 
 #: Injection point for tests: monkeypatch.setitem(server._state, "client", FakeGraphClient(...)).
 _state: dict[str, Any] = {"client": None}
