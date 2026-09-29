@@ -37,7 +37,7 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   stack trace. 429 retries once (respecting `Retry-After`); 5xx retries twice
   with exponential backoff. `credential`/`http_client` constructor params
   are `# injectable for tests` (respx-mocked httpx, a stub credential).
-- `entraadm_mcp/server.py` — `FastMCP("entraadm-mcp")` with 7 tools.
+- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 7 tools.
   `AADSTS_CODES` is a hand-maintained dict (not exhaustive) annotating
   sign-in failure codes; missing codes return `meaning: null`, never hidden.
   `_state = {"client": None}` is the sole test-injection point

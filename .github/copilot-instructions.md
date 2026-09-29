@@ -1,6 +1,6 @@
 # Copilot review instructions — entraadm-mcp
 
-This repo is a stdio MCP server ([FastMCP](https://github.com/modelcontextprotocol/python-sdk))
+This repo is a stdio MCP server ([MCPServer](https://github.com/modelcontextprotocol/python-sdk), mcp 2.x)
 for Microsoft Entra ID sign-in and audit-log triage. All 7 tools are
 read-only — there is no write/mutating tool in this server (no account
 unblock, password reset, or session revoke), and no approval-gate or

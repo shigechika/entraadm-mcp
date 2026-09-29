@@ -68,17 +68,3 @@ jobs:
           enable-cache: true
       - run: uv sync --dev --python ${{ steps.pyver.outputs.v }}
       - run: uv run pytest -v
-
-  # The jobs above sync from uv.lock, which resolves mcp 1.x. This one swaps in the
-  # newest 2.x so both majors stay tested (entraadm_mcp/server.py imports MCPServer or FastMCP).
-  test-mcp-v2:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-      - run: uv sync --dev
-      - run: uv pip install "mcp>=2,<3"
-      - run: uv run --no-sync python -c "import importlib.metadata as m; v = m.version('mcp'); print('mcp', v); assert v.startswith('2.')"
-      - run: uv run --no-sync pytest -v
