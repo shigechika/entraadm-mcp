@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/shigechika/entraadm-mcp/compare/v0.1.0...v0.2.0) (2026-09-29)
+
+
+### Features
+
+* bound tool calls with a wall-clock deadline and add a category filter ([#4](https://github.com/shigechika/entraadm-mcp/issues/4)) ([b8c8b40](https://github.com/shigechika/entraadm-mcp/commit/b8c8b40f03d7aade7af443d08c16db0c84100363))
+
 ## 0.1.0 (2026-08-24)
 
 
