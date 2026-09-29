@@ -24,11 +24,14 @@ import collections
 import contextvars
 import datetime
 import functools
+import inspect
 import re
 import time
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 from entraadm_mcp import __version__
 from entraadm_mcp.client import (
@@ -48,7 +51,52 @@ from entraadm_mcp.config import (
     max_pages_default,
 )
 
-mcp = MCPServer("entraadm-mcp", version=__version__)
+
+def _expose_errors(fn):
+    """Wrap a tool so any exception reaches the model as a ToolError with its message.
+
+    mcp 1.x returned the exception text for every failing tool. mcp 2.x hides it
+    (the model sees only "Error executing tool <name>") unless a ToolError is raised.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (ToolError, MCPError):
+                raise
+            except Exception as exc:
+                raise ToolError(str(exc) or type(exc).__name__) from exc
+
+    else:
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (ToolError, MCPError):
+                raise
+            except Exception as exc:
+                raise ToolError(str(exc) or type(exc).__name__) from exc
+
+    return wrapper
+
+
+class _Server(MCPServer):
+    """MCPServer whose tools report their exception messages (see _expose_errors)."""
+
+    def tool(self, *args, **kwargs):
+        register = super().tool(*args, **kwargs)
+
+        def decorator(fn):
+            register(_expose_errors(fn))
+            return fn
+
+        return decorator
+
+
+mcp = _Server("entraadm-mcp", version=__version__)
 
 #: Injection point for tests: monkeypatch.setitem(server._state, "client", FakeGraphClient(...)).
 _state: dict[str, Any] = {"client": None}
