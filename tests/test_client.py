@@ -510,3 +510,21 @@ def test_deadline_passed_during_token_acquisition_is_partial(monkeypatch):
     items, capped = client.get_paged("/auditLogs/signIns", deadline=time.monotonic() + 0.1)
     assert items == [] and capped is True
     assert route.call_count == 0
+
+
+@respx.mock
+def test_trickling_body_is_cut_off_at_the_deadline(monkeypatch):
+    import time
+
+    def trickle():
+        for _ in range(20):
+            time.sleep(0.05)
+            yield b" "
+        yield b'{"value": []}'
+
+    respx.get(f"{GRAPH_BASE}/auditLogs/signIns").mock(return_value=httpx.Response(200, content=trickle()))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    started = time.monotonic()
+    items, capped = client.get_paged("/auditLogs/signIns", deadline=time.monotonic() + 0.2)
+    assert items == [] and capped is True
+    assert time.monotonic() - started < 0.8

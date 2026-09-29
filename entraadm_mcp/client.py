@@ -191,7 +191,7 @@ class GraphClient:
                 if timeout is None:
                     resp = self._http.request(method, url, params=params, headers=headers)
                 else:
-                    resp = self._http.request(method, url, params=params, headers=headers, timeout=timeout)
+                    resp = self._bounded_request(method, url, params, headers, timeout, deadline)
             except httpx.RequestError as e:
                 # A connection/DNS/timeout failure never reaches _parse(), so
                 # without this it would propagate as a bare httpx exception --
@@ -211,6 +211,23 @@ class GraphClient:
                 server_retries_left -= 1
                 continue
             return resp
+
+    def _bounded_request(self, method, url, params, headers, timeout, deadline) -> httpx.Response:
+        """One request whose *total* time (connect, headers and body) stops at ``deadline``.
+
+        httpx's timeout is per operation and the read timeout restarts on every chunk, so a
+        response that trickles in would outlast it. The body is read chunk by chunk and the
+        wall clock is checked between chunks (GraphDeadline past it).
+        """
+        with self._http.stream(method, url, params=params, headers=headers, timeout=timeout) as resp:
+            chunks = []
+            for chunk in resp.iter_raw():
+                chunks.append(chunk)
+                if time.monotonic() >= deadline:
+                    raise GraphDeadline("deadline passed while reading the response")
+            return httpx.Response(
+                resp.status_code, headers=resp.headers, content=b"".join(chunks), request=resp.request
+            )
 
     @staticmethod
     def _sleep_within(seconds: float, deadline: float | None) -> None:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import collections
 import contextvars
 import datetime
+import functools
 import re
 import time
 from typing import Any
@@ -118,6 +119,20 @@ def _current_deadline() -> float | None:
     return inherited if inherited is not None else _new_deadline()
 
 
+def _with_call_deadline(fn):
+    """Give a tool one wall-clock budget shared by all the Graph calls it makes."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = _CALL_DEADLINE.set(_current_deadline())
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _CALL_DEADLINE.reset(token)
+
+    return wrapper
+
+
 def _since(hours: int) -> str:
     dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -141,6 +156,7 @@ def _find_user(client: GraphClient, upn: str, select: str) -> dict | None:
     body = client.get(
         "/users",
         params={"$filter": f"userPrincipalName eq {odata_quote(upn)}", "$select": select},
+        deadline=_current_deadline(),
     )
     values = body.get("value", [])
     return values[0] if values else None
@@ -262,7 +278,9 @@ def _resolve_license_names(client: GraphClient, sku_ids: list[str]) -> tuple[lis
     fetch_capped = False
     if unresolved:
         try:
-            skus, fetch_capped = client.get_paged("/subscribedSkus", max_pages=_resolve_max_pages(None))
+            skus, fetch_capped = client.get_paged(
+                "/subscribedSkus", max_pages=_resolve_max_pages(None), deadline=_current_deadline()
+            )
         except GraphError:
             # Best effort: license names are a convenience, not the point of
             # get_user. Unresolved ids fall back to the raw id below.
@@ -298,6 +316,7 @@ def _user_entry(u: dict, license_names: list[str], licenses_capped: bool) -> dic
 
 
 @mcp.tool()
+@_with_call_deadline
 def get_user(upn: str) -> dict:
     """One account's identity/lifecycle state -- the first thing to check on any triage report.
 
@@ -787,6 +806,7 @@ def _method_entry(m: dict) -> dict:
 
 
 @mcp.tool()
+@_with_call_deadline
 def get_user_auth_methods(upn: str) -> dict:
     """Registered authentication methods for one account -- is MFA actually set up?
 
@@ -823,7 +843,9 @@ def get_user_auth_methods(upn: str) -> dict:
 
     try:
         methods, capped = client.get_paged(
-            f"/users/{user_id}/authentication/methods", max_pages=_resolve_max_pages(None)
+            f"/users/{user_id}/authentication/methods",
+            max_pages=_resolve_max_pages(None),
+            deadline=_current_deadline(),
         )
     except GraphPermissionError as e:
         return {"error": str(e), "missing_permission": "UserAuthenticationMethod.Read.All"}

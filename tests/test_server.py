@@ -746,3 +746,24 @@ def test_deadline_disabled_by_zero(inject, monkeypatch):
     monkeypatch.setenv("ENTRAADM_DEADLINE", "0")
     server.signin_failure_stats(hours=1)
     assert seen == [None]
+
+
+def test_get_user_and_auth_methods_share_one_deadline_per_call(inject, monkeypatch):
+    seen = []
+    client = FakeGraphClient(get_responses={"/users": {"value": [{"id": "11111111-1111-1111-1111-111111111111"}]}})
+    orig_get, orig_paged = client.get, client.get_paged
+
+    def get(path, params=None, deadline=None):
+        seen.append(("get", deadline))
+        return orig_get(path, params)
+
+    def get_paged(path, params=None, max_pages=5, deadline=None):
+        seen.append(("paged", deadline))
+        return orig_paged(path, params, max_pages)
+
+    client.get, client.get_paged = get, get_paged
+    inject(client)
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "30")
+    server.get_user_auth_methods("user@example.edu")
+    deadlines = {d for _, d in seen}
+    assert len(seen) >= 2 and None not in deadlines and len(deadlines) == 1
