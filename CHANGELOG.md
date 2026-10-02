@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/shigechika/entraadm-mcp/compare/v1.0.1...v1.1.0) (2026-10-02)
+
+
+### Features
+
+* add signin_success_stats and signin_by_ip (successes by source IP, one IP's history) ([#10](https://github.com/shigechika/entraadm-mcp/issues/10)) ([ea7a1f2](https://github.com/shigechika/entraadm-mcp/commit/ea7a1f2e04ebb022565e66b21daa02d91b57d7a8))
+
 ## [1.0.1](https://github.com/shigechika/entraadm-mcp/compare/v1.0.0...v1.0.1) (2026-09-29)
 
 
