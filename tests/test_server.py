@@ -536,6 +536,14 @@ def test_signin_by_ip_rejects_a_non_address(inject):
     assert "error" in result and "ip must be" in result["error"]
 
 
+def test_signin_by_ip_row_without_error_code_is_not_a_failure(inject):
+    rows = [_signin_row(userPrincipalName="a@example.edu", status={})]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_by_ip("203.0.113.5", result="failure")
+    assert result["failures"] == 0 and result["count"] == 0
+    assert result["users"][0]["failures"] == 0
+
+
 def test_signin_by_ip_reports_missing_permission(inject):
     inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": GraphPermissionError("denied")}))
     result = server.signin_by_ip("2001:db8::1")
@@ -622,6 +630,20 @@ def test_signin_success_stats_min_distinct_users_is_clamped_to_at_least_two(inje
     inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
     result = server.signin_success_stats(min_distinct_users=1)
     assert result["shared_ips"] == []
+
+
+def test_signin_success_stats_caps_shared_ips_most_shared_first(inject):
+    rows = []
+    for i in range(60):
+        ip = f"198.51.100.{i}"
+        n_users = 3 if i == 59 else 2
+        rows.extend(_success_row(userPrincipalName=f"u{j}@example.edu", ipAddress=ip) for j in range(n_users))
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_success_stats()
+    assert result["shared_ips_total"] == 60
+    assert len(result["shared_ips"]) == 50
+    assert result["shared_ips_capped"] is True
+    assert result["shared_ips"][0]["ip_address"] == "198.51.100.59"
 
 
 def test_signin_success_stats_reports_missing_permission(inject):

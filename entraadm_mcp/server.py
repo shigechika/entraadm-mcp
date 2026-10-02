@@ -658,7 +658,7 @@ def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, m
     for row in rows:
         upn = row.get("userPrincipalName") or ""
         when = row.get("createdDateTime") or ""
-        ok = _error_code_of(row) == 0
+        ok = _row_matches(row, "success")
         if ok:
             successes += 1
         else:
@@ -849,6 +849,7 @@ _LEGACY_AUTH_CLIENTS = frozenset(
 _SHARED_IP_MIN_DISTINCT_USERS = 2
 _SHARED_IP_USERS_LIMIT = 25
 _LEGACY_USERS_LIMIT = 50
+_SHARED_IPS_LIMIT = 50
 
 
 @mcp.tool()
@@ -859,9 +860,10 @@ def signin_success_stats(hours: int = 24, max_pages: int | None = None, min_dist
     anyone got in. The breach signature is one source IP signing in
     successfully as several different accounts, most often over a legacy
     protocol (``clientAppUsed`` such as "Authenticated SMTP" or "IMAP4",
-    which carry no MFA). ``shared_ips`` lists every IP with successes for
-    ``min_distinct_users`` or more distinct accounts, with the account
-    names (up to 25 per IP), the client apps and the countries seen.
+    which carry no MFA). ``shared_ips`` lists the IPs with successes for
+    ``min_distinct_users`` or more distinct accounts, most-shared first (up
+    to 50 IPs, ``shared_ips_capped`` when more qualified; account names up
+    to 25 per IP), with the client apps and the countries seen.
     ``legacy_auth_users`` lists the accounts that succeeded over a legacy
     protocol at all, with how many IPs and countries they came from.
 
@@ -996,7 +998,9 @@ def signin_success_stats(hours: int = 24, max_pages: int | None = None, min_dist
         "legacy_auth_successes": sum(legacy_counts.values()),
         "legacy_auth_users": legacy_auth_users,
         "legacy_auth_users_capped": len(legacy_sorted) > _LEGACY_USERS_LIMIT,
-        "shared_ips": shared_ips,
+        "shared_ips_total": len(shared_ips),
+        "shared_ips": shared_ips[:_SHARED_IPS_LIMIT],
+        "shared_ips_capped": len(shared_ips) > _SHARED_IPS_LIMIT,
     }
 
 

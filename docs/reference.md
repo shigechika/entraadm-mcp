@@ -79,8 +79,9 @@ clamped as above.
 
 Tenant-wide *successful* sign-in aggregation by source IP — the companion
 to `signin_failure_stats`: that one shows who is being attacked, this one
-shows whether anyone got in. `shared_ips` lists every IP with successes for
-`min_distinct_users` or more distinct accounts (account names up to 25 per
+shows whether anyone got in. `shared_ips` lists the IPs with successes for
+`min_distinct_users` or more distinct accounts, most-shared first (up to 50
+IPs, `shared_ips_capped` when more qualified; account names up to 25 per
 IP, client apps, countries, first/last seen); `legacy_auth_users` lists the
 accounts that succeeded over a legacy protocol (`Authenticated SMTP`,
 `IMAP4`, `POP3`, …), which carry no MFA. A campus NAT or a VDI farm also puts
