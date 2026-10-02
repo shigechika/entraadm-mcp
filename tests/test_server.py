@@ -516,6 +516,20 @@ def test_signin_by_ip_result_filter_keeps_only_successes(inject):
     assert result["failures"] == 1  # the summary still counts the failure
 
 
+def test_signin_by_ip_counts_rows_without_an_account_and_keeps_the_ip_spelling(inject):
+    rows = [
+        _signin_row(userPrincipalName=""),  # Graph logs some failures with no account name
+        _signin_row(userPrincipalName="a@example.edu", status={"errorCode": 0}),
+    ]
+    fake = FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)})
+    inject(fake)
+    result = server.signin_by_ip(" 2001:0db8:0000:0000:0000:0000:0000:0001 ")
+    assert "ipAddress eq '2001:0db8:0000:0000:0000:0000:0000:0001'" in fake.calls[0][2]["$filter"]
+    assert result["ip_address"] == "2001:0db8:0000:0000:0000:0000:0000:0001"
+    assert result["successes"] == 1 and result["failures"] == 1
+    assert result["distinct_users"] == 1
+
+
 def test_signin_by_ip_rejects_a_non_address(inject):
     inject(FakeGraphClient())
     result = server.signin_by_ip("203.0.113.5 or 1 eq 1")

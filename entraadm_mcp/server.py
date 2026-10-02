@@ -616,8 +616,12 @@ def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, m
         top: Maximum events to return, clamped to [1, 500].
         max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
     """
+    # validate only: keep the caller's spelling, because Graph compares the
+    # ipAddress string literally and an expanded IPv6 form from the log would
+    # not match its compressed form
+    ip = ip.strip()
     try:
-        ip = str(ipaddress.ip_address(ip.strip()))
+        ipaddress.ip_address(ip)
     except ValueError:
         return {"error": f"ip must be an IPv4 or IPv6 address (got {ip!r})"}
     if result not in ("failure", "success", "all"):
@@ -650,10 +654,15 @@ def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, m
     countries: set = set()
     matched: list[dict] = []
     matched_total = 0
+    successes = failures = 0
     for row in rows:
         upn = row.get("userPrincipalName") or ""
         when = row.get("createdDateTime") or ""
         ok = _error_code_of(row) == 0
+        if ok:
+            successes += 1
+        else:
+            failures += 1
         if upn:
             u = per_user.setdefault(
                 upn, {"user_principal_name": upn, "successes": 0, "failures": 0, "first_seen": when, "last_seen": when}
@@ -681,8 +690,8 @@ def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, m
         "result_filter": result,
         "capped": capped,
         "total_rows": len(rows),
-        "successes": sum(u["successes"] for u in users),
-        "failures": sum(u["failures"] for u in users),
+        "successes": successes,
+        "failures": failures,
         "distinct_users": len(users),
         "countries": sorted(countries),
         "success_client_apps": [{"client_app": c, "count": n} for c, n in client_counts.most_common(5)],
