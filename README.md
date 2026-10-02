@@ -20,7 +20,7 @@ and is not a fit for an unattended triage bot:
   server exposes one tool that lets the model construct arbitrary
   `GET`/schema-discovery calls against Microsoft Graph. That is flexible for
   a human, and awkward to put behind an allow-list for an automated triage
-  profile. entraadm-mcp exposes seven fixed, read-only tools instead.
+  profile. entraadm-mcp exposes nine fixed, read-only tools instead.
 - **No AADSTS translation.** Sign-in failures come back as raw error codes;
   triage still needs a lookup table. entraadm-mcp annotates every sign-in
   failure with what the code actually means.
@@ -38,6 +38,8 @@ and is not a fit for an unattended triage bot:
 | `get_user` | Is this account enabled, synced from on-prem, and what are its licenses? |
 | `signin_logs` | Why did this user's sign-in fail (or succeed), with the AADSTS code translated? |
 | `signin_failure_stats` | Tenant-wide failure aggregation: top error codes, users, apps, source IPs, and password-spray suspects |
+| `signin_success_stats` | Tenant-wide success aggregation by source IP: IPs shared by several accounts, legacy-auth (SMTP/IMAP) successes — the view that finds a breach |
+| `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when? |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
 | `daily_brief` | One-call summary combining `signin_failure_stats` and `directory_audits` |
@@ -63,7 +65,7 @@ different auth mode than intended.
 | Tool(s) | Permission | Notes |
 |---|---|---|
 | `get_user` (base fields) | `User.Read.All` | |
-| `signin_logs`, `signin_failure_stats`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
+| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
 
 A missing permission never crashes a tool. It degrades that tool (or that

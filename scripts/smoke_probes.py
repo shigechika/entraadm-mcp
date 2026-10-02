@@ -57,6 +57,12 @@ async def _fake_upn_arg(call: Caller) -> dict[str, Any]:
     return {"upn": f"{_fake_local_part()}@{_reserved_domain()}"}
 
 
+async def _test_net_ip_arg(call: Caller) -> dict[str, Any]:
+    """An RFC 5737 TEST-NET-3 address (never routed, so never a real tenant source IP)."""
+    del call
+    return {"ip": ".".join(("203", "0", "113", "1"))}
+
+
 PROBES: dict[str, Probe] = {
     "health_check": Probe(
         require_keys=("service", "version", "status", "auth_mode", "graph", "signin_probe"),
@@ -84,6 +90,18 @@ PROBES: dict[str, Probe] = {
     "signin_failure_stats": Probe(
         args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES},
         require_keys=("window_hours", "capped", "total_failures", "top_error_codes", "spray_suspects"),
+        allow_empty=True,
+    ),
+    "signin_by_ip": Probe(
+        args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES, "top": 5},
+        args_factory=_test_net_ip_arg,
+        require_keys=("ip_address", "window_hours", "capped", "users", "events"),
+        rows_key="events",
+        allow_empty=True,
+    ),
+    "signin_success_stats": Probe(
+        args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES},
+        require_keys=("window_hours", "capped", "total_successes", "legacy_auth_users", "shared_ips"),
         allow_empty=True,
     ),
     "directory_audits": Probe(

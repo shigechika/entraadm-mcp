@@ -30,6 +30,8 @@ Microsoft は Entra ID データ向けに
 | `get_user` | アカウントのライフサイクル状態：有効性・オンプレ同期・パスワード経過日数・ライセンス・サインイン状況 |
 | `signin_logs` | このユーザのサインインイベント。各 AADSTS エラーコードに意味の注釈付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
+| `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
+| `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
 | `daily_brief` | `signin_failure_stats` と `directory_audits` を1回でまとめたサマリ |

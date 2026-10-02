@@ -15,7 +15,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 - **固定ツールセットではなく汎用 Graph クエリツール。** 公式サーバは、モデルが任意の
   `GET`／スキーマ探索呼び出しを Microsoft Graph へ構成できる1本のツールを公開する。
   人間には柔軟だが、自動 triage プロファイル向けの許可リストには馴染みにくい。
-  entraadm-mcp は固定・読み取り専用の7ツールを公開する
+  entraadm-mcp は固定・読み取り専用の9ツールを公開する
 - **AADSTS の意味翻訳がない。** サインイン失敗は生のエラーコードのまま返ってきて、
   triage には結局ルックアップが必要になる。entraadm-mcp は全てのサインイン失敗に
   コードの意味を注釈する
@@ -32,6 +32,8 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `get_user` | このアカウントは有効か、オンプレ同期されているか、ライセンスは何か |
 | `signin_logs` | このユーザのサインインがなぜ失敗（または成功）したか、AADSTS コードの意味付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
+| `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
+| `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
 | `daily_brief` | `signin_failure_stats` と `directory_audits` を1回でまとめたサマリ |
@@ -56,7 +58,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | ツール | 権限 | 備考 |
 |---|---|---|
 | `get_user`（基本フィールド） | `User.Read.All` | |
-| `signin_logs`、`signin_failure_stats`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
+| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
 
 権限不足でツールがクラッシュすることはない。該当ツール（または該当フィールド）だけが

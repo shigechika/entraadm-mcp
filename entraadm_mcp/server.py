@@ -25,6 +25,7 @@ import contextvars
 import datetime
 import functools
 import inspect
+import ipaddress
 import re
 import time
 from typing import Any
@@ -583,6 +584,126 @@ def signin_logs(
 
 
 # ---------------------------------------------------------------------------
+# signin_by_ip
+# ---------------------------------------------------------------------------
+
+_BY_IP_USERS_LIMIT = 50
+
+
+@mcp.tool()
+def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, max_pages: int | None = None) -> dict:
+    """Every sign-in from one source IP: who got in from it, who was tried, and when.
+
+    The follow-up to a ``spray_suspects`` or ``shared_ips`` hit: Graph can
+    filter sign-ins on ``ipAddress`` server-side, so this is one cheap
+    query, not a log walk. ``users`` summarises the IP per account
+    (successes, failures, first/last seen, up to 50 accounts) over every row
+    fetched; ``events`` lists the newest ``top`` entries that match
+    ``result`` ("all" by default, or "success" / "failure"), each carrying
+    the account name and the same AADSTS annotation as ``signin_logs``.
+    ``capped=true`` means the page budget or the deadline ran out before the
+    window was fully read; ``events_truncated=true`` means more matching
+    rows were read than ``top`` returns (the ``users`` summary still counts
+    them).
+
+    Read-only (AuditLog.Read.All application permission, or -- for azure-cli
+    auth -- the Reports Reader directory role).
+
+    Args:
+        ip: The source IPv4 or IPv6 address, exactly as the sign-in log shows it.
+        hours: How far back to look, clamped to [1, 720] (30 days).
+        result: "all" (default), "success", or "failure" -- which events to list.
+        top: Maximum events to return, clamped to [1, 500].
+        max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+    """
+    # validate only: keep the caller's spelling, because Graph compares the
+    # ipAddress string literally and an expanded IPv6 form from the log would
+    # not match its compressed form
+    ip = ip.strip()
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return {"error": f"ip must be an IPv4 or IPv6 address (got {ip!r})"}
+    if result not in ("failure", "success", "all"):
+        return {"error": f"result must be 'failure', 'success', or 'all' (got {result!r})"}
+
+    hours = _clamp_hours(hours)
+    top = _clamp_top(top)
+    pages_budget = _resolve_max_pages(max_pages)
+    filter_expr = f"ipAddress eq {odata_quote(ip)} and createdDateTime ge {_since(hours)}"
+
+    try:
+        client = _client()
+        rows, capped = client.get_paged(
+            "/auditLogs/signIns",
+            params={
+                "$filter": filter_expr,
+                "$select": _SIGNIN_SELECT + ",userPrincipalName",
+                "$orderby": "createdDateTime desc",
+            },
+            max_pages=pages_budget,
+            deadline=_current_deadline(),
+        )
+    except GraphPermissionError as e:
+        return {"error": str(e), "missing_permission": "AuditLog.Read.All"}
+    except (ConfigError, GraphError) as e:
+        return {"error": str(e)}
+
+    per_user: dict[str, dict] = {}
+    client_counts: collections.Counter = collections.Counter()
+    countries: set = set()
+    matched: list[dict] = []
+    matched_total = 0
+    successes = failures = 0
+    for row in rows:
+        upn = row.get("userPrincipalName") or ""
+        when = row.get("createdDateTime") or ""
+        ok = _row_matches(row, "success")
+        if ok:
+            successes += 1
+        else:
+            failures += 1
+        if upn:
+            u = per_user.setdefault(
+                upn, {"user_principal_name": upn, "successes": 0, "failures": 0, "first_seen": when, "last_seen": when}
+            )
+            u["successes" if ok else "failures"] += 1
+            if when:
+                u["first_seen"] = min(u["first_seen"] or when, when)
+                u["last_seen"] = max(u["last_seen"] or when, when)
+        if ok and row.get("clientAppUsed"):
+            client_counts[row["clientAppUsed"]] += 1
+        country = (row.get("location") or {}).get("countryOrRegion")
+        if country:
+            countries.add(country)
+        if _row_matches(row, result):
+            matched_total += 1
+            if len(matched) < top:
+                entry = _signin_entry(row)
+                entry["user_principal_name"] = upn or None
+                matched.append(entry)
+
+    users = sorted(per_user.values(), key=lambda u: (-u["successes"], -u["failures"], u["user_principal_name"]))
+    return {
+        "ip_address": ip,
+        "window_hours": hours,
+        "result_filter": result,
+        "capped": capped,
+        "total_rows": len(rows),
+        "successes": successes,
+        "failures": failures,
+        "distinct_users": len(users),
+        "countries": sorted(countries),
+        "success_client_apps": [{"client_app": c, "count": n} for c, n in client_counts.most_common(5)],
+        "users": users[:_BY_IP_USERS_LIMIT],
+        "users_capped": len(users) > _BY_IP_USERS_LIMIT,
+        "count": len(matched),
+        "events_truncated": matched_total > len(matched),
+        "events": matched,
+    }
+
+
+# ---------------------------------------------------------------------------
 # signin_failure_stats
 # ---------------------------------------------------------------------------
 
@@ -696,6 +817,190 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
         "top_apps": top_apps,
         "top_ips": top_ips,
         "spray_suspects": spray_suspects,
+    }
+
+
+# ---------------------------------------------------------------------------
+# signin_success_stats
+# ---------------------------------------------------------------------------
+
+_SUCCESS_SELECT = ",".join(
+    ["createdDateTime", "userPrincipalName", "appDisplayName", "clientAppUsed", "ipAddress", "location", "status"]
+)
+# Entra's "legacy authentication" client apps: no MFA, no Conditional Access
+# device signals, and the protocols credential-stuffing tools drive.
+_LEGACY_AUTH_CLIENTS = frozenset(
+    {
+        "Authenticated SMTP",
+        "Autodiscover",
+        "Exchange ActiveSync",
+        "Exchange Online PowerShell",
+        "Exchange Web Services",
+        "IMAP4",
+        "MAPI Over HTTP",
+        "Offline Address Book",
+        "Other clients",
+        "Outlook Anywhere (RPC over HTTP)",
+        "Outlook Service",
+        "POP3",
+        "Reporting Web Services",
+    }
+)
+_SHARED_IP_MIN_DISTINCT_USERS = 2
+_SHARED_IP_USERS_LIMIT = 25
+_LEGACY_USERS_LIMIT = 50
+_SHARED_IPS_LIMIT = 50
+
+
+@mcp.tool()
+def signin_success_stats(hours: int = 24, max_pages: int | None = None, min_distinct_users: int = 2) -> dict:
+    """Tenant-wide *successful* sign-in aggregation by source IP -- the view that finds a breach.
+
+    ``signin_failure_stats`` shows who is being attacked; this shows whether
+    anyone got in. The breach signature is one source IP signing in
+    successfully as several different accounts, most often over a legacy
+    protocol (``clientAppUsed`` such as "Authenticated SMTP" or "IMAP4",
+    which carry no MFA). ``shared_ips`` lists the IPs with successes for
+    ``min_distinct_users`` or more distinct accounts, most-shared first (up
+    to 50 IPs, ``shared_ips_capped`` when more qualified; account names up
+    to 25 per IP), with the client apps and the countries seen.
+    ``legacy_auth_users`` lists the accounts that succeeded over a legacy
+    protocol at all, with how many IPs and countries they came from.
+
+    A campus NAT, a VDI farm or a shared proxy also puts many accounts
+    behind one IP, so a shared IP is a lead, not a verdict: the caller
+    excludes its own egress ranges and reads the client apps and countries
+    before calling anything a breach. Graph cannot filter sign-ins on
+    ``status/errorCode`` server-side, so like ``signin_failure_stats`` this
+    walks the sign-in log for the window and aggregates client-side. The
+    walk covers interactive sign-ins only (Graph's default listing): every
+    legacy-protocol authentication is logged as interactive, so none is
+    missed, but non-interactive token refreshes are not counted;
+    ``capped=true`` means the page budget or the deadline (ENTRAADM_DEADLINE,
+    default 45 s) ran out first and the counts are a lower bound -- narrow
+    ``hours`` for a full count.
+
+    Read-only (AuditLog.Read.All application permission, or -- for azure-cli
+    auth -- the Reports Reader directory role).
+
+    Args:
+        hours: How far back to look, clamped to [1, 720] (30 days).
+        max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        min_distinct_users: Distinct accounts an IP needs to appear in
+            ``shared_ips`` (default 2, clamped to >= 2).
+    """
+    hours = _clamp_hours(hours)
+    pages_budget = _resolve_max_pages(max_pages)
+    min_distinct_users = max(_SHARED_IP_MIN_DISTINCT_USERS, int(min_distinct_users))
+    filter_expr = f"createdDateTime ge {_since(hours)}"
+
+    try:
+        client = _client()
+        rows, capped = client.get_paged(
+            "/auditLogs/signIns",
+            params={"$filter": filter_expr, "$select": _SUCCESS_SELECT},
+            max_pages=pages_budget,
+            deadline=_current_deadline(),
+        )
+    except GraphPermissionError as e:
+        return {"error": str(e), "missing_permission": "AuditLog.Read.All"}
+    except (ConfigError, GraphError) as e:
+        return {"error": str(e)}
+
+    total = 0
+    users: set = set()
+    client_counts: collections.Counter = collections.Counter()
+    ip_counts: collections.Counter = collections.Counter()
+    ip_users: dict[str, set] = collections.defaultdict(set)
+    ip_clients: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    ip_countries: dict[str, set] = collections.defaultdict(set)
+    ip_first: dict[str, str] = {}
+    ip_last: dict[str, str] = {}
+    legacy_counts: collections.Counter = collections.Counter()
+    legacy_ips: dict[str, set] = collections.defaultdict(set)
+    legacy_countries: dict[str, set] = collections.defaultdict(set)
+    legacy_last: dict[str, str] = {}
+
+    for row in rows:
+        if _error_code_of(row) != 0:
+            continue
+        total += 1
+        upn = row.get("userPrincipalName") or ""
+        if upn:
+            users.add(upn)
+        client_app = row.get("clientAppUsed") or ""
+        if client_app:
+            client_counts[client_app] += 1
+        country = (row.get("location") or {}).get("countryOrRegion") or ""
+        when = row.get("createdDateTime") or ""
+        ip = row.get("ipAddress")
+        if ip:
+            ip_counts[ip] += 1
+            if upn:
+                ip_users[ip].add(upn)
+            if client_app:
+                ip_clients[ip][client_app] += 1
+            if country:
+                ip_countries[ip].add(country)
+            if when:
+                # rows arrive newest first, but do not rely on it
+                if ip not in ip_first or when < ip_first[ip]:
+                    ip_first[ip] = when
+                if ip not in ip_last or when > ip_last[ip]:
+                    ip_last[ip] = when
+        if upn and client_app in _LEGACY_AUTH_CLIENTS:
+            legacy_counts[upn] += 1
+            if ip:
+                legacy_ips[upn].add(ip)
+            if country:
+                legacy_countries[upn].add(country)
+            if when and when > legacy_last.get(upn, ""):
+                legacy_last[upn] = when
+
+    shared_ips = []
+    for ip, ip_user_set in sorted(ip_users.items(), key=lambda kv: (-len(kv[1]), -ip_counts[kv[0]], kv[0])):
+        if len(ip_user_set) < min_distinct_users:
+            continue
+        names = sorted(ip_user_set)
+        shared_ips.append(
+            {
+                "ip_address": ip,
+                "successes": ip_counts[ip],
+                "distinct_users": len(names),
+                "users": names[:_SHARED_IP_USERS_LIMIT],
+                "users_capped": len(names) > _SHARED_IP_USERS_LIMIT,
+                "client_apps": [{"client_app": c, "count": n} for c, n in ip_clients[ip].most_common(3)],
+                "legacy_auth": any(c in _LEGACY_AUTH_CLIENTS for c in ip_clients[ip]),
+                "countries": sorted(ip_countries[ip]),
+                "first_seen": ip_first.get(ip),
+                "last_seen": ip_last.get(ip),
+            }
+        )
+
+    legacy_sorted = sorted(legacy_counts.items(), key=lambda kv: (-len(legacy_ips[kv[0]]), -kv[1], kv[0]))
+    legacy_auth_users = [
+        {
+            "user_principal_name": upn,
+            "successes": n,
+            "distinct_ips": len(legacy_ips[upn]),
+            "countries": sorted(legacy_countries[upn]),
+            "last_seen": legacy_last.get(upn),
+        }
+        for upn, n in legacy_sorted[:_LEGACY_USERS_LIMIT]
+    ]
+
+    return {
+        "window_hours": hours,
+        "capped": capped,
+        "total_successes": total,
+        "distinct_users": len(users),
+        "top_client_apps": [{"client_app": c, "count": n} for c, n in client_counts.most_common(10)],
+        "legacy_auth_successes": sum(legacy_counts.values()),
+        "legacy_auth_users": legacy_auth_users,
+        "legacy_auth_users_capped": len(legacy_sorted) > _LEGACY_USERS_LIMIT,
+        "shared_ips_total": len(shared_ips),
+        "shared_ips": shared_ips[:_SHARED_IPS_LIMIT],
+        "shared_ips_capped": len(shared_ips) > _SHARED_IPS_LIMIT,
     }
 
 
