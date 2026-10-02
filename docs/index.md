@@ -34,6 +34,7 @@ and not a fit for an unattended triage bot:
 | `get_user` | Account lifecycle state: enabled, on-prem sync, password age, licenses, sign-in activity |
 | `signin_logs` | One user's sign-in events, each AADSTS error code annotated with what it means |
 | `signin_failure_stats` | Tenant-wide failure aggregation: top error codes, users, apps, source IPs, and password-spray suspects |
+| `signin_success_stats` | Tenant-wide success aggregation by source IP: IPs shared by several accounts, legacy-auth (SMTP/IMAP) successes — the view that finds a breach |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
 | `daily_brief` | One-call summary combining `signin_failure_stats` and `directory_audits` |

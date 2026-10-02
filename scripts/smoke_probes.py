@@ -86,6 +86,11 @@ PROBES: dict[str, Probe] = {
         require_keys=("window_hours", "capped", "total_failures", "top_error_codes", "spray_suspects"),
         allow_empty=True,
     ),
+    "signin_success_stats": Probe(
+        args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES},
+        require_keys=("window_hours", "capped", "total_successes", "legacy_auth_users", "shared_ips"),
+        allow_empty=True,
+    ),
     "directory_audits": Probe(
         args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES, "top": 5},
         require_keys=("window_hours", "capped", "count", "events"),

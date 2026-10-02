@@ -26,7 +26,7 @@ app-only 用3変数のうち1つか2つだけの設定は、起動時に設定�
 | ツール | 権限 |
 |---|---|
 | `get_user`（基本フィールド） | `User.Read.All` |
-| `signin_logs`、`signin_failure_stats`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
+| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
 
 ## ツール
@@ -68,6 +68,17 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 送信元IPの上位。`spray_suspects` は、5人以上の異なるユーザに対して失敗している
 IP を列挙する——Entra のアカウント単位スマートロックアウトだけでは捉えられない
 パターン。`hours` の扱いは上記と同様。
+
+### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
+
+テナント全体の*成功した*サインインを送信元IPで集計する——`signin_failure_stats`
+の対：あちらは誰が攻撃されているかを、こちらは誰かが入られたかを示す。
+`shared_ips` は `min_distinct_users` 人以上の異なるアカウントで成功している IP を
+列挙する（IP ごとにアカウント名 25 件まで・クライアントアプリ・国・初回/最終時刻）。
+`legacy_auth_users` はレガシー認証（`Authenticated SMTP`・`IMAP4`・`POP3` など、
+MFA の掛からないプロトコル）で成功したアカウントを列挙する。学内 NAT や VDI も
+多数のアカウントを 1 つの IP に載せるので、自組織の出口レンジを除いてから
+`shared_ips` を読むこと。ログ全走査と `capped` の扱いは `signin_failure_stats` と同じ。
 
 ### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
 

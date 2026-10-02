@@ -28,7 +28,7 @@ also takes `category` (for example `UserManagement`) to filter on the Graph side
 | Tool(s) | Permission |
 |---|---|
 | `get_user` (base fields) | `User.Read.All` |
-| `signin_logs`, `signin_failure_stats`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
+| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
 
 ## Tools
@@ -74,6 +74,19 @@ failing users, top applications, and top source IPs. `spray_suspects` lists
 any IP with failed sign-ins against 5 or more distinct users — a pattern
 Entra's per-account smart lockout does not catch on its own. `hours`
 clamped as above.
+
+### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
+
+Tenant-wide *successful* sign-in aggregation by source IP — the companion
+to `signin_failure_stats`: that one shows who is being attacked, this one
+shows whether anyone got in. `shared_ips` lists every IP with successes for
+`min_distinct_users` or more distinct accounts (account names up to 25 per
+IP, client apps, countries, first/last seen); `legacy_auth_users` lists the
+accounts that succeeded over a legacy protocol (`Authenticated SMTP`,
+`IMAP4`, `POP3`, …), which carry no MFA. A campus NAT or a VDI farm also puts
+many accounts behind one IP, so exclude your own egress ranges before
+reading `shared_ips` as a breach. Same full-log walk and `capped` semantics
+as `signin_failure_stats`.
 
 ### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
 

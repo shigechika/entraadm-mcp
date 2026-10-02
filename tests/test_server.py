@@ -468,6 +468,94 @@ def test_signin_logs_hours_are_clamped(inject):
 
 
 # ---------------------------------------------------------------------------
+# signin_success_stats
+# ---------------------------------------------------------------------------
+
+
+def _success_row(**overrides):
+    row = _signin_row(status={"errorCode": 0, "failureReason": "Other."})
+    row.update(overrides)
+    return row
+
+
+def test_signin_success_stats_flags_an_ip_shared_by_several_accounts(inject):
+    rows = [
+        _success_row(
+            userPrincipalName="a@example.edu",
+            ipAddress="198.51.100.7",
+            clientAppUsed="Authenticated SMTP",
+            location={"countryOrRegion": "KR"},
+            createdDateTime="2026-08-21T09:00:00Z",
+        ),
+        _success_row(
+            userPrincipalName="b@example.edu",
+            ipAddress="198.51.100.7",
+            clientAppUsed="Authenticated SMTP",
+            location={"countryOrRegion": "KR"},
+            createdDateTime="2026-08-21T08:00:00Z",
+        ),
+        _success_row(
+            userPrincipalName="a@example.edu",
+            ipAddress="198.51.100.7",
+            clientAppUsed="Browser",
+            location={"countryOrRegion": "JP"},
+            createdDateTime="2026-08-21T10:00:00Z",
+        ),
+        _success_row(userPrincipalName="c@example.edu", ipAddress="203.0.113.5", clientAppUsed="Browser"),
+    ]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_success_stats()
+    assert result["total_successes"] == 4
+    assert result["distinct_users"] == 3
+    assert len(result["shared_ips"]) == 1
+    shared = result["shared_ips"][0]
+    assert shared["ip_address"] == "198.51.100.7"
+    assert shared["users"] == ["a@example.edu", "b@example.edu"]
+    assert shared["legacy_auth"] is True
+    assert shared["countries"] == ["JP", "KR"]
+    assert shared["first_seen"] == "2026-08-21T08:00:00Z"
+    assert shared["last_seen"] == "2026-08-21T10:00:00Z"
+    assert shared["client_apps"][0] == {"client_app": "Authenticated SMTP", "count": 2}
+
+
+def test_signin_success_stats_lists_legacy_auth_users_and_ignores_failures(inject):
+    rows = [
+        _success_row(userPrincipalName="a@example.edu", ipAddress="198.51.100.7", clientAppUsed="IMAP4"),
+        _success_row(userPrincipalName="a@example.edu", ipAddress="198.51.100.8", clientAppUsed="IMAP4"),
+        _success_row(userPrincipalName="b@example.edu", ipAddress="203.0.113.5", clientAppUsed="Browser"),
+        _signin_row(userPrincipalName="z@example.edu", ipAddress="198.51.100.7", clientAppUsed="Authenticated SMTP"),
+    ]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_success_stats()
+    assert result["total_successes"] == 3
+    assert result["legacy_auth_successes"] == 2
+    assert result["legacy_auth_users"] == [
+        {
+            "user_principal_name": "a@example.edu",
+            "successes": 2,
+            "distinct_ips": 2,
+            "countries": ["JP"],
+            "last_seen": "2026-08-21T09:00:00Z",
+        }
+    ]
+    # the failed SMTP attempt by z@ must not make 198.51.100.7 a shared IP
+    assert result["shared_ips"] == []
+
+
+def test_signin_success_stats_min_distinct_users_is_clamped_to_at_least_two(inject):
+    rows = [_success_row(userPrincipalName="a@example.edu", ipAddress="203.0.113.5") for _ in range(3)]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_success_stats(min_distinct_users=1)
+    assert result["shared_ips"] == []
+
+
+def test_signin_success_stats_reports_missing_permission(inject):
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": GraphPermissionError("denied")}))
+    result = server.signin_success_stats()
+    assert result["missing_permission"] == "AuditLog.Read.All"
+
+
+# ---------------------------------------------------------------------------
 # signin_failure_stats
 # ---------------------------------------------------------------------------
 
