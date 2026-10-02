@@ -33,6 +33,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `signin_logs` | このユーザのサインインがなぜ失敗（または成功）したか、AADSTS コードの意味付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
 | `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
+| `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
 | `daily_brief` | `signin_failure_stats` と `directory_audits` を1回でまとめたサマリ |
@@ -57,7 +58,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | ツール | 権限 | 備考 |
 |---|---|---|
 | `get_user`（基本フィールド） | `User.Read.All` | |
-| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
+| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
 
 権限不足でツールがクラッシュすることはない。該当ツール（または該当フィールド）だけが

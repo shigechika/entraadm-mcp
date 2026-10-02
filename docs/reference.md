@@ -28,7 +28,7 @@ also takes `category` (for example `UserManagement`) to filter on the Graph side
 | Tool(s) | Permission |
 |---|---|
 | `get_user` (base fields) | `User.Read.All` |
-| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
+| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
 
 ## Tools
@@ -89,6 +89,17 @@ reading `shared_ips` as a breach. Same log walk and `capped` semantics as
 `signin_failure_stats`; like it, this scans interactive sign-ins only (every
 legacy-protocol authentication is logged as interactive; non-interactive
 token refreshes are not counted).
+
+### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None)`
+
+Every sign-in from one source IP — the follow-up to a `spray_suspects` or
+`shared_ips` hit. Graph filters on `ipAddress` server-side, so this is one
+cheap query rather than a log walk. `users` summarises the IP per account
+(successes, failures, first/last seen, up to 50); `events` lists the newest
+`top` entries matching `result` ("all" / "success" / "failure"), each with
+the account name and the same AADSTS annotation as `signin_logs`.
+`events_truncated` means more matching rows were read than `top` returns
+(`users` still counts them). `ip` must parse as an IPv4/IPv6 address.
 
 ### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
 

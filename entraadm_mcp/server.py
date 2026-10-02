@@ -25,6 +25,7 @@ import contextvars
 import datetime
 import functools
 import inspect
+import ipaddress
 import re
 import time
 from typing import Any
@@ -578,6 +579,117 @@ def signin_logs(
         "result_filter": result,
         "count": len(matched),
         "capped": url is not None or truncated_within_page,
+        "events": matched,
+    }
+
+
+# ---------------------------------------------------------------------------
+# signin_by_ip
+# ---------------------------------------------------------------------------
+
+_BY_IP_USERS_LIMIT = 50
+
+
+@mcp.tool()
+def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, max_pages: int | None = None) -> dict:
+    """Every sign-in from one source IP: who got in from it, who was tried, and when.
+
+    The follow-up to a ``spray_suspects`` or ``shared_ips`` hit: Graph can
+    filter sign-ins on ``ipAddress`` server-side, so this is one cheap
+    query, not a log walk. ``users`` summarises the IP per account
+    (successes, failures, first/last seen, up to 50 accounts) over every row
+    fetched; ``events`` lists the newest ``top`` entries that match
+    ``result`` ("all" by default, or "success" / "failure"), each carrying
+    the account name and the same AADSTS annotation as ``signin_logs``.
+    ``capped=true`` means the page budget or the deadline ran out before the
+    window was fully read; ``events_truncated=true`` means more matching
+    rows were read than ``top`` returns (the ``users`` summary still counts
+    them).
+
+    Read-only (AuditLog.Read.All application permission, or -- for azure-cli
+    auth -- the Reports Reader directory role).
+
+    Args:
+        ip: The source IPv4 or IPv6 address, exactly as the sign-in log shows it.
+        hours: How far back to look, clamped to [1, 720] (30 days).
+        result: "all" (default), "success", or "failure" -- which events to list.
+        top: Maximum events to return, clamped to [1, 500].
+        max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+    """
+    try:
+        ip = str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        return {"error": f"ip must be an IPv4 or IPv6 address (got {ip!r})"}
+    if result not in ("failure", "success", "all"):
+        return {"error": f"result must be 'failure', 'success', or 'all' (got {result!r})"}
+
+    hours = _clamp_hours(hours)
+    top = _clamp_top(top)
+    pages_budget = _resolve_max_pages(max_pages)
+    filter_expr = f"ipAddress eq {odata_quote(ip)} and createdDateTime ge {_since(hours)}"
+
+    try:
+        client = _client()
+        rows, capped = client.get_paged(
+            "/auditLogs/signIns",
+            params={
+                "$filter": filter_expr,
+                "$select": _SIGNIN_SELECT + ",userPrincipalName",
+                "$orderby": "createdDateTime desc",
+            },
+            max_pages=pages_budget,
+            deadline=_current_deadline(),
+        )
+    except GraphPermissionError as e:
+        return {"error": str(e), "missing_permission": "AuditLog.Read.All"}
+    except (ConfigError, GraphError) as e:
+        return {"error": str(e)}
+
+    per_user: dict[str, dict] = {}
+    client_counts: collections.Counter = collections.Counter()
+    countries: set = set()
+    matched: list[dict] = []
+    matched_total = 0
+    for row in rows:
+        upn = row.get("userPrincipalName") or ""
+        when = row.get("createdDateTime") or ""
+        ok = _error_code_of(row) == 0
+        if upn:
+            u = per_user.setdefault(
+                upn, {"user_principal_name": upn, "successes": 0, "failures": 0, "first_seen": when, "last_seen": when}
+            )
+            u["successes" if ok else "failures"] += 1
+            if when:
+                u["first_seen"] = min(u["first_seen"] or when, when)
+                u["last_seen"] = max(u["last_seen"] or when, when)
+        if ok and row.get("clientAppUsed"):
+            client_counts[row["clientAppUsed"]] += 1
+        country = (row.get("location") or {}).get("countryOrRegion")
+        if country:
+            countries.add(country)
+        if _row_matches(row, result):
+            matched_total += 1
+            if len(matched) < top:
+                entry = _signin_entry(row)
+                entry["user_principal_name"] = upn or None
+                matched.append(entry)
+
+    users = sorted(per_user.values(), key=lambda u: (-u["successes"], -u["failures"], u["user_principal_name"]))
+    return {
+        "ip_address": ip,
+        "window_hours": hours,
+        "result_filter": result,
+        "capped": capped,
+        "total_rows": len(rows),
+        "successes": sum(u["successes"] for u in users),
+        "failures": sum(u["failures"] for u in users),
+        "distinct_users": len(users),
+        "countries": sorted(countries),
+        "success_client_apps": [{"client_app": c, "count": n} for c, n in client_counts.most_common(5)],
+        "users": users[:_BY_IP_USERS_LIMIT],
+        "users_capped": len(users) > _BY_IP_USERS_LIMIT,
+        "count": len(matched),
+        "events_truncated": matched_total > len(matched),
         "events": matched,
     }
 

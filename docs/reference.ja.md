@@ -26,7 +26,7 @@ app-only 用3変数のうち1つか2つだけの設定は、起動時に設定�
 | ツール | 権限 |
 |---|---|
 | `get_user`（基本フィールド） | `User.Read.All` |
-| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
+| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
 
 ## ツール
@@ -81,6 +81,16 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 `shared_ips` を読むこと。ログ走査と `capped` の扱いは `signin_failure_stats` と同じで、
 対話型サインインだけを見る（レガシー認証はすべて対話型として記録されるので漏れない。
 非対話型のトークン更新は数えない）。
+
+### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None)`
+
+1 つの送信元IPからの全サインイン——`spray_suspects` や `shared_ips` に出た IP の
+追跡用。Graph は `ipAddress` でサーバ側フィルタできるので、ログ走査でなく 1 回の
+軽い問い合わせで済む。`users` はその IP をアカウント別に要約する（成功・失敗・
+初回/最終時刻、50 件まで）。`events` は `result`（"all" / "success" / "failure"）に
+合う最新 `top` 件で、各行にアカウント名と `signin_logs` と同じ AADSTS の注釈が付く。
+`events_truncated` は `top` より多くの該当行を読んだ印（`users` はそれも数えている）。
+`ip` は IPv4/IPv6 アドレスとして解釈できる文字列に限る。
 
 ### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
 

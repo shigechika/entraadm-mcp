@@ -468,6 +468,67 @@ def test_signin_logs_hours_are_clamped(inject):
 
 
 # ---------------------------------------------------------------------------
+# signin_by_ip
+# ---------------------------------------------------------------------------
+
+
+def test_signin_by_ip_summarises_each_account_and_lists_events_with_names(inject):
+    rows = [
+        _signin_row(
+            userPrincipalName="a@example.edu",
+            createdDateTime="2026-08-21T09:00:00Z",
+            status={"errorCode": 0},
+            clientAppUsed="Authenticated SMTP",
+        ),
+        _signin_row(
+            userPrincipalName="a@example.edu",
+            createdDateTime="2026-08-20T09:00:00Z",
+            status={"errorCode": 0},
+            clientAppUsed="Authenticated SMTP",
+        ),
+        _signin_row(userPrincipalName="b@example.edu", createdDateTime="2026-08-21T08:00:00Z"),
+    ]
+    fake = FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)})
+    inject(fake)
+    result = server.signin_by_ip("203.0.113.5", hours=48, top=2)
+    assert "ipAddress eq '203.0.113.5'" in fake.calls[0][2]["$filter"]
+    assert result["successes"] == 2 and result["failures"] == 1 and result["distinct_users"] == 2
+    assert result["users"][0] == {
+        "user_principal_name": "a@example.edu",
+        "successes": 2,
+        "failures": 0,
+        "first_seen": "2026-08-20T09:00:00Z",
+        "last_seen": "2026-08-21T09:00:00Z",
+    }
+    assert result["success_client_apps"] == [{"client_app": "Authenticated SMTP", "count": 2}]
+    assert [e["user_principal_name"] for e in result["events"]] == ["a@example.edu", "a@example.edu"]
+    assert result["events_truncated"] is True
+
+
+def test_signin_by_ip_result_filter_keeps_only_successes(inject):
+    rows = [
+        _signin_row(userPrincipalName="a@example.edu", status={"errorCode": 0}),
+        _signin_row(userPrincipalName="b@example.edu"),
+    ]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_by_ip("203.0.113.5", result="success")
+    assert result["count"] == 1 and result["events"][0]["user_principal_name"] == "a@example.edu"
+    assert result["failures"] == 1  # the summary still counts the failure
+
+
+def test_signin_by_ip_rejects_a_non_address(inject):
+    inject(FakeGraphClient())
+    result = server.signin_by_ip("203.0.113.5 or 1 eq 1")
+    assert "error" in result and "ip must be" in result["error"]
+
+
+def test_signin_by_ip_reports_missing_permission(inject):
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": GraphPermissionError("denied")}))
+    result = server.signin_by_ip("2001:db8::1")
+    assert result["missing_permission"] == "AuditLog.Read.All"
+
+
+# ---------------------------------------------------------------------------
 # signin_success_stats
 # ---------------------------------------------------------------------------
 
