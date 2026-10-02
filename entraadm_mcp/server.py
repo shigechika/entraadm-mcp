@@ -749,7 +749,10 @@ def signin_success_stats(hours: int = 24, max_pages: int | None = None, min_dist
     excludes its own egress ranges and reads the client apps and countries
     before calling anything a breach. Graph cannot filter sign-ins on
     ``status/errorCode`` server-side, so like ``signin_failure_stats`` this
-    walks the full sign-in log for the window and aggregates client-side;
+    walks the sign-in log for the window and aggregates client-side. The
+    walk covers interactive sign-ins only (Graph's default listing): every
+    legacy-protocol authentication is logged as interactive, so none is
+    missed, but non-interactive token refreshes are not counted;
     ``capped=true`` means the page budget or the deadline (ENTRAADM_DEADLINE,
     default 45 s) ran out first and the counts are a lower bound -- narrow
     ``hours`` for a full count.

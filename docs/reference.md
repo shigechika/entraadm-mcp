@@ -85,8 +85,10 @@ IP, client apps, countries, first/last seen); `legacy_auth_users` lists the
 accounts that succeeded over a legacy protocol (`Authenticated SMTP`,
 `IMAP4`, `POP3`, …), which carry no MFA. A campus NAT or a VDI farm also puts
 many accounts behind one IP, so exclude your own egress ranges before
-reading `shared_ips` as a breach. Same full-log walk and `capped` semantics
-as `signin_failure_stats`.
+reading `shared_ips` as a breach. Same log walk and `capped` semantics as
+`signin_failure_stats`; like it, this scans interactive sign-ins only (every
+legacy-protocol authentication is logged as interactive; non-interactive
+token refreshes are not counted).
 
 ### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
 

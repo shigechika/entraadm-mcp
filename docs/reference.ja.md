@@ -78,7 +78,9 @@ IP を列挙する——Entra のアカウント単位スマートロックア�
 `legacy_auth_users` はレガシー認証（`Authenticated SMTP`・`IMAP4`・`POP3` など、
 MFA の掛からないプロトコル）で成功したアカウントを列挙する。学内 NAT や VDI も
 多数のアカウントを 1 つの IP に載せるので、自組織の出口レンジを除いてから
-`shared_ips` を読むこと。ログ全走査と `capped` の扱いは `signin_failure_stats` と同じ。
+`shared_ips` を読むこと。ログ走査と `capped` の扱いは `signin_failure_stats` と同じで、
+対話型サインインだけを見る（レガシー認証はすべて対話型として記録されるので漏れない。
+非対話型のトークン更新は数えない）。
 
 ### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
 
