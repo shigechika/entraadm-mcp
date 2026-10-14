@@ -103,7 +103,16 @@ export ENTRAADM_MAX_PAGES_DEFAULT=50
 # client cuts a call off at about 60 s, so a scan stops at the budget and returns
 # what it has with capped=true.
 export ENTRAADM_DEADLINE=45
+# Your own address ranges (NAT egress, offices, labs). Spray suspects inside them are
+# listed separately as internal_spray_suspects, labelled with the site.
+export ENTRAADM_SITES_INI=/path/to/sites.ini
 ```
+
+`ENTRAADM_SITES_INI` uses the same format as keycloak-mcp's `KEYCLOAK_SITES_INI`,
+so one file can serve both (see [`sites.ini.example`](sites.ini.example)). Lookups are
+longest-prefix. A file that is set but cannot be read makes `health_check` report
+`degraded`, and every IP is then treated as external. An invalid CIDR is reported the
+same way, but the valid ranges are still used.
 
 ## Usage
 

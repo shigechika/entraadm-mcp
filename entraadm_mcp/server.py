@@ -34,7 +34,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 
-from entraadm_mcp import __version__
+from entraadm_mcp import __version__, sites
 from entraadm_mcp.client import (
     GraphClient,
     GraphDeadline,
@@ -256,7 +256,14 @@ def health_check() -> dict:
     Read-only. Always returns the same keys regardless of outcome (``detail``
     is null on success, a translated message on failure), so a caller never
     has to branch on which keys are present.
+
+    ``sites`` reports the optional ENTRAADM_SITES_INI table
+    (``configured``, ``ranges``, ``error``). A configured file that fails to
+    load is an ``error`` here and leaves ``status`` no better than
+    ``degraded``: without it every internal IP would be reported as an
+    external spray suspect.
     """
+    site_status = sites.load().status()
     try:
         client = _client()
     except ConfigError as e:
@@ -268,12 +275,15 @@ def health_check() -> dict:
             "auth_mode": "unknown",
             "graph": {"auth": "error", "detail": detail},
             "signin_probe": {"auth": "error", "detail": detail},
+            "sites": site_status,
         }
 
     graph = client.check()
     signin_probe = client.probe_signin_access()
     ok_count = sum(1 for probe in (graph, signin_probe) if probe["auth"] == "ok")
     status = "healthy" if ok_count == 2 else "degraded" if ok_count == 1 else "error"
+    if status == "healthy" and site_status["error"] is not None:
+        status = "degraded"
 
     return {
         "service": "entraadm-mcp",
@@ -282,6 +292,7 @@ def health_check() -> dict:
         "auth_mode": client.mode,
         "graph": graph,
         "signin_probe": signin_probe,
+        "sites": site_status,
     }
 
 
@@ -730,6 +741,16 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
     official Microsoft MCP Server for Enterprise nor Graph itself offers this
     aggregation.
 
+    When ENTRAADM_SITES_INI names the tenant's own address ranges, IPs inside
+    them get ``site`` (and ``site_name``) in ``top_ips``, and suspects inside
+    them move from ``spray_suspects`` to ``internal_spray_suspects``: a NAT
+    egress or a room of shared workstations fails for many users every day,
+    and would otherwise bury an outside source. Internal suspects are kept,
+    not dropped, because an internal host can be compromised too. ``sites``
+    reports whether the file loaded; an invalid CIDR is reported in
+    ``sites.error`` while the valid ranges are still used, and a file that
+    cannot be read leaves every IP in ``spray_suspects``.
+
     Read-only (AuditLog.Read.All application permission, or -- for azure-cli
     auth -- the Reports Reader directory role). Graph cannot filter sign-ins
     on status/errorCode server-side, so this walks up to ``max_pages`` of the
@@ -788,19 +809,34 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
     ]
     top_failing_users = [{"user_principal_name": u, "count": c} for u, c in user_counts.most_common(10)]
     top_apps = [{"app_display_name": a, "count": c} for a, c in app_counts.most_common(5)]
+    site_table = sites.load()
+
+    def _with_site(entry: dict) -> dict:
+        site = site_table.classify(entry["ip_address"])
+        if site is not None:
+            entry["site"] = site.code
+            if site.name:
+                entry["site_name"] = site.name
+        return entry
+
     top_ips = [
-        {"ip_address": ip, "count": c, "distinct_users": len(ip_users.get(ip, ()))}
+        _with_site({"ip_address": ip, "count": c, "distinct_users": len(ip_users.get(ip, ()))})
         for ip, c in ip_counts.most_common(10)
     ]
-    spray_suspects = sorted(
+    suspects = sorted(
         (
-            {"ip_address": ip, "distinct_users": len(users), "attempts": ip_counts[ip]}
+            _with_site({"ip_address": ip, "distinct_users": len(users), "attempts": ip_counts[ip]})
             for ip, users in ip_users.items()
             if len(users) >= _SPRAY_MIN_DISTINCT_USERS
         ),
         key=lambda s: s["distinct_users"],
         reverse=True,
     )
+    # The tenant's own sites (NAT egress, shared workstations) routinely fail
+    # for many users at once. Keep them, but in their own list, so that an
+    # outside source is not buried among them.
+    spray_suspects = [s for s in suspects if "site" not in s]
+    internal_spray_suspects = [s for s in suspects if "site" in s]
 
     return {
         "window_hours": hours,
@@ -817,6 +853,8 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
         "top_apps": top_apps,
         "top_ips": top_ips,
         "spray_suspects": spray_suspects,
+        "internal_spray_suspects": internal_spray_suspects,
+        "sites": site_table.status(),
     }
 
 
@@ -1256,8 +1294,11 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
             "distinct_failing_users": stats["distinct_failing_users"],
             "top_error_codes": stats["top_error_codes"][:5],
             "spray_suspects": stats["spray_suspects"],
+            "internal_spray_suspects": stats["internal_spray_suspects"],
             "capped": stats["capped"],
         }
+        if stats["sites"]["error"] is not None:
+            summary["sites_error"] = stats["sites"]["error"]
 
     if "error" in audits:
         summary["admin_actions"] = audits
