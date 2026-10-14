@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from entraadm_mcp import sites
 
 
@@ -59,9 +61,11 @@ def test_failed_read_is_not_cached(tmp_path):
     assert sites.load(env=env).classify("192.0.2.1").code == "HQ"
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs POSIX permissions and a non-root user (root reads a 000 file anyway)",
+)
 def test_permission_repair_is_picked_up_without_a_content_change(tmp_path):
-    if os.geteuid() == 0:
-        return  # root reads a 000 file anyway
     path = _write(tmp_path, "[HQ]\nipv4 = 192.0.2.0/24\n")
     env = {sites.ENV_VAR: path}
     os.chmod(path, 0)
