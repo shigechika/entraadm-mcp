@@ -21,6 +21,11 @@ app-only 用3変数のうち1つか2つだけの設定は、起動時に設定�
 `capped=true` で返す。`daily_brief` は 2 つの節で 1 つの持ち時間を共有する。
 `directory_audits` は `category`（例: `UserManagement`）で Graph 側の絞り込みもできる。
 
+任意: `ENTRAADM_SITES_INI` は自組織のアドレス範囲を書いた INI ファイル。形式は
+keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクション，`name` は任意，
+`ipv4`／`ipv6` にカンマ区切りの CIDR）。照合は最長一致で，ファイルが変わると読み直す。
+CIDR の誤り・読めないファイル・範囲の無いファイルは，読み飛ばさずにエラーとして報告する。
+
 ### 必要な Graph 権限
 
 | ツール | 権限 |
@@ -33,12 +38,14 @@ app-only 用3変数のうち1つか2つだけの設定は、起動時に設定�
 
 ### `health_check()`
 
-引数なし。`{service, version, status, auth_mode, graph, signin_probe}` を返す。
+引数なし。`{service, version, status, auth_mode, graph, signin_probe, sites}` を返す。
 `graph` は基本的な Graph 到達性（`GET /users`、`$top=1` — `User.Read.All` のみで通る）を、`signin_probe` は
 サインインログ読み取り可否を追加でプローブする。`status` は両方成功で
 `"healthy"`、Graph到達可だがサインインログ読み取り不可で `"degraded"`、
 Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`signin_probe` は
-それぞれ `{auth: "ok"|"error", detail: str|null}`。
+それぞれ `{auth: "ok"|"error", detail: str|null}`。`sites` は `ENTRAADM_SITES_INI` の
+`{configured, ranges, error}` で，指定したファイルに `error` があると `"healthy"` を
+`"degraded"` に下げる。
 
 ### `get_user(upn)`
 
@@ -68,6 +75,12 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 送信元IPの上位。`spray_suspects` は、5人以上の異なるユーザに対して失敗している
 IP を列挙する——Entra のアカウント単位スマートロックアウトだけでは捉えられない
 パターン。`hours` の扱いは上記と同様。
+
+`ENTRAADM_SITES_INI` を指定すると，自組織の範囲の IP は `top_ips` に `site`（と
+`site_name`）が付き，その範囲のスプレー疑いは `internal_spray_suspects` に移る。
+NAT の出口や共用端末に外部の送信元が埋もれないようにするため。`sites` は読み込めたかを示し，
+読み込みに失敗したときはすべて `spray_suspects` に残す。`daily_brief` の要約には
+内部の疑いの件数と，読み込みに失敗したときの `sites_error` が入る。
 
 ### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
 

@@ -4,7 +4,10 @@
 
 MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage.
 Transport is stdio only. All 9 tools are read-only — there is no
-write/mutating tool. Auth is env-var driven (see below); no config file.
+write/mutating tool. Auth is env-var driven (see below); no config file. The
+one optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
+ranges, same format as keycloak-mcp's `KEYCLOAK_SITES_INI`), loaded by
+`entraadm_mcp/sites.py` with longest-prefix lookup.
 
 ## Commands
 

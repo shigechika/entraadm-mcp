@@ -92,7 +92,14 @@ export ENTRAADM_CLIENT_SECRET=your-client-secret
 export ENTRAADM_MAX_PAGES_DEFAULT=50
 # 1 回のツール呼び出しの持ち時間（秒、既定 45、0 で無効）。ホスト型クライアントは約 60 秒で打ち切る
 export ENTRAADM_DEADLINE=45
+# 自組織のアドレス範囲（NAT の出口・事業所・実習室など）。この範囲のスプレー疑いは
+# internal_spray_suspects に拠点名付きで分けて出す
+export ENTRAADM_SITES_INI=/path/to/sites.ini
 ```
+
+`ENTRAADM_SITES_INI` は keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ形式なので，1 つの
+ファイルを両方で使える（[`sites.ini.example`](sites.ini.example) 参照）。照合は最長一致。
+指定したのに読めないときは `health_check` が `degraded` になり，すべての IP を外部扱いにする。
 
 ## 使い方
 

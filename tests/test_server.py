@@ -79,6 +79,8 @@ def inject(monkeypatch):
     # runs). Clear it per test so one test's resolved sku names don't leak
     # into another test's "resolution failed" fixture.
     monkeypatch.setattr(server, "_license_cache", {})
+    # A developer shell may point at a real sites file; tests opt in explicitly.
+    monkeypatch.delenv("ENTRAADM_SITES_INI", raising=False)
 
     def _inject(client):
         monkeypatch.setitem(server._state, "client", client)
@@ -204,7 +206,8 @@ def test_health_check_shape_is_identical_across_all_statuses(inject):
     )
     errored = server.health_check()
     for result in (healthy, degraded, errored):
-        assert set(result.keys()) == {"service", "version", "status", "auth_mode", "graph", "signin_probe"}
+        assert set(result.keys()) == {"service", "version", "status", "auth_mode", "graph", "signin_probe", "sites"}
+        assert set(result["sites"].keys()) == {"configured", "ranges", "error"}
         assert set(result["graph"].keys()) == {"auth", "detail"}
         assert set(result["signin_probe"].keys()) == {"auth", "detail"}
 
@@ -967,3 +970,117 @@ def test_daily_brief_runs_the_audit_scan_before_the_signin_scan(inject):
     inject(client)
     server.daily_brief(hours=1)
     assert order == ["/auditLogs/directoryAudits", "/auditLogs/signIns"]
+
+
+# ---------------------------------------------------------------------------
+# ENTRAADM_SITES_INI: internal vs external spray suspects
+# ---------------------------------------------------------------------------
+
+_SITES_INI = """\
+[HQ]
+name = Head office
+ipv4 = 192.0.2.0/24
+ipv6 = 2001:db8:1::/48
+
+[LAB]
+ipv4 = 192.0.2.128/25
+"""
+
+
+def _spray_rows(ip, n=5):
+    return [_signin_row(userPrincipalName=f"user{i}@example.edu", ipAddress=ip) for i in range(n)]
+
+
+@pytest.fixture
+def sites_ini(tmp_path, monkeypatch):
+    path = tmp_path / "sites.ini"
+    path.write_text(_SITES_INI, encoding="utf-8")
+    monkeypatch.setenv("ENTRAADM_SITES_INI", str(path))
+    return path
+
+
+def test_signin_failure_stats_moves_internal_suspects_to_their_own_list(inject, sites_ini):
+    rows = _spray_rows("192.0.2.10", 6) + _spray_rows("203.0.113.9")
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_failure_stats()
+    assert result["spray_suspects"] == [{"ip_address": "203.0.113.9", "distinct_users": 5, "attempts": 5}]
+    assert result["internal_spray_suspects"] == [
+        {"ip_address": "192.0.2.10", "distinct_users": 6, "attempts": 6, "site": "HQ", "site_name": "Head office"}
+    ]
+    assert result["sites"] == {"configured": True, "ranges": 3, "error": None}
+
+
+def test_signin_failure_stats_labels_top_ips_with_the_most_specific_site(inject, sites_ini):
+    rows = _spray_rows("192.0.2.200", 1) + _spray_rows("2001:db8:1::5", 1)
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    result = server.signin_failure_stats()
+    by_ip = {e["ip_address"]: e for e in result["top_ips"]}
+    assert by_ip["192.0.2.200"]["site"] == "LAB"  # /25 beats the wider /24
+    assert "site_name" not in by_ip["192.0.2.200"]
+    assert by_ip["2001:db8:1::5"]["site"] == "HQ"
+
+
+def test_signin_failure_stats_without_sites_ini_keeps_every_suspect_external(inject):
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (_spray_rows("192.0.2.10"), False)}))
+    result = server.signin_failure_stats()
+    assert [s["ip_address"] for s in result["spray_suspects"]] == ["192.0.2.10"]
+    assert result["internal_spray_suspects"] == []
+    assert result["sites"] == {"configured": False, "ranges": 0, "error": None}
+
+
+def test_signin_failure_stats_with_a_broken_sites_ini_keeps_every_suspect_external(inject, tmp_path, monkeypatch):
+    path = tmp_path / "sites.ini"
+    path.write_text("[HQ]\nipv4 = 192.0.2.0/33\n", encoding="utf-8")
+    monkeypatch.setenv("ENTRAADM_SITES_INI", str(path))
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (_spray_rows("192.0.2.10"), False)}))
+    result = server.signin_failure_stats()
+    assert [s["ip_address"] for s in result["spray_suspects"]] == ["192.0.2.10"]
+    assert result["sites"]["error"] is not None
+
+
+def test_health_check_is_degraded_when_sites_ini_is_missing(inject, tmp_path, monkeypatch):
+    monkeypatch.setenv("ENTRAADM_SITES_INI", str(tmp_path / "missing.ini"))
+    inject(FakeGraphClient())
+    result = server.health_check()
+    assert result["status"] == "degraded"
+    assert result["sites"]["configured"] is True
+    assert "cannot read" in result["sites"]["error"]
+
+
+def test_health_check_reports_loaded_sites(inject, sites_ini):
+    inject(FakeGraphClient())
+    result = server.health_check()
+    assert result["status"] == "healthy"
+    assert result["sites"] == {"configured": True, "ranges": 3, "error": None}
+
+
+def test_daily_brief_summary_counts_internal_suspects_and_surfaces_sites_error(inject, tmp_path, monkeypatch):
+    path = tmp_path / "sites.ini"
+    path.write_text("[HQ]\nname = x\n", encoding="utf-8")  # no ranges
+    monkeypatch.setenv("ENTRAADM_SITES_INI", str(path))
+    inject(
+        FakeGraphClient(
+            paged_responses={
+                "/auditLogs/signIns": (_spray_rows("192.0.2.10"), False),
+                "/auditLogs/directoryAudits": ([_audit_row()], False),
+            }
+        )
+    )
+    result = server.daily_brief()
+    assert result["summary"]["internal_spray_suspects"] == 0
+    assert "no ipv4/ipv6 ranges" in result["summary"]["sites_error"]
+
+
+def test_daily_brief_summary_counts_internal_suspects(inject, sites_ini):
+    inject(
+        FakeGraphClient(
+            paged_responses={
+                "/auditLogs/signIns": (_spray_rows("192.0.2.10"), False),
+                "/auditLogs/directoryAudits": ([_audit_row()], False),
+            }
+        )
+    )
+    result = server.daily_brief()
+    assert result["summary"]["spray_suspects"] == []
+    assert result["summary"]["internal_spray_suspects"] == 1
+    assert "sites_error" not in result["summary"]

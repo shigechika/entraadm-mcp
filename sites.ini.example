@@ -1,0 +1,12 @@
+; ENTRAADM_SITES_INI: your own address ranges, one section per site.
+; Same format as keycloak-mcp's KEYCLOAK_SITES_INI, so one file can serve both.
+; name is optional. ipv4 / ipv6 take comma-separated CIDRs. Lookups are longest-prefix.
+
+[HQ]
+name = Head office
+ipv4 = 192.0.2.0/24
+ipv6 = 2001:db8:1::/48
+
+[LAB]
+name = Computer lab
+ipv4 = 192.0.2.128/25, 198.51.100.0/26
