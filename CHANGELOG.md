@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/shigechika/entraadm-mcp/compare/v1.1.0...v1.2.0) (2026-10-14)
+
+
+### Features
+
+* separate the tenant's own address ranges from spray suspects (ENTRAADM_SITES_INI) ([#15](https://github.com/shigechika/entraadm-mcp/issues/15)) ([600973e](https://github.com/shigechika/entraadm-mcp/commit/600973e02df95b98dbd1ce56bfbba546ed11c77d))
+
 ## [1.1.0](https://github.com/shigechika/entraadm-mcp/compare/v1.0.1...v1.1.0) (2026-10-02)
 
 
