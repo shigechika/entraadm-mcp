@@ -1028,6 +1028,17 @@ def test_signin_failure_stats_without_sites_ini_keeps_every_suspect_external(inj
     assert result["sites"] == {"configured": False, "ranges": 0, "error": None}
 
 
+def test_signin_failure_stats_one_bad_cidr_does_not_make_the_good_ranges_external(inject, tmp_path, monkeypatch):
+    path = tmp_path / "sites.ini"
+    path.write_text("[HQ]\nipv4 = 192.0.2.0/24, 192.0.2.0/33\n", encoding="utf-8")
+    monkeypatch.setenv("ENTRAADM_SITES_INI", str(path))
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (_spray_rows("192.0.2.10"), False)}))
+    result = server.signin_failure_stats()
+    assert result["spray_suspects"] == []
+    assert [s["site"] for s in result["internal_spray_suspects"]] == ["HQ"]
+    assert "192.0.2.0/33" in result["sites"]["error"]
+
+
 def test_signin_failure_stats_with_a_broken_sites_ini_keeps_every_suspect_external(inject, tmp_path, monkeypatch):
     path = tmp_path / "sites.ini"
     path.write_text("[HQ]\nipv4 = 192.0.2.0/33\n", encoding="utf-8")
@@ -1067,7 +1078,7 @@ def test_daily_brief_summary_counts_internal_suspects_and_surfaces_sites_error(i
         )
     )
     result = server.daily_brief()
-    assert result["summary"]["internal_spray_suspects"] == 0
+    assert result["summary"]["internal_spray_suspects"] == []
     assert "no ipv4/ipv6 ranges" in result["summary"]["sites_error"]
 
 
@@ -1082,5 +1093,5 @@ def test_daily_brief_summary_counts_internal_suspects(inject, sites_ini):
     )
     result = server.daily_brief()
     assert result["summary"]["spray_suspects"] == []
-    assert result["summary"]["internal_spray_suspects"] == 1
+    assert [s["ip_address"] for s in result["summary"]["internal_spray_suspects"]] == ["192.0.2.10"]
     assert "sites_error" not in result["summary"]

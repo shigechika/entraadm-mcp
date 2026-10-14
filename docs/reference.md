@@ -26,9 +26,9 @@ also takes `category` (for example `UserManagement`) to filter on the Graph side
 Optional: `ENTRAADM_SITES_INI` names an INI file of your own address ranges, in
 the same format as keycloak-mcp's `KEYCLOAK_SITES_INI` (one section per site,
 optional `name`, comma-separated `ipv4` / `ipv6` CIDRs). Lookups are
-longest-prefix, and the file is re-read when it changes. An invalid CIDR, an
-unreadable file or a file with no ranges is reported as an error rather than
-skipped.
+longest-prefix, and the file is re-read when it changes. An unreadable file or
+a file with no ranges is reported as an error. An invalid CIDR is reported too,
+but the valid ranges are still used.
 
 ### Required Graph permissions
 
@@ -87,9 +87,9 @@ clamped as above.
 With `ENTRAADM_SITES_INI` set, IPs inside your own ranges get `site` (and
 `site_name`) in `top_ips`, and suspects inside them move to
 `internal_spray_suspects`, so that a NAT egress or shared workstations do not
-bury an outside source. `sites` reports whether the file loaded; on a load
-error every suspect stays in `spray_suspects`. `daily_brief`'s summary carries
-the count of internal suspects, and `sites_error` when the file failed to load.
+bury an outside source. `sites` reports whether the file loaded; when it cannot
+be read, every suspect stays in `spray_suspects`. `daily_brief`'s summary carries
+the internal suspects too, and `sites_error` when the file has an error.
 
 ### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
 

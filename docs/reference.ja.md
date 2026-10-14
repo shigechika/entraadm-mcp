@@ -24,7 +24,7 @@ app-only 用3変数のうち1つか2つだけの設定は、起動時に設定�
 任意: `ENTRAADM_SITES_INI` は自組織のアドレス範囲を書いた INI ファイル。形式は
 keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクション，`name` は任意，
 `ipv4`／`ipv6` にカンマ区切りの CIDR）。照合は最長一致で，ファイルが変わると読み直す。
-CIDR の誤り・読めないファイル・範囲の無いファイルは，読み飛ばさずにエラーとして報告する。
+読めないファイル・範囲の無いファイルはエラーとして報告する。CIDR の誤りも報告するが，正しい範囲はそのまま使う。
 
 ### 必要な Graph 権限
 
@@ -79,8 +79,8 @@ IP を列挙する——Entra のアカウント単位スマートロックア�
 `ENTRAADM_SITES_INI` を指定すると，自組織の範囲の IP は `top_ips` に `site`（と
 `site_name`）が付き，その範囲のスプレー疑いは `internal_spray_suspects` に移る。
 NAT の出口や共用端末に外部の送信元が埋もれないようにするため。`sites` は読み込めたかを示し，
-読み込みに失敗したときはすべて `spray_suspects` に残す。`daily_brief` の要約には
-内部の疑いの件数と，読み込みに失敗したときの `sites_error` が入る。
+読めないときはすべて `spray_suspects` に残す。`daily_brief` の要約には
+内部の疑いの一覧と，ファイルにエラーがあるときの `sites_error` が入る。
 
 ### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
 

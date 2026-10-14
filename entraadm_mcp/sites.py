@@ -11,10 +11,13 @@ sibling keycloak-mcp's ``KEYCLOAK_SITES_INI``, so one file can serve both::
 Each section is a site: the section name is its short code, ``name`` an
 optional display name, and ``ipv4`` / ``ipv6`` comma-separated CIDR ranges.
 Lookups are longest-prefix: a narrower range carved out of a wider one wins,
-whatever order the sections are written in.
+whatever order the sections are written in. An IPv4-mapped IPv6 address
+(``::ffff:192.0.2.1``) is looked up as IPv4.
 
-The file is re-read when its modification time changes, so an updated file
-takes effect without restarting the server.
+An invalid CIDR is reported as an error, but the valid ranges are still used,
+so one typo does not turn every internal range into "external". The file is
+re-read when it changes (size, mtime, ctime or inode), and a failed read is not
+cached, so an updated or repaired file takes effect without a restart.
 """
 
 from __future__ import annotations
@@ -51,11 +54,6 @@ class SiteTable:
         """True when ENTRAADM_SITES_INI is set, whether or not it loaded."""
         return bool(self.path)
 
-    @property
-    def usable(self) -> bool:
-        """True when at least one range loaded and no error occurred."""
-        return self.error is None and bool(self.networks)
-
     def classify(self, ip: str | None) -> Site | None:
         """Return the site whose range most specifically contains ``ip``, or None."""
         if not ip or not self.networks:
@@ -64,11 +62,13 @@ class SiteTable:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             return None
-        best: tuple[_Network, Site] | None = None
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        # networks is sorted longest prefix first, so the first match is the most specific.
         for net, site in self.networks:
-            if addr.version == net.version and addr in net and (best is None or net.prefixlen > best[0].prefixlen):
-                best = (net, site)
-        return best[1] if best else None
+            if addr.version == net.version and addr in net:
+                return site
+        return None
 
     def status(self) -> dict:
         """Fixed-shape summary for health_check and tool output."""
@@ -97,12 +97,14 @@ def _parse(path: str) -> SiteTable:
                 except ValueError:
                     bad.append(f"[{section}] {cidr}")
 
+    networks.sort(key=lambda pair: pair[0].prefixlen, reverse=True)
+    error = None
     if bad:
-        # A typo must not quietly turn an internal range into "external".
-        return SiteTable(path=path, error=f"invalid CIDR in {ENV_VAR}: {', '.join(bad[:5])}")
-    if not networks:
-        return SiteTable(path=path, error=f"{ENV_VAR} has no ipv4/ipv6 ranges")
-    return SiteTable(path=path, networks=networks)
+        more = f" (+{len(bad) - 5} more)" if len(bad) > 5 else ""
+        error = f"invalid CIDR in {ENV_VAR}, skipped: {', '.join(bad[:5])}{more}"
+    elif not networks:
+        error = f"{ENV_VAR} has no ipv4/ipv6 ranges"
+    return SiteTable(path=path, networks=networks, error=error)
 
 
 _lock = threading.Lock()
@@ -116,13 +118,19 @@ def load(env: dict | None = None) -> SiteTable:
     if path is None:
         return SiteTable(path=None)
     try:
-        mtime = os.stat(path).st_mtime_ns
+        st = os.stat(path)
     except OSError as err:
         return SiteTable(path=path, error=f"cannot read {ENV_VAR}: {type(err).__name__}: {err}")
 
-    key = (path, mtime)
+    # ctime catches a chmod/chown repair; size and inode catch a rewrite within one mtime tick.
+    key = (path, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
     with _lock:
-        if _cache["key"] != key:
-            _cache["table"] = _parse(path)
-            _cache["key"] = key
-        return _cache["table"]  # type: ignore[return-value]
+        if _cache["key"] == key:
+            return _cache["table"]  # type: ignore[return-value]
+        table = _parse(path)
+        if table.networks or not table.error:
+            _cache["key"], _cache["table"] = key, table
+        else:
+            # Nothing loaded: try again on the next call instead of caching the failure.
+            _cache["key"] = None
+        return table

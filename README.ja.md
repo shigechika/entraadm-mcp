@@ -100,6 +100,7 @@ export ENTRAADM_SITES_INI=/path/to/sites.ini
 `ENTRAADM_SITES_INI` は keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ形式なので，1 つの
 ファイルを両方で使える（[`sites.ini.example`](sites.ini.example) 参照）。照合は最長一致。
 指定したのに読めないときは `health_check` が `degraded` になり，すべての IP を外部扱いにする。
+CIDR の誤りも同じく報告するが，正しい範囲はそのまま使う。
 
 ## 使い方
 

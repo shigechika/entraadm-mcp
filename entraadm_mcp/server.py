@@ -747,8 +747,9 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
     egress or a room of shared workstations fails for many users every day,
     and would otherwise bury an outside source. Internal suspects are kept,
     not dropped, because an internal host can be compromised too. ``sites``
-    reports whether the file loaded; on a load error every IP stays in
-    ``spray_suspects``, as if the file were not set.
+    reports whether the file loaded; an invalid CIDR is reported in
+    ``sites.error`` while the valid ranges are still used, and a file that
+    cannot be read leaves every IP in ``spray_suspects``.
 
     Read-only (AuditLog.Read.All application permission, or -- for azure-cli
     auth -- the Reports Reader directory role). Graph cannot filter sign-ins
@@ -1293,7 +1294,7 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
             "distinct_failing_users": stats["distinct_failing_users"],
             "top_error_codes": stats["top_error_codes"][:5],
             "spray_suspects": stats["spray_suspects"],
-            "internal_spray_suspects": len(stats["internal_spray_suspects"]),
+            "internal_spray_suspects": stats["internal_spray_suspects"],
             "capped": stats["capped"],
         }
         if stats["sites"]["error"] is not None:

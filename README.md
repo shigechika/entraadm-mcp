@@ -110,8 +110,9 @@ export ENTRAADM_SITES_INI=/path/to/sites.ini
 
 `ENTRAADM_SITES_INI` uses the same format as keycloak-mcp's `KEYCLOAK_SITES_INI`,
 so one file can serve both (see [`sites.ini.example`](sites.ini.example)). Lookups are
-longest-prefix. A file that is set but cannot be loaded makes `health_check` report
-`degraded`, and every IP is then treated as external.
+longest-prefix. A file that is set but cannot be read makes `health_check` report
+`degraded`, and every IP is then treated as external. An invalid CIDR is reported the
+same way, but the valid ranges are still used.
 
 ## Usage
 
