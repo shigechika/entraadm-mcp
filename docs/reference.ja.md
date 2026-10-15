@@ -152,7 +152,10 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 そのサブスクリプションのコンテナー走査が不完全なら `null`（不明）——部分的な走査から「未保護」を
 作らない。`backup_ok` は `lastBackupStatus` が `Completed`／`CompletedWithWarnings` か。`stale` は
 `stale_hours` 以内の復旧ポイント（`lastRecoveryPoint`）が無いこと（既定 36 時間は日次ポリシー向け。
-週次なら増やす——行に `policy_name` がある）。
+週次なら増やす——行に `policy_name` がある）。`backup_ok` が `false` になるのは `Failed` だけで、実行中
+（`InProgress`・`Warning`）は `null`。`protectionState` の無いアイテムは VM を `unknown` にし、2 つのコンテナーが
+同じ VM のアイテムを持つときは動いている方を採る（`duplicate_items`）。`items_complete` はサブスクリプション
+スコープの Reader を前提にする（リソースグループに絞った Reader ではコンテナー一覧が黙って絞られる）。
 
 `subscription` は id か表示名。`None` は見える全サブスクリプションを走査して結合も全体で行うので、
 別サブスクリプションのコンテナーに保護されている VM も一致する。1 つ指定したときはその
@@ -184,8 +187,9 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 
 `services`：Microsoft 365 の各サービスと現在の状態（`healthOverviews`）。`issues`：未解決の
 インシデント・アドバイザリを新しい順に（`id`、`title`、`service`、`feature`、`classification`、
-`status`、`start`、`last_modified`、`impact`）。`summary` に `degraded_services`、`open_incidents`、
-`open_advisories`、`capped`（どちらもページングするので、途中で切れた数は下限）。各セクションは
+`status`、`start`、`last_modified`、`impact`）。`summary` に `degraded_services`（状態が開いているもの——`serviceDegradation`・`serviceInterruption`・
+`investigating` 等。Graph が数日残す `serviceRestored` などの解決後の値は数えない）、`services_without_status`、
+`open_incidents`、`open_advisories`、`capped`（どちらもページングするので、途中で切れた数は下限）。各セクションは
 `{"error", "missing_permission": "ServiceHealth.Read.All"}` に個別に劣化する。メッセージセンター
 （`messages`）は別の権限が要るので読まない。
 
@@ -193,7 +197,7 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 
 `m365_service_health`・`signin_failure_stats`・`directory_audits` を、コンパクトな `summary` を
 添えて1回でまとめる（`service_health` に劣化中のサービス・開いているインシデント数・そのセクションの
-`capped`）。1 つのセクションの権限エラーはそのセクションだけを劣化させ、残りは全体が返る。
+`capped`。これは上位の `summary.capped` にも畳み込む）。1 つのセクションの権限エラーはそのセクションだけを劣化させ、残りは全体が返る。
 この順に 1 つの期限を共有して同期実行する。Azure VM のバックアップは意図的に入れていない
 （ARM の走査が予算を使い切りうるので `vm_backup_status` を別に呼ぶ）。`samples` は現状未使用（予約）。
 

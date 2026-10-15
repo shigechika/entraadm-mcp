@@ -1337,6 +1337,8 @@ def test_vm_backup_status_classifies_every_state(inject, inject_arm, frozen_now)
         _item(SUB_A, "pending", state="IRPending", last_status="", recovery_point=None),
         _item(SUB_A, "failed", last_status="Failed", recovery_point="2026-10-10T20:00:00Z"),
         _item(SUB_A, "weird", state="SomethingNew", last_status=None, recovery_point="garbage"),
+        _item(SUB_A, "running", last_status="InProgress"),
+        _item(SUB_A, "stateless", state=None),
         _item(SUB_A, "gone"),  # the VM no longer exists
     ]
     inject_arm(
@@ -1344,7 +1346,10 @@ def test_vm_backup_status_classifies_every_state(inject, inject_arm, frozen_now)
             {
                 "/subscriptions": (_subs((SUB_A, "alpha")), False),
                 _vms_path(SUB_A): (
-                    [_vm(SUB_A, n) for n in ("ok", "stopped", "pending", "failed", "weird", "none")],
+                    [
+                        _vm(SUB_A, n)
+                        for n in ("ok", "stopped", "pending", "failed", "weird", "running", "stateless", "none")
+                    ],
                     False,
                 ),
                 _vaults_path(SUB_A): ([_vault(SUB_A)], False),
@@ -1365,21 +1370,27 @@ def test_vm_backup_status_classifies_every_state(inject, inject_arm, frozen_now)
     )
     assert rows["weird"]["protected"] is False and rows["weird"]["stale"] is None
     assert rows["none"]["protected"] is False and rows["none"]["vault"] is None and "note" not in rows["none"]
+    # a backup in flight is neither a success nor a failure
+    assert rows["running"]["protected"] is True and rows["running"]["backup_ok"] is None
+    # an item whose state is unreadable is unknown, not unprotected
+    assert rows["stateless"]["protected"] is None and rows["stateless"]["vault"] == "vault1"
+    assert "protectionState is missing" in rows["stateless"]["note"]
     counts = result["subscriptions"][0]
-    assert (counts["vm_count"], counts["protected"], counts["unprotected"], counts["unknown"]) == (6, 3, 3, 0)
+    assert (counts["vm_count"], counts["protected"], counts["unprotected"], counts["unknown"]) == (8, 4, 3, 1)
     assert (counts["stale"], counts["failed"]) == (1, 1)
     assert result["summary"] == {
         "subscriptions": 1,
         "failed_subscriptions": 0,
-        "vm_count": 6,
-        "protected": 3,
+        "vm_count": 8,
+        "protected": 4,
         "unprotected": 3,
-        "unknown": 0,
+        "unknown": 1,
         "stale": 1,
         "failed": 1,
         "orphans": 1,
         "capped": False,
     }
+    assert result["duplicate_items"] == 0
     assert result["orphans"][0]["name"] == "gone" and result["orphans"][0]["vault"] == "vault1"
     assert result["capped"] is False and result["skipped"] == []
     assert result["coverage"].startswith("every visible subscription")
@@ -1535,6 +1546,49 @@ def test_vm_backup_status_global_join_needs_every_vault_scan_complete(inject, in
     assert policies["summary"]["failed_subscriptions"] == 2 and policies["capped"] is True
 
 
+def test_vm_backup_status_a_vault_that_errors_is_skipped_not_fatal(inject, inject_arm, frozen_now):
+    # A 5xx past the retry budget on one vault keeps the subscription's VM listing.
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A), _vault(SUB_A, "vault2")], False),
+                _items_path(SUB_A): GraphError("ARM request failed (500): boom"),
+                _items_path(SUB_A, "vault2"): ([_item(SUB_A, "ok")], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    assert "error" not in entry and entry["vms"][0]["protected"] is True
+    assert entry["skipped_vaults"][0]["reason"] == "ARM request failed (500): boom"
+    assert entry["items_complete"] is False and result["summary"]["failed_subscriptions"] == 0
+
+
+def test_vm_backup_status_prefers_the_live_item_when_two_vaults_hold_one_vm(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    old = _item(SUB_A, "ok", state="ProtectionStopped")
+    live = _item(SUB_A, "ok")
+    for order in ((old, live), (live, old)):
+        inject_arm(
+            FakeArmClient(
+                {
+                    "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                    _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                    _vaults_path(SUB_A): ([_vault(SUB_A, "vault-old"), _vault(SUB_A, "vault-new")], False),
+                    _items_path(SUB_A, "vault-old"): ([order[0]], False),
+                    _items_path(SUB_A, "vault-new"): ([order[1]], False),
+                }
+            )
+        )
+        result = server.vm_backup_status()
+        row = result["subscriptions"][0]["vms"][0]
+        assert row["protected"] is True and row["protection_state"] == "Protected"
+        assert result["duplicate_items"] == 1
+
+
 def test_vm_backup_status_unreadable_vault_is_skipped_with_its_reason(inject, inject_arm, frozen_now):
     inject(FakeGraphClient())
     inject_arm(
@@ -1664,7 +1718,8 @@ def test_vm_backup_status_tolerates_null_and_wrong_typed_fields(inject, inject_a
     entry = result["subscriptions"][0]
     rows = {r["id"]: r for r in entry["vms"]}
     ok = rows[_vm(SUB_A, "ok")["id"].lower()]
-    assert ok["protected"] is False and ok["policy_name"] is None and ok["last_backup_status"] is None
+    # protectionState is null: an item exists but says nothing, so unknown rather than unprotected
+    assert ok["protected"] is None and ok["policy_name"] is None and ok["last_backup_status"] is None
     assert rows[""]["name"] is None and rows[""]["protected"] is None  # no id: cannot join; scan was incomplete
     assert len(entry["skipped_vaults"]) == 2
 
@@ -1898,6 +1953,10 @@ def test_m365_service_health_summarises_services_and_open_issues(inject):
                     [
                         {"id": "a", "service": "Exchange Online", "status": "serviceDegradation"},
                         {"id": "b", "service": "SharePoint Online", "status": "serviceOperational"},
+                        # post-resolution values Graph keeps for days are not "degraded"
+                        {"id": "c", "service": "Microsoft Teams", "status": "serviceRestored"},
+                        {"id": "d", "service": "OneDrive", "status": "postIncidentReviewPublished"},
+                        {"id": "e", "service": "Microsoft Entra", "status": "investigating"},
                         "junk",
                     ],
                     False,
@@ -1909,7 +1968,7 @@ def test_m365_service_health_summarises_services_and_open_issues(inject):
     result = server.m365_service_health(max_pages=3)
     assert result["summary"] == {
         "capped": True,
-        "degraded_services": ["Exchange Online"],
+        "degraded_services": ["Exchange Online", "Microsoft Entra"],
         "services_without_status": 1,
         "open_incidents": 1,
         "open_advisories": 1,
@@ -1970,8 +2029,8 @@ def test_daily_brief_carries_a_service_health_section(inject):
         "capped": True,
     }
     assert result["m365_service_health"]["summary"]["open_advisories"] == 1
-    # the service-health cap is reported in its own section, not folded into the sign-in cap
-    assert result["summary"]["capped"] is False
+    # one coverage contract: a capped service-health listing caps the brief
+    assert result["summary"]["capped"] is True
 
 
 def test_daily_brief_service_health_config_error_degrades_only_that_section(inject, monkeypatch):

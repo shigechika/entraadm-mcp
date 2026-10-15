@@ -171,6 +171,12 @@ partial scan never produces a false "unprotected". `backup_ok` is whether
 `lastBackupStatus` is `Completed` / `CompletedWithWarnings`; `stale` means no
 recovery point (`lastRecoveryPoint`) within `stale_hours` (default 36 h, suits
 daily policies; raise it for weekly ones — `policy_name` is in the row).
+`backup_ok` is `false` only for `Failed`; a backup in flight (`InProgress`,
+`Warning`) leaves it `null`. An item whose `protectionState` is missing makes
+the VM `unknown`; when two vaults hold an item for one VM the live one wins
+(`duplicate_items`). `items_complete` assumes the subscription-scope Reader
+role: a Reader scoped to resource groups gets a silently filtered vault
+listing.
 
 `subscription` is an id or display name; `None` scans every visible
 subscription and joins globally, so a VM backed up to a vault in another
@@ -214,8 +220,11 @@ Same `subscription` resolution and coverage flags as `vm_backup_status`.
 (`healthOverviews`); `issues`: the unresolved incidents and advisories,
 newest first (`id`, `title`, `service`, `feature`, `classification`,
 `status`, `start`, `last_modified`, `impact`). `summary` carries
-`degraded_services`, `open_incidents`, `open_advisories` and `capped` (both
-collections page; a capped scan is a lower bound). Each section degrades on
+`degraded_services` (services whose status is an open one — `serviceDegradation`,
+`serviceInterruption`, `investigating`, …; the post-resolution values Graph
+keeps for days such as `serviceRestored` are not counted),
+`services_without_status`, `open_incidents`, `open_advisories` and `capped`
+(both collections page; a capped scan is a lower bound). Each section degrades on
 its own with `{"error", "missing_permission": "ServiceHealth.Read.All"}`.
 The message center (`messages`) needs another permission and is not read.
 
@@ -224,7 +233,7 @@ The message center (`messages`) needs another permission and is not read.
 One-call summary combining `m365_service_health`, `signin_failure_stats`
 and `directory_audits`, with a compact `summary` on top (`service_health`
 holds the degraded services, the open incident count and that section's
-`capped`). A permission failure in one section degrades only that section —
+`capped`, which is also folded into the top-level `summary.capped`). A permission failure in one section degrades only that section —
 the others still return in full. The sections run in that order,
 synchronously, under one shared deadline; Azure VM backup is deliberately
 not a section (its ARM fan-out could exhaust the budget — call

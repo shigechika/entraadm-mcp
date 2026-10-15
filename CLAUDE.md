@@ -81,8 +81,8 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `initiatedBy` and `targetResources` client-side (`_matches_user`). This
   means a busy window needs a larger `max_pages` budget to find one specific
   user's audits than the sign-in tools do for the same window.
-- **Nothing from an ARM response or from tool input reaches a URL path
-  unvalidated.** `subscription` is resolved against `list_subscriptions`
+- Nothing from an ARM response or from tool input reaches a URL path
+  unvalidated. `subscription` is resolved against `list_subscriptions`
   and only ARM's own GUID-checked id is interpolated; vault ids must match
   `_VAULT_ID_RE` (built from the resource-group and vault naming rules, not
   `[^/]+` — a group made only of periods is rejected while `rg..prod`,
@@ -90,22 +90,24 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   one being scanned) or they go to `skipped_vaults` and are never requested. The VM ↔ protected-item
   join lower-cases both ids (ARM casing differs between Compute and
   RecoveryServices).
-- **A partial scan never produces a false diagnosis.** In
+- A partial scan never produces a false diagnosis. In
   `vm_backup_status` a VM with no protected item is `protected: false` only
   when the vault scan it could have appeared in was complete — the named
   subscription's, or in the global join every subscription's (an unreadable
   or unreached subscription counts as incomplete and sets `capped`);
   otherwise `null` (unknown). Orphans are reported only when the VM listing
-  was complete.
+  was complete. `complete` assumes the documented subscription-scope
+  Reader: a Reader scoped to resource groups gets a silently filtered vault
+  listing this scan cannot detect.
   Unknown schedule/retention types in `vm_backup_policies` come back as
   `{"type", "unparsed": true}`, never dropped. Projection goes through
   `_str`/`_int`/`_dict`/`_parse_iso`, which turn a wrong type or a malformed
   timestamp into `null`, never an exception.
-- **`health_check`'s `arm` probe is informational.** It never moves
+- `health_check`'s `arm` probe is informational. It never moves
   `status`: Azure RBAC is optional, and a deployment used only for Entra
   triage must not sit at `degraded` forever. `--check` prints the matching
   `Info:` line without changing the exit code.
-- **`daily_brief` carries `m365_service_health` and not VM backup.** Service
+- `daily_brief` carries `m365_service_health` and not VM backup. Service
   health is two small reads and runs first; the ARM fan-out is the one scan
   that could exhaust the shared budget, so callers invoke `vm_backup_status`
   separately.

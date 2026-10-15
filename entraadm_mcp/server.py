@@ -290,7 +290,10 @@ def health_check() -> dict:
     deployment used only for Entra triage must not sit at ``degraded``
     forever because nobody granted it a Reader role. It runs last under its
     own short budget (``_ARM_PROBE_SECONDS``) so an unresponsive ARM cannot
-    push this whole call past the client's tool-call timeout.
+    push this whole call past the client's tool-call timeout. The budget
+    bounds the request, not the first token acquisition (azure-identity is
+    synchronous; in azure-cli mode it shells out to ``az``), which is the
+    same limit every tool here has.
     """
     site_status = sites.load().status()
     try:
@@ -1310,7 +1313,10 @@ _IAAS_VM_FILTER = "backupManagementType eq 'AzureIaasVM'"
 _BACKUP_PARAMS = {"api-version": ARM_API_VERSIONS["backup"], "$filter": _IAAS_VM_FILTER}
 #: protectionState values under which backups are running (IRPending = first backup not done yet).
 _PROTECTED_STATES = ("Protected", "IRPending")
+#: lastBackupStatus values that settle backup_ok. Anything else (InProgress, Warning,
+#: an unknown value) is neither a success nor a failure: backup_ok stays null.
 _BACKUP_OK_STATUSES = ("Completed", "CompletedWithWarnings")
+_BACKUP_FAILED_STATUSES = ("Failed",)
 _DEFAULT_STALE_HOURS = 36
 _MIN_STALE_HOURS = 1
 _MAX_STALE_HOURS = 24 * 400
@@ -1442,7 +1448,10 @@ def _scan_vaults(arm: ArmClient, sub: dict, max_pages: int, collection: str, par
     ``{"vaults", "rows", "skipped_vaults", "complete"}``: ``rows`` is a list of
     ``(vault_entry, resource)``; ``complete`` is False when the vault listing was
     capped, a vault was skipped, or any vault's collection was capped -- the
-    callers must then not treat an absent row as proof of absence. A vault id
+    callers must then not treat an absent row as proof of absence. ``complete``
+    assumes the documented subscription-scope Reader role: a Reader scoped to
+    some resource groups gets a vault listing silently filtered to those
+    groups, which this scan cannot tell from a complete one. A vault id
     that does not match ``_VAULT_ID_RE`` (or names another subscription) is
     never requested. A subscription-level ApiError propagates to the caller.
     """
@@ -1479,9 +1488,11 @@ def _scan_vaults(arm: ArmClient, sub: dict, max_pages: int, collection: str, par
             items, items_capped = arm.get_paged(
                 f"{vid}/{collection}", params=params, max_pages=max_pages, deadline=_current_deadline()
             )
-        except ApiPermissionError as e:
-            # RBAC can be scoped to a resource group: one unreadable vault must
-            # not hide the readable ones, nor be mistaken for an empty one.
+        except ApiError as e:
+            # One unreadable vault (RBAC scoped to a resource group, a vault deleted
+            # between the listing and the read, a 5xx past the retry budget) must not
+            # hide the readable ones, be mistaken for an empty one, or discard the
+            # subscription's VM listing that already succeeded.
             skipped.append({"id": vid.lower(), "reason": str(e)})
             complete = False
             continue
@@ -1529,12 +1540,19 @@ def _vm_row(vm: dict, match: tuple[dict, dict] | None, items_complete: bool, now
         last_backup_time=_str(p.get("lastBackupTime")),
         last_recovery_point=_str(p.get("lastRecoveryPoint")),
     )
+    if state is None:
+        # An item exists but its state is unreadable: unknown, not "unprotected".
+        row["note"] = "protected item found but its protectionState is missing"
+        return row
     row["protected"] = state in _PROTECTED_STATES
     if state == "IRPending":
         row["note"] = "initial backup pending"
         return row
     status = row["last_backup_status"]
-    row["backup_ok"] = None if status is None else status in _BACKUP_OK_STATUSES
+    if status in _BACKUP_OK_STATUSES:
+        row["backup_ok"] = True
+    elif status in _BACKUP_FAILED_STATUSES:
+        row["backup_ok"] = False
     if row["protected"]:
         recovery_point = _parse_iso(row["last_recovery_point"])
         row["stale"] = recovery_point is None or (now - recovery_point) > datetime.timedelta(hours=stale_hours)
@@ -1575,8 +1593,12 @@ def vm_backup_status(
       incomplete (``capped``, a skipped vault, an unreadable or unreached
       subscription -- in the global join, any subscription's) -- a partial
       scan never produces a false "unprotected".
-    - ``backup_ok``: whether ``lastBackupStatus`` is ``Completed`` /
-      ``CompletedWithWarnings``; ``null`` before any backup ran.
+    - ``backup_ok``: ``true`` for ``lastBackupStatus`` ``Completed`` /
+      ``CompletedWithWarnings``, ``false`` for ``Failed``, ``null`` before any
+      backup ran or while one is running (``InProgress``, ``Warning``, an
+      unknown value). An item whose ``protectionState`` is missing is
+      ``protected: null`` with a note. When two vaults hold an item for one
+      VM, the one still backing up wins (``duplicate_items`` counts them).
     - ``stale``: no recovery point (``lastRecoveryPoint``, the proof of a
       successful backup) within ``stale_hours``. The default 36 h suits daily
       policies; raise it for weekly ones (``policy_name`` is in the row).
@@ -1610,6 +1632,7 @@ def vm_backup_status(
     raw_vms: dict[str, list[dict]] = {}
     matches: dict[str, tuple[dict, dict]] = {}  # lower-cased VM id -> (protected item, vault)
     item_subscription: dict[str, str] = {}  # lower-cased VM id -> subscription whose vault holds it
+    duplicate_items = 0
     for sub in targets:
         sid = sub["subscription_id"]
         if not _budget_left():
@@ -1630,9 +1653,16 @@ def vm_backup_status(
         for vault, item in scan["rows"]:
             p = _props(item)
             key = (_str(p.get("virtualMachineId")) or _str(p.get("sourceResourceId")) or "").lower()
-            if key:
-                matches[key] = (item, vault)
-                item_subscription[key] = sid
+            if not key:
+                continue
+            if key in matches:
+                # Two vaults hold an item for one VM (a stopped item left behind after a
+                # move): the one still backing up wins, whatever order ARM listed them in.
+                duplicate_items += 1
+                if _str(_props(matches[key][0]).get("protectionState")) in _PROTECTED_STATES:
+                    continue
+            matches[key] = (item, vault)
+            item_subscription[key] = sid
         entries.append(
             {
                 "subscription_id": sid,
@@ -1711,6 +1741,7 @@ def vm_backup_status(
         "skipped": skipped,
         "orphans": orphans,
         "unjoined_items": unjoined,
+        "duplicate_items": duplicate_items,
         "capped": capped,
     }
 
@@ -1890,6 +1921,20 @@ def vm_backup_policies(subscription: str | None = None, max_pages: int | None = 
 # ---------------------------------------------------------------------------
 
 _SERVICE_HEALTH_PERMISSION = "ServiceHealth.Read.All"
+#: healthOverviews statuses that mean an issue is open now. Graph keeps post-resolution
+#: values (serviceRestored, postIncidentReviewPublished, falsePositive, resolved,
+#: mitigated, ...) on a service for days; those are not "degraded".
+_OPEN_HEALTH_STATUSES = (
+    "serviceDegradation",
+    "serviceInterruption",
+    "investigating",
+    "restoringService",
+    "verifyingService",
+    "extendedRecovery",
+    "investigationSuspended",
+    "confirmed",
+    "reported",
+)
 
 
 def _service_health_error(e: Exception) -> dict:
@@ -1960,9 +2005,9 @@ def m365_service_health(max_pages: int | None = None) -> dict:
 
     summary: dict = {"capped": capped}
     if isinstance(services, list):
-        # A row without a status is not "degraded"; it is listed as unknown so it is not hidden.
+        # Only an open issue counts; a row without a status is counted so it is not hidden.
         summary["degraded_services"] = [
-            s["service"] or "(unnamed service)" for s in services if s["status"] not in ("serviceOperational", None)
+            s["service"] or "(unnamed service)" for s in services if s["status"] in _OPEN_HEALTH_STATUSES
         ]
         summary["services_without_status"] = sum(1 for s in services if s["status"] is None)
     else:
@@ -2048,6 +2093,8 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
     else:
         summary["admin_actions"] = audits["count"]
         summary["capped"] = summary.get("capped", False) or audits["capped"]
+    if "error" not in health:
+        summary["capped"] = summary.get("capped", False) or health["capped"]
 
     return {
         "window_hours": hours,

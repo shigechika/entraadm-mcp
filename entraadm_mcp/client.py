@@ -320,8 +320,10 @@ class _RestClient:
             base = httpx.URL(self.base_url)
         except (httpx.InvalidURL, TypeError):
             return False
-        if not link.is_absolute_url:
-            return True
+        if not link.host and not link.scheme:
+            return True  # path-relative; httpx resolves it against base_url
+        # A scheme-relative "//host/path" has a host but no scheme: it is not
+        # absolute to httpx, and it names another host.
         return (link.scheme, link.host, link.port) == (base.scheme, base.host, base.port)
 
     def get_paged(

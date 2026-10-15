@@ -602,12 +602,13 @@ def test_arm_reports_capped_when_a_nextlink_remains():
         "https://evil.example/subscriptions?api-version=x",
         "http://management.azure.com/subscriptions?api-version=x",
         "https://management.azure.com:8443/subscriptions?api-version=x",
+        "//evil.example/subscriptions?api-version=x",
     ],
 )
 def test_foreign_nextlink_is_not_followed_with_the_token(link):
     # The bearer token goes on every request; a continuation link naming any
     # other scheme/host/port would hand it to that host.
-    foreign = respx.get(url__regex=r"^https?://(evil\.example|management\.azure\.com:8443)/.*").mock(
+    foreign = respx.get(url__regex=r"^https?://(evil\.example|management\.azure\.com:8443)(:\d+)?/.*").mock(
         return_value=httpx.Response(200, json={"value": []})
     )
     plain_http = respx.get(url__regex=r"^http://management\.azure\.com/.*").mock(
