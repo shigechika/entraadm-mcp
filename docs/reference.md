@@ -64,7 +64,8 @@ error}` for `ENTRAADM_SITES_INI`; a configured file with an `error` turns a
 capped}` (one page of `GET /subscriptions` on Azure Resource Manager;
 `subscriptions` is how many the credential can see, `capped` whether more
 pages existed) and is informational: it never changes `status`,
-because Azure RBAC is optional for this server.
+because Azure RBAC is optional for this server. It runs under its own
+10-second budget so an unresponsive ARM cannot stall the whole call.
 
 ### `get_user(upn)`
 

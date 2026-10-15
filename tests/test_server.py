@@ -268,6 +268,25 @@ def test_health_check_shape_is_identical_across_all_statuses(inject):
         assert set(result["arm"].keys()) == {"auth", "detail", "subscriptions", "capped"}
 
 
+def test_health_check_gives_the_arm_probe_its_own_short_budget(inject, inject_arm, monkeypatch):
+    import time
+
+    inject(FakeGraphClient())
+    seen = []
+
+    class RecordingArm(FakeArmClient):
+        def check(self, deadline=None):
+            seen.append(deadline)
+            return super().check(deadline)
+
+    inject_arm(RecordingArm())
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "0")  # even with the tool budget disabled
+    before = time.monotonic()
+    server.health_check()
+    assert len(seen) == 1 and seen[0] is not None
+    assert 0 < seen[0] - before <= server._ARM_PROBE_SECONDS + 0.5
+
+
 def test_health_check_arm_probe_is_informational(inject, inject_arm):
     # Azure RBAC is optional: a deployment used only for Entra triage must not
     # be degraded forever because ARM is unreachable or sees no subscription.
@@ -1881,7 +1900,8 @@ def test_m365_service_health_summarises_services_and_open_issues(inject):
     result = server.m365_service_health(max_pages=3)
     assert result["summary"] == {
         "capped": True,
-        "degraded_services": ["Exchange Online", None],
+        "degraded_services": ["Exchange Online"],
+        "services_without_status": 1,
         "open_incidents": 1,
         "open_advisories": 1,
     }

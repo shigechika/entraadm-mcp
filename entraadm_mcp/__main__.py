@@ -30,9 +30,11 @@ def _check() -> int:
     else:
         print(f"Degraded: sign-in log access unavailable — {signin.get('detail')}")
     # Informational, like health_check's ``arm`` probe: Azure RBAC is optional.
+    import time
+
     from entraadm_mcp.client import ArmClient
 
-    arm = ArmClient(config, credential=client.credential).check()
+    arm = ArmClient(config, credential=client.credential).check(deadline=time.monotonic() + 10.0)
     if arm.get("auth") == "ok":
         print(f"Info: ARM reachable, {arm.get('subscriptions')} subscription(s) visible")
     else:

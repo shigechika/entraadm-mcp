@@ -58,7 +58,8 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 `"degraded"` に下げる。`arm` は `{auth, detail, subscriptions, capped}`（Azure Resource Manager の
 `GET /subscriptions` の 1 ページ。`subscriptions` はクレデンシャルから見える数、`capped` は続きのページが
 あったか）で情報扱い——Azure RBAC は
-このサーバでは任意なので `status` を変えない。
+このサーバでは任意なので `status` を変えない。ARM が応答しなくても呼び出し全体が止まらないよう，
+このプローブだけ 10 秒の予算で走る。
 
 ### `get_user(upn)`
 

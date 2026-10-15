@@ -121,6 +121,9 @@ _MAX_TOP = 500
 _SPRAY_MIN_DISTINCT_USERS = 5
 
 _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+#: Budget of health_check's informational ARM probe: short, so an unresponsive ARM
+#: cannot push the whole health_check past the client's tool-call timeout.
+_ARM_PROBE_SECONDS = 10.0
 
 #: AADSTS error codes worth annotating in triage output. Not exhaustive -- a
 #: code missing from this dict is returned with meaning=None, never hidden.
@@ -285,7 +288,9 @@ def health_check() -> dict:
     reachable, and how many subscriptions this credential can see). It
     never moves ``status``: Azure RBAC is optional for this server, and a
     deployment used only for Entra triage must not sit at ``degraded``
-    forever because nobody granted it a Reader role.
+    forever because nobody granted it a Reader role. It runs last under its
+    own short budget (``_ARM_PROBE_SECONDS``) so an unresponsive ARM cannot
+    push this whole call past the client's tool-call timeout.
     """
     site_status = sites.load().status()
     try:
@@ -305,7 +310,7 @@ def health_check() -> dict:
 
     graph = client.check()
     signin_probe = client.probe_signin_access()
-    arm = _arm().check(deadline=_new_deadline())
+    arm = _arm().check(deadline=time.monotonic() + _ARM_PROBE_SECONDS)
     ok_count = sum(1 for probe in (graph, signin_probe) if probe["auth"] == "ok")
     status = "healthy" if ok_count == 2 else "degraded" if ok_count == 1 else "error"
     if status == "healthy" and site_status["error"] is not None:
@@ -1947,7 +1952,11 @@ def m365_service_health(max_pages: int | None = None) -> dict:
 
     summary: dict = {"capped": capped}
     if isinstance(services, list):
-        summary["degraded_services"] = [s["service"] for s in services if s["status"] != "serviceOperational"]
+        # A row without a status is not "degraded"; it is listed as unknown so it is not hidden.
+        summary["degraded_services"] = [
+            s["service"] or "(unnamed service)" for s in services if s["status"] not in ("serviceOperational", None)
+        ]
+        summary["services_without_status"] = sum(1 for s in services if s["status"] is None)
     else:
         summary["degraded_services"] = services
     if isinstance(issues, list):
