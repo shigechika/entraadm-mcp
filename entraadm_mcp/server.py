@@ -299,7 +299,7 @@ def health_check() -> dict:
             "auth_mode": "unknown",
             "graph": {"auth": "error", "detail": detail},
             "signin_probe": {"auth": "error", "detail": detail},
-            "arm": {"auth": "error", "detail": detail, "subscriptions": None},
+            "arm": {"auth": "error", "detail": detail, "subscriptions": None, "capped": None},
             "sites": site_status,
         }
 
@@ -1282,14 +1282,17 @@ def get_user_auth_methods(upn: str) -> dict:
 _GUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
 #: A Recovery Services vault id as ARM returns it, built from the documented
-#: naming rules (resource group: alphanumerics, ".", "_", "(", ")", "-", up to
-#: 90 characters; vault: alphanumerics and "-", 2-50) rather than ``[^/]+``,
-#: so "..", ".", "?", "#" and percent escapes never reach a request path. ARM casing
-#: varies between responses, hence IGNORECASE; the subscription GUID is
-#: compared against the one being scanned by the caller.
+#: naming rules rather than ``[^/]+``. Resource group: letters and digits in
+#: any script, "_", ".", "(", ")", "-", 1-90 characters, not ending in a
+#: period, and not a segment made only of periods (so "." and ".." never
+#: reach a request path; "rg..prod" and ".prod" are valid names and pass).
+#: Vault: ASCII alphanumerics and "-", 2-50. "?", "#", "%", "\\" and whitespace
+#: are outside both alphabets. ARM casing varies between responses, hence
+#: IGNORECASE; the subscription GUID is compared against the one being
+#: scanned by the caller.
 _VAULT_ID_RE = re.compile(
     rf"^/subscriptions/(?P<sub>{_GUID})"
-    r"/resourceGroups/(?P<rg>(?![^/]*\.\.)(?!\.)[A-Za-z0-9._()\-]{1,90}(?<!\.))"
+    r"/resourceGroups/(?P<rg>(?!\.+/)[\w.()\-]{1,90}(?<!\.))"
     r"/providers/Microsoft\.RecoveryServices/vaults/(?P<vault>[A-Za-z0-9\-]{2,50})$",
     re.IGNORECASE,
 )
@@ -1555,8 +1558,9 @@ def vm_backup_status(
       yet, ``note`` says so); ``false`` when there is none, or it is
       ``ProtectionStopped`` / ``ProtectionPaused`` / ``ProtectionError`` (data
       may be retained, backups are not running -- the state is shown);
-      ``null`` (unknown) when no item was found but the vault scan of that
-      subscription was incomplete (``capped``, a skipped vault) -- a partial
+      ``null`` (unknown) when no item was found but the vault scan was
+      incomplete (``capped``, a skipped vault, an unreadable or unreached
+      subscription -- in the global join, any subscription's) -- a partial
       scan never produces a false "unprotected".
     - ``backup_ok``: whether ``lastBackupStatus`` is ``Completed`` /
       ``CompletedWithWarnings``; ``null`` before any backup ran.
@@ -1629,15 +1633,21 @@ def vm_backup_status(
 
     vm_ids: set[str] = set()
     totals = _count_vms([])
-    capped = listing_capped or bool(skipped)
+    failed_subscriptions = sum(1 for e in entries if "error" in e)
+    # A subscription that errored or was never reached is missing from the inventory.
+    capped = listing_capped or bool(skipped) or failed_subscriptions > 0
+    # Global mode joins across subscriptions, so "no item anywhere" is only
+    # proof of absence when every subscription's vault scan completed.
+    vaults_complete_everywhere = not capped and all(e["items_complete"] for e in entries if "error" not in e)
     for entry in entries:
         if "error" in entry:
             continue
         rows = []
+        items_complete = entry["items_complete"] if subscription is not None else vaults_complete_everywhere
         for vm in raw_vms[entry["subscription_id"]]:
             vid = (_str(vm.get("id")) or "").lower()
             vm_ids.add(vid)
-            rows.append(_vm_row(vm, matches.get(vid), entry["items_complete"], now, stale_hours))
+            rows.append(_vm_row(vm, matches.get(vid), items_complete, now, stale_hours))
         counts = _count_vms(rows)
         entry.update(counts)
         entry["vms"] = rows
@@ -1677,7 +1687,13 @@ def vm_backup_status(
     return {
         "stale_hours": stale_hours,
         "coverage": coverage,
-        "summary": {"subscriptions": len(entries), **totals, "orphans": len(orphans), "capped": capped},
+        "summary": {
+            "subscriptions": len(entries),
+            "failed_subscriptions": failed_subscriptions,
+            **totals,
+            "orphans": len(orphans),
+            "capped": capped,
+        },
         "subscriptions": entries,
         "skipped": skipped,
         "orphans": orphans,
@@ -1828,6 +1844,7 @@ def vm_backup_policies(subscription: str | None = None, max_pages: int | None = 
             scan = _scan_vaults(arm, sub, pages, "backupPolicies", _BACKUP_PARAMS)
         except ApiError as e:
             entries.append({"subscription_id": sid, "name": sub["name"], **_arm_error(e)})
+            capped = True  # part of the inventory is missing
             continue
         policies = [_policy_entry(policy, vault) for vault, policy in scan["rows"]]
         total += len(policies)
@@ -1843,7 +1860,12 @@ def vm_backup_policies(subscription: str | None = None, max_pages: int | None = 
             }
         )
     return {
-        "summary": {"subscriptions": len(entries), "policies": total, "capped": capped},
+        "summary": {
+            "subscriptions": len(entries),
+            "failed_subscriptions": sum(1 for e in entries if "error" in e),
+            "policies": total,
+            "capped": capped,
+        },
         "subscriptions": entries,
         "skipped": skipped,
         "capped": capped,
@@ -1855,6 +1877,14 @@ def vm_backup_policies(subscription: str | None = None, max_pages: int | None = 
 # ---------------------------------------------------------------------------
 
 _SERVICE_HEALTH_PERMISSION = "ServiceHealth.Read.All"
+
+
+def _service_health_error(e: Exception) -> dict:
+    """A section's error; the permission hint only when the failure was a permission failure."""
+    out: dict = {"error": str(e)}
+    if isinstance(e, ApiPermissionError):
+        out["missing_permission"] = _SERVICE_HEALTH_PERMISSION
+    return out
 
 
 def _issue_entry(issue: dict) -> dict:
@@ -1902,7 +1932,7 @@ def m365_service_health(max_pages: int | None = None) -> dict:
         capped = capped or c
         services = [{"service": _str(_dict(o).get("service")), "status": _str(_dict(o).get("status"))} for o in raw]
     except ApiError as e:
-        services = {"error": str(e), "missing_permission": _SERVICE_HEALTH_PERMISSION}
+        services = _service_health_error(e)
     try:
         raw, c = client.get_paged(
             "/admin/serviceAnnouncement/issues",
@@ -1913,7 +1943,7 @@ def m365_service_health(max_pages: int | None = None) -> dict:
         capped = capped or c
         issues = [_issue_entry(i) for i in raw if isinstance(i, dict)]
     except ApiError as e:
-        issues = {"error": str(e), "missing_permission": _SERVICE_HEALTH_PERMISSION}
+        issues = _service_health_error(e)
 
     summary: dict = {"capped": capped}
     if isinstance(services, list):

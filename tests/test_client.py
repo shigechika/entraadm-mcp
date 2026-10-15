@@ -729,8 +729,23 @@ def test_arm_check_counts_visible_subscriptions_and_reports_errors():
         return_value=httpx.Response(200, json={"value": [{"subscriptionId": "1"}, {"subscriptionId": "2"}]})
     )
     client, _cred = _arm_client()
-    assert client.check() == {"auth": "ok", "detail": None, "subscriptions": 2}
+    assert client.check() == {"auth": "ok", "detail": None, "subscriptions": 2, "capped": False}
+    respx.get(f"{ARM_BASE}/subscriptions").mock(
+        return_value=httpx.Response(200, json={"value": [{"subscriptionId": "1"}], "nextLink": f"{ARM_BASE}/x"})
+    )
+    assert _arm_client()[0].check()["capped"] is True
     respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(401))
     client, _cred = _arm_client()
     result = client.check()
     assert result["auth"] == "error" and result["subscriptions"] is None and "401" in result["detail"]
+
+
+@respx.mock
+def test_arm_check_reports_an_expired_deadline_as_an_error_not_as_zero_subscriptions():
+    import time
+
+    route = respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(200, json={"value": []}))
+    client, _cred = _arm_client()
+    result = client.check(deadline=time.monotonic() - 1)
+    assert result["auth"] == "error" and result["subscriptions"] is None and "deadline" in result["detail"]
+    assert route.call_count == 0

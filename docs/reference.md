@@ -60,9 +60,10 @@ is reachable but sign-in log access is not, `"error"` when Graph itself is
 unreachable or auth is misconfigured. `graph`/`signin_probe` are each
 `{auth: "ok"|"error", detail: str|null}`. `sites` is `{configured, ranges,
 error}` for `ENTRAADM_SITES_INI`; a configured file with an `error` turns a
-`"healthy"` status into `"degraded"`. `arm` is `{auth, detail, subscriptions}`
-(`GET /subscriptions` on Azure Resource Manager; `subscriptions` is how many
-the credential can see) and is informational: it never changes `status`,
+`"healthy"` status into `"degraded"`. `arm` is `{auth, detail, subscriptions,
+capped}` (one page of `GET /subscriptions` on Azure Resource Manager;
+`subscriptions` is how many the credential can see, `capped` whether more
+pages existed) and is informational: it never changes `status`,
 because Azure RBAC is optional for this server.
 
 ### `get_user(upn)`
@@ -180,7 +181,10 @@ subscriptions adds `ambiguous`. Per subscription: `vm_count`, `protected`,
 own `capped`), `skipped_vaults` (an id that failed validation, a vault the
 budget did not reach, or one the credential cannot read, with the reason),
 `vms_capped`, `items_complete`, `capped`; or `{"error", "missing_permission"}`
-when that subscription is unreadable. `orphans` are protected items whose VM
+when that subscription is unreadable. In the global join an unmatched VM is
+`unknown` unless every subscription's vault scan completed (an unreadable or
+unreached subscription counts as incomplete, and `summary.failed_subscriptions`
+and `capped` say so). `orphans` are protected items whose VM
 no longer exists, reported only when that VM's subscription was listed
 completely; `unjoined_items` counts the rest. `skipped` lists the
 subscriptions the wall-clock budget did not reach; `summary` and `capped`

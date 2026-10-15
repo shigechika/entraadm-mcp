@@ -451,15 +451,17 @@ class ArmClient(_RestClient):
 
         ``GET /subscriptions`` needs no RBAC at all (it lists what the
         credential can see), so ``auth: ok`` with ``subscriptions: 0`` means
-        "ARM reachable, no Reader role granted anywhere yet".
+        "ARM reachable, no Reader role granted anywhere yet". ``capped`` is
+        True when ARM had more pages than the one this probe reads.
         """
         try:
-            subs, _capped = self.get_paged(
-                "/subscriptions",
-                params={"api-version": ARM_API_VERSIONS["subscriptions"]},
-                max_pages=1,
-                deadline=deadline,
+            # One page via get(), not get_paged(): a deadline that expires before ARM
+            # answers must surface as an error here, not as "ok, 0 subscriptions".
+            body = self.get(
+                "/subscriptions", params={"api-version": ARM_API_VERSIONS["subscriptions"]}, deadline=deadline
             )
         except ApiError as e:
-            return {"auth": "error", "detail": str(e), "subscriptions": None}
-        return {"auth": "ok", "detail": None, "subscriptions": len(subs)}
+            return {"auth": "error", "detail": str(e), "subscriptions": None, "capped": None}
+        value = body.get("value", [])
+        count = len(value) if isinstance(value, list) else 0
+        return {"auth": "ok", "detail": None, "subscriptions": count, "capped": body.get("nextLink") is not None}

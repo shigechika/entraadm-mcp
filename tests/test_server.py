@@ -84,7 +84,9 @@ class FakeArmClient:
     def __init__(self, paged_responses=None, check_result=None):
         self._paged_responses = paged_responses if paged_responses is not None else {}
         self._check_result = (
-            check_result if check_result is not None else {"auth": "ok", "detail": None, "subscriptions": 0}
+            check_result
+            if check_result is not None
+            else {"auth": "ok", "detail": None, "subscriptions": 0, "capped": False}
         )
         self.calls = []
 
@@ -263,17 +265,18 @@ def test_health_check_shape_is_identical_across_all_statuses(inject):
         assert set(result["sites"].keys()) == {"configured", "ranges", "error"}
         assert set(result["graph"].keys()) == {"auth", "detail"}
         assert set(result["signin_probe"].keys()) == {"auth", "detail"}
-        assert set(result["arm"].keys()) == {"auth", "detail", "subscriptions"}
+        assert set(result["arm"].keys()) == {"auth", "detail", "subscriptions", "capped"}
 
 
 def test_health_check_arm_probe_is_informational(inject, inject_arm):
     # Azure RBAC is optional: a deployment used only for Entra triage must not
     # be degraded forever because ARM is unreachable or sees no subscription.
     inject(FakeGraphClient())
-    inject_arm(FakeArmClient(check_result={"auth": "error", "detail": "no token", "subscriptions": None}))
+    probe = {"auth": "error", "detail": "no token", "subscriptions": None, "capped": None}
+    inject_arm(FakeArmClient(check_result=probe))
     result = server.health_check()
     assert result["status"] == "healthy"
-    assert result["arm"] == {"auth": "error", "detail": "no token", "subscriptions": None}
+    assert result["arm"] == probe
 
 
 # ---------------------------------------------------------------------------
@@ -1339,6 +1342,7 @@ def test_vm_backup_status_classifies_every_state(inject, inject_arm, frozen_now)
     assert (counts["stale"], counts["failed"]) == (1, 1)
     assert result["summary"] == {
         "subscriptions": 1,
+        "failed_subscriptions": 0,
         "vm_count": 6,
         "protected": 3,
         "unprotected": 3,
@@ -1396,6 +1400,9 @@ def test_vm_backup_status_orphans_need_a_complete_vm_listing(inject, inject_arm,
     "bad_id",
     [
         f"/subscriptions/{SUB_A}/resourceGroups/../providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/./providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg./providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg 1/providers/Microsoft.RecoveryServices/vaults/v1",
         f"/subscriptions/{SUB_A}/resourceGroups/rg1/providers/Microsoft.RecoveryServices/vaults/v1?x=1",
         f"/subscriptions/{SUB_A}/resourceGroups/rg1/providers/Microsoft.RecoveryServices/vaults/v1#frag",
         f"/subscriptions/{SUB_A}/resourceGroups/rg%2F1/providers/Microsoft.RecoveryServices/vaults/v1",
@@ -1424,24 +1431,23 @@ def test_vm_backup_status_never_requests_a_vault_id_that_fails_validation(inject
     assert entry["items_complete"] is False and result["capped"] is True
 
 
-def test_vm_backup_status_accepts_arm_casing_differences_in_vault_ids(inject, inject_arm, frozen_now):
+@pytest.mark.parametrize("rg", ["My.RG_(1)", "rg..prod", ".prod", "東京-rg", "a"])
+def test_vm_backup_status_accepts_arm_casing_differences_and_valid_group_names(inject, inject_arm, frozen_now, rg):
     inject(FakeGraphClient())
-    odd = (
-        f"/SUBSCRIPTIONS/{SUB_A.upper()}/resourcegroups/My.RG_(1)/providers/microsoft.recoveryservices/vaults/My-Vault"
-    )
+    odd = f"/SUBSCRIPTIONS/{SUB_A.upper()}/resourcegroups/{rg}/providers/microsoft.recoveryservices/vaults/My-Vault"
     arm = inject_arm(
         FakeArmClient(
             {
                 "/subscriptions": (_subs((SUB_A, "alpha")), False),
-                _vms_path(SUB_A): ([_vm(SUB_A, "ok", rg="My.RG_(1)")], False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok", rg=rg)], False),
                 _vaults_path(SUB_A): ([{"id": odd, "name": "My-Vault"}], False),
-                f"{odd}/backupProtectedItems": ([_item(SUB_A, "ok", rg="my.rg_(1)")], False),
+                f"{odd}/backupProtectedItems": ([_item(SUB_A, "ok", rg=rg.lower())], False),
             }
         )
     )
     result = server.vm_backup_status()
     entry = result["subscriptions"][0]
-    assert entry["vaults"][0]["name"] == "My-Vault" and entry["vaults"][0]["resource_group"] == "My.RG_(1)"
+    assert entry["vaults"][0]["name"] == "My-Vault" and entry["vaults"][0]["resource_group"] == rg
     assert entry["vms"][0]["protected"] is True
     assert any(c[1] == f"{odd}/backupProtectedItems" for c in arm.calls)
 
@@ -1464,6 +1470,41 @@ def test_vm_backup_status_one_subscription_error_degrades_only_that_entry(inject
     assert a["subscription_id"] == SUB_A and a["missing_permission"] == server.ARM_ROLE_HINT and "vms" not in a
     assert b["vms"][0]["protected"] is True
     assert result["summary"]["subscriptions"] == 2 and result["summary"]["vm_count"] == 1
+    # part of the inventory is missing, so the result is capped and an unmatched VM would be unknown
+    assert result["summary"]["failed_subscriptions"] == 1 and result["capped"] is True
+    only_b = server.vm_backup_status(subscription="beta")
+    assert only_b["capped"] is False and only_b["summary"]["failed_subscriptions"] == 0
+
+
+def test_vm_backup_status_global_join_needs_every_vault_scan_complete(inject, inject_arm, frozen_now):
+    # The VM is in A (complete scan); B's vault scan was capped. Globally the VM
+    # may be protected by a vault in B that was not read, so it is unknown.
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([], False),
+                _vms_path(SUB_B): ([], False),
+                _vaults_path(SUB_B): ([_vault(SUB_B)], False),
+                _items_path(SUB_B): ([], True),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    assert result["subscriptions"][0]["vms"][0]["protected"] is None
+    assert result["summary"]["unknown"] == 1 and result["capped"] is True
+    # Named alone, A's own (complete) scan is the authority.
+    assert server.vm_backup_status(subscription="alpha")["subscriptions"][0]["vms"][0]["protected"] is False
+    # Every subscription denied: nothing is known, and the summary says so.
+    inject_arm(
+        FakeArmClient({"/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False), "*": ARM_PERM_ERROR})
+    )
+    result = server.vm_backup_status()
+    assert result["summary"]["failed_subscriptions"] == 2 and result["capped"] is True
+    policies = server.vm_backup_policies()
+    assert policies["summary"]["failed_subscriptions"] == 2 and policies["capped"] is True
 
 
 def test_vm_backup_status_unreadable_vault_is_skipped_with_its_reason(inject, inject_arm, frozen_now):
@@ -1765,7 +1806,7 @@ def test_vm_backup_policies_parses_v1_and_every_v2_frequency(inject, inject_arm)
     assert by_name["Unknown"]["retention"] == {"type": "NewRetention", "unparsed": True}
     assert by_name["Empty"]["schedule"] == {"type": None, "unparsed": True}
     assert by_name["Empty"]["protected_item_count"] is None
-    assert result["summary"] == {"subscriptions": 1, "policies": 7, "capped": False}
+    assert result["summary"] == {"subscriptions": 1, "failed_subscriptions": 0, "policies": 7, "capped": False}
     # the policy listing uses the workload filter and the backup api-version; no second item scan
     policy_calls = [c for c in arm.calls if c[1].endswith("/backupPolicies")]
     assert policy_calls[0][2] == {"api-version": server.ARM_API_VERSIONS["backup"], "$filter": server._IAAS_VM_FILTER}
@@ -1860,6 +1901,14 @@ def test_m365_service_health_summarises_services_and_open_issues(inject):
     issues_call = next(c for c in client.calls if c[1] == ISSUES)
     assert issues_call[2] == {"$filter": "isResolved eq false", "$orderby": "startDateTime desc"}
     assert issues_call[3] == 3
+
+
+def test_m365_service_health_permission_hint_only_for_permission_failures(inject):
+    outage = GraphError("Graph request failed (503): try later")
+    inject(FakeGraphClient(paged_responses={OVERVIEWS: outage, ISSUES: PERM_ERROR}))
+    result = server.m365_service_health()
+    assert result["services"] == {"error": str(outage)}
+    assert result["issues"]["missing_permission"] == "ServiceHealth.Read.All"
 
 
 def test_m365_service_health_degrades_each_section_on_its_own(inject):

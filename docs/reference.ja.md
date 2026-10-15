@@ -55,8 +55,9 @@ Azure RBAC は任意。`health_check` の `arm` プローブは情報扱い。
 Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`signin_probe` は
 それぞれ `{auth: "ok"|"error", detail: str|null}`。`sites` は `ENTRAADM_SITES_INI` の
 `{configured, ranges, error}` で，指定したファイルに `error` があると `"healthy"` を
-`"degraded"` に下げる。`arm` は `{auth, detail, subscriptions}`（Azure Resource Manager の
-`GET /subscriptions`。`subscriptions` はクレデンシャルから見える数）で情報扱い——Azure RBAC は
+`"degraded"` に下げる。`arm` は `{auth, detail, subscriptions, capped}`（Azure Resource Manager の
+`GET /subscriptions` の 1 ページ。`subscriptions` はクレデンシャルから見える数、`capped` は続きのページが
+あったか）で情報扱い——Azure RBAC は
 このサーバでは任意なので `status` を変えない。
 
 ### `get_user(upn)`
@@ -159,6 +160,8 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 `protected`、`unprotected`、`unknown`、`stale`、`failed`、`vms`、`vaults`（それぞれ `capped` 付き）、
 `skipped_vaults`（検証に落ちた id・予算が届かなかったコンテナー・読めないコンテナー。理由付き）、
 `vms_capped`、`items_complete`、`capped`。読めないサブスクリプションは `{"error", "missing_permission"}`。
+全体の結合では、全サブスクリプションのコンテナー走査が完了していない限り一致しない VM は `unknown`
+（読めない・届かなかったサブスクリプションも未完了に数え、`summary.failed_subscriptions` と `capped` に出る）。
 `orphans` は VM がもう無い保護アイテムで、その VM のサブスクリプションを完全に列挙できたときだけ出す。
 残りは `unjoined_items` の数。`skipped` は時間予算が届かなかったサブスクリプション。上に `summary` と `capped`。
 

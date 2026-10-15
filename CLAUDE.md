@@ -85,14 +85,18 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   unvalidated.** `subscription` is resolved against `list_subscriptions`
   and only ARM's own GUID-checked id is interpolated; vault ids must match
   `_VAULT_ID_RE` (built from the resource-group and vault naming rules, not
-  `[^/]+`, and the subscription GUID must be the one being scanned) or they
-  go to `skipped_vaults` and are never requested. The VM ↔ protected-item
+  `[^/]+` — a group made only of periods is rejected while `rg..prod`,
+  `.prod` and non-ASCII letters pass, and the subscription GUID must be the
+  one being scanned) or they go to `skipped_vaults` and are never requested. The VM ↔ protected-item
   join lower-cases both ids (ARM casing differs between Compute and
   RecoveryServices).
 - **A partial scan never produces a false diagnosis.** In
   `vm_backup_status` a VM with no protected item is `protected: false` only
-  when that subscription's vault scan was complete; otherwise `null`
-  (unknown). Orphans are reported only when the VM listing was complete.
+  when the vault scan it could have appeared in was complete — the named
+  subscription's, or in the global join every subscription's (an unreadable
+  or unreached subscription counts as incomplete and sets `capped`);
+  otherwise `null` (unknown). Orphans are reported only when the VM listing
+  was complete.
   Unknown schedule/retention types in `vm_backup_policies` come back as
   `{"type", "unparsed": true}`, never dropped. Projection goes through
   `_str`/`_int`/`_dict`/`_parse_iso`, which turn a wrong type or a malformed
