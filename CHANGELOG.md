@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/shigechika/entraadm-mcp/compare/v1.2.0...v1.3.0) (2026-10-15)
+
+
+### Features
+
+* Azure VM backup posture and Microsoft 365 service health tools ([#18](https://github.com/shigechika/entraadm-mcp/issues/18)) ([3f0c122](https://github.com/shigechika/entraadm-mcp/commit/3f0c1227965187043646fc2b2fddbe96cc77fb68))
+
 ## [1.2.0](https://github.com/shigechika/entraadm-mcp/compare/v1.1.0...v1.2.0) (2026-10-14)
 
 
