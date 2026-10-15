@@ -2,7 +2,9 @@
 
 [English](README.md) | 日本語
 
-Microsoft Entra ID のサインインログ・監査ログの triage 用 MCP サーバ。読み取り専用。
+Microsoft Entra ID のサインインログ・監査ログの triage 用 MCP サーバ。同じクレデンシャルで朝の
+パトロールが聞く Azure 側の 2 つ——Azure VM はバックアップされているか、Microsoft 365 自体が
+いま劣化していないか——にも答える。読み取り専用。
 
 ## 公式の Microsoft MCP Server for Enterprise ではなくこれを使う理由
 
@@ -15,7 +17,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 - **固定ツールセットではなく汎用 Graph クエリツール。** 公式サーバは、モデルが任意の
   `GET`／スキーマ探索呼び出しを Microsoft Graph へ構成できる1本のツールを公開する。
   人間には柔軟だが、自動 triage プロファイル向けの許可リストには馴染みにくい。
-  entraadm-mcp は固定・読み取り専用の9ツールを公開する
+  entraadm-mcp は固定・読み取り専用の13ツールを公開する
 - **AADSTS の意味翻訳がない。** サインイン失敗は生のエラーコードのまま返ってきて、
   triage には結局ルックアップが必要になる。entraadm-mcp は全てのサインイン失敗に
   コードの意味を注釈する
@@ -36,10 +38,20 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
-| `daily_brief` | `signin_failure_stats` と `directory_audits` を1回でまとめたサマリ |
+| `list_subscriptions` | このクレデンシャルから見える Azure サブスクリプションはどれか（ARM） |
+| `vm_backup_status` | Azure Backup で保護されている Azure VM はどれか、直近のバックアップは成功したか、復旧ポイントが古くなっていないか（ARM） |
+| `vm_backup_policies` | Azure VM のバックアップポリシーのスケジュールと保持期間（ARM） |
+| `m365_service_health` | Microsoft 365 のサービスが劣化していないか、どのインシデント・アドバイザリが開いているか |
+| `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
 
 全ツールが読み取り専用。書き込み操作（アカウントのブロック解除・パスワードリセット・
 セッション失効）はこのサーバのスコープ外。
+
+Azure Resource Manager の 3 ツールを Entra の名を持つサーバに置いているのは意図的。同じアプリ登録・
+同じ `azure-identity` のクレデンシャル（トークンのスコープが `https://management.azure.com/.default` に
+なるだけ）・同じ配備で動き、同じ `health_check` で見える。2 ツールのために別サーバを立てると運用面が
+倍になる。資源の管理ではなくガバナンスの読み取りであり、Reader ロールの無いサブスクリプションは
+`list_subscriptions` に出てこないだけ。
 
 ## 認証方式
 
@@ -60,6 +72,17 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | `get_user`（基本フィールド） | `User.Read.All` | |
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
+| `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All` | delegated 認証ではサインインしたユーザにサービス正常性を読める Entra ロール（Service Support Administrator や Global Reader 等）も必要 |
+
+### 必要な Azure RBAC
+
+| ツール | ロール | 備考 |
+|---|---|---|
+| `list_subscriptions` | なし | クレデンシャルから見えるものを列挙する。空ならどこにもロールが付いていない |
+| `vm_backup_status`、`vm_backup_policies` | 各サブスクリプションの **Reader** | `Reader` は `*/read` で、使う全エンドポイントを満たす。`Backup Reader` だけでは足りない（`Microsoft.Compute/virtualMachines/read` が無い）。app-only ならサービスプリンシパルに、azure-cli ならサインインしたユーザに付与する |
+
+Azure RBAC は任意。`health_check` は ARM の到達性と見えるサブスクリプション数を情報扱いの `arm` プローブとして
+報告し、`status` は変えない。Entra の triage だけに使う配備は `healthy` のまま。
 
 権限不足でツールがクラッシュすることはない。該当ツール（または該当フィールド）だけが
 `{"error": "...", "missing_permission": "..."}` に劣化し、必要なロール・権限を
@@ -143,7 +166,7 @@ entraadm-mcp
 | オプション | 効果 |
 |---|---|
 | `--version` | バージョンを表示して終了 |
-| `--check` | 認証を解決し、Graph 到達性とサインインログ読み取りをプローブしてレポートを出力。exit 0（設定エラー時は 1） |
+| `--check` | 認証を解決し、Graph 到達性とサインインログ読み取りをプローブしてレポートを出力（ARM の情報行付き）。exit 0（設定エラー時は 1） |
 
 ## 補足
 

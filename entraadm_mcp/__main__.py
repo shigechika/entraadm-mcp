@@ -8,7 +8,7 @@ from entraadm_mcp import __version__
 
 
 def _check() -> int:
-    """Config + auth + Graph smoke test. Exit 0 = Graph reachable."""
+    """Config + auth + Graph smoke test (plus an informational ARM line). Exit 0 = Graph reachable."""
     from entraadm_mcp.client import GraphClient
     from entraadm_mcp.config import AuthConfig, ConfigError
 
@@ -27,8 +27,16 @@ def _check() -> int:
     signin = client.probe_signin_access()
     if signin.get("auth") == "ok":
         print("OK: sign-in log access confirmed")
-        return 0
-    print(f"Degraded: sign-in log access unavailable — {signin.get('detail')}")
+    else:
+        print(f"Degraded: sign-in log access unavailable — {signin.get('detail')}")
+    # Informational, like health_check's ``arm`` probe: Azure RBAC is optional.
+    from entraadm_mcp.client import ArmClient
+
+    arm = ArmClient(config, credential=client.credential).check()
+    if arm.get("auth") == "ok":
+        print(f"Info: ARM reachable, {arm.get('subscriptions')} subscription(s) visible")
+    else:
+        print(f"Info: ARM not usable — {arm.get('detail')}")
     return 0
 
 

@@ -2,9 +2,10 @@
 
 ## Overview
 
-MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage.
-Transport is stdio only. All 9 tools are read-only — there is no
-write/mutating tool. Auth is env-var driven (see below); no config file. The
+MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
+plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
+service health. Transport is stdio only. All 13 tools are read-only — there
+is no write/mutating tool. Auth is env-var driven (see below); no config file. The
 one optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
 ranges, same format as keycloak-mcp's `KEYCLOAK_SITES_INI`), loaded by
 `entraadm_mcp/sites.py` with longest-prefix lookup.
@@ -29,10 +30,19 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   silent fallback to the wrong mode). `max_pages_default()` reads
   `ENTRAADM_MAX_PAGES_DEFAULT`, clamped to `[MIN_MAX_PAGES, MAX_MAX_PAGES]`
   = `[1, 50]`, falling back to `DEFAULT_MAX_PAGES` = 5 on anything unparsable.
-- `entraadm_mcp/client.py` — `GraphClient`: token acquisition/caching
-  (`_TOKEN_REFRESH_MARGIN_SECONDS` = 300), `get()`/`get_paged()` (the latter
-  follows `@odata.nextLink` and returns `(items, capped)`), and error
-  translation. `odata_quote()`/`validate_upn()` are the injection defenses —
+- `entraadm_mcp/client.py` — `_RestClient` is the shared bearer-token
+  client (token acquisition/caching with `_TOKEN_REFRESH_MARGIN_SECONDS` =
+  300, retry budgets, the deadline-bounded request, `get()`/`get_paged()`
+  returning `(items, capped)`); `GraphClient` (Graph v1.0,
+  `@odata.nextLink`) and `ArmClient` (`https://management.azure.com`, bare
+  `nextLink`, `api-version` from `ARM_API_VERSIONS` on every call,
+  `AuthorizationFailed` → the Reader-role hint `ARM_ROLE_HINT`) subclass it.
+  The two share one credential object and each caches its own scope's
+  token. `get_paged` refuses to follow a continuation link whose
+  scheme/host/port differ from the client's base URL (it would hand the
+  bearer token to that host) — `ApiError`, not followed. The exception
+  hierarchy is `ApiError`/`ApiDeadline`/`ApiAuthError`/`ApiPermissionError`;
+  `GraphError` etc. are aliases kept for the older imports. `odata_quote()`/`validate_upn()` are the injection defenses —
   every `$filter` built from tool input goes through one or both; MCP tool
   input is treated as adversarial. HTTP 403 is translated via
   `_PERMISSION_HINTS` into an actionable message (which Graph role/permission
@@ -40,11 +50,13 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   stack trace. 429 retries once (respecting `Retry-After`); 5xx retries twice
   with exponential backoff. `credential`/`http_client` constructor params
   are `# injectable for tests` (respx-mocked httpx, a stub credential).
-- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 9 tools.
+- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 13 tools.
   `AADSTS_CODES` is a hand-maintained dict (not exhaustive) annotating
   sign-in failure codes; missing codes return `meaning: null`, never hidden.
-  `_state = {"client": None}` is the sole test-injection point
-  (`monkeypatch.setitem`). Every tool's entry point catches
+  `_state = {"client": None, "arm": None}` holds the two test-injection
+  points (`monkeypatch.setitem`; the `inject` fixture always puts a
+  `FakeArmClient` in `arm`, because `health_check` probes ARM too and a real
+  `AzureCliCredential` would shell out to `az`). Every tool's entry point catches
   `(ConfigError, GraphError)` and returns `{"error": str(e)}`;
   `GraphPermissionError` specifically adds `missing_permission` naming the
   actual Graph permission that endpoint needs (not a single global constant
@@ -69,6 +81,30 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `initiatedBy` and `targetResources` client-side (`_matches_user`). This
   means a busy window needs a larger `max_pages` budget to find one specific
   user's audits than the sign-in tools do for the same window.
+- **Nothing from an ARM response or from tool input reaches a URL path
+  unvalidated.** `subscription` is resolved against `list_subscriptions`
+  and only ARM's own GUID-checked id is interpolated; vault ids must match
+  `_VAULT_ID_RE` (built from the resource-group and vault naming rules, not
+  `[^/]+`, and the subscription GUID must be the one being scanned) or they
+  go to `skipped_vaults` and are never requested. The VM ↔ protected-item
+  join lower-cases both ids (ARM casing differs between Compute and
+  RecoveryServices).
+- **A partial scan never produces a false diagnosis.** In
+  `vm_backup_status` a VM with no protected item is `protected: false` only
+  when that subscription's vault scan was complete; otherwise `null`
+  (unknown). Orphans are reported only when the VM listing was complete.
+  Unknown schedule/retention types in `vm_backup_policies` come back as
+  `{"type", "unparsed": true}`, never dropped. Projection goes through
+  `_str`/`_int`/`_dict`/`_parse_iso`, which turn a wrong type or a malformed
+  timestamp into `null`, never an exception.
+- **`health_check`'s `arm` probe is informational.** It never moves
+  `status`: Azure RBAC is optional, and a deployment used only for Entra
+  triage must not sit at `degraded` forever. `--check` prints the matching
+  `Info:` line without changing the exit code.
+- **`daily_brief` carries `m365_service_health` and not VM backup.** Service
+  health is two small reads and runs first; the ARM fan-out is the one scan
+  that could exhaust the shared budget, so callers invoke `vm_backup_status`
+  separately.
 - **`daily_brief` is synchronous, unlike the sibling gwsadm-mcp's
   job+poll `daily_brief_start`/`_result`.** If a tenant's sign-in volume
   makes this exceed a client's tool-call timeout, port that pattern here —
@@ -114,7 +150,13 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   hints attached to specific AADSTS codes (e.g. "compare this timestamp
   against the KeyCloak-side password-change event").
 - Write tools (unblock an account, force a password reset, revoke a
-  session), Identity Protection (`riskyUsers`, needs Entra ID P2),
-  Conditional Access policy reads (`Policy.Read.All`) — none needed for the
-  triage use case this server exists for; add only if that need is
-  demonstrated.
+  session), Identity Protection (`riskyUsers`, needs an Entra ID P2 licence
+  — the API answers 403 "tenant is not licensed" without it, so do not add
+  the tool before confirming the licence), Conditional Access policy reads
+  (`Policy.Read.All`), the message center (`ServiceMessage.Read.All`) — none
+  needed for the triage use case this server exists for; add only if that
+  need is demonstrated.
+- The Azure Backup field names (`AzureIaaSVMProtectedItem`, the V1/V2
+  schedule and `LongTermRetentionPolicy` shapes) were taken from the REST
+  reference and the respx/fake fixtures; confirm them against a live
+  subscription that has protected VMs when one becomes reachable.

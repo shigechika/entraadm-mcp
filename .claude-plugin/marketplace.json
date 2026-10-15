@@ -9,7 +9,7 @@
     {
       "name": "entraadm-mcp",
       "source": "./plugin",
-      "description": "Microsoft Entra ID sign-in and audit-log triage MCP for Claude Code. Investigate why a sign-in failed (AADSTS-annotated), tenant-wide failure trends and password-spray suspects, who changed what in the directory, and whether MFA is registered for an account, plus a one-shot daily_brief. Read-only — no write calls anywhere in this package. Needs either app-only credentials (ENTRAADM_TENANT_ID/_CLIENT_ID/_CLIENT_SECRET) or an existing `az login` session already present on the machine; the plugin cannot create or supply those for you.",
+      "description": "Microsoft Entra ID sign-in and audit-log triage MCP for Claude Code. Investigate why a sign-in failed (AADSTS-annotated), tenant-wide failure trends and password-spray suspects, who changed what in the directory, whether MFA is registered for an account, whether your Azure VMs are backed up (Azure Resource Manager, Reader role) and whether a Microsoft 365 service is degraded, plus a one-shot daily_brief. Read-only — no write calls anywhere in this package. Needs either app-only credentials (ENTRAADM_TENANT_ID/_CLIENT_ID/_CLIENT_SECRET) or an existing `az login` session already present on the machine; the plugin cannot create or supply those for you.",
       "category": "security",
       "homepage": "https://shigechika.github.io/entraadm-mcp/"
     }

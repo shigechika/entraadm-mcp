@@ -34,7 +34,11 @@ Microsoft は Entra ID データ向けに
 | `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
-| `daily_brief` | `signin_failure_stats` と `directory_audits` を1回でまとめたサマリ |
+| `list_subscriptions` | このクレデンシャルから見える Azure サブスクリプション（ARM） |
+| `vm_backup_status` | 保護されている Azure VM、直近のバックアップの成否、復旧ポイントの鮮度（ARM） |
+| `vm_backup_policies` | Azure VM バックアップポリシーのスケジュールと保持期間（ARM） |
+| `m365_service_health` | Microsoft 365 のサービス状態と開いているインシデント・アドバイザリ |
+| `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
 
 全ツールが読み取り専用。このサーバに書き込み系ツールは無い——アカウントのブロック解除・
 パスワードリセット・セッション失効はすべてスコープ外。

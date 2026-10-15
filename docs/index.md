@@ -38,7 +38,11 @@ and not a fit for an unattended triage bot:
 | `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
-| `daily_brief` | One-call summary combining `signin_failure_stats` and `directory_audits` |
+| `list_subscriptions` | Which Azure subscriptions this credential can see (ARM) |
+| `vm_backup_status` | Which Azure VMs are backed up, whether the last backup succeeded, and whether a recovery point is stale (ARM) |
+| `vm_backup_policies` | Schedule and retention of the Azure VM backup policies (ARM) |
+| `m365_service_health` | Microsoft 365 service status and the open incidents and advisories |
+| `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
 
 All tools are read-only. There is no write/mutating tool in this server —
 unblocking an account, resetting a password, and revoking a session are all

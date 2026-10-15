@@ -13,7 +13,14 @@ import pytest
 import respx
 
 from entraadm_mcp.client import (
+    ARM_API_VERSIONS,
+    ARM_BASE,
+    ARM_SCOPE,
     GRAPH_BASE,
+    GRAPH_SCOPE,
+    ApiError,
+    ApiPermissionError,
+    ArmClient,
     GraphAuthError,
     GraphClient,
     GraphError,
@@ -528,3 +535,202 @@ def test_trickling_body_is_cut_off_at_the_deadline(monkeypatch):
     items, capped = client.get_paged("/auditLogs/signIns", deadline=time.monotonic() + 0.2)
     assert items == [] and capped is True
     assert time.monotonic() - started < 0.8
+
+
+# ---------------------------------------------------------------------------
+# ArmClient: scope, api-version, nextLink, RBAC translation
+# ---------------------------------------------------------------------------
+
+
+class ScopeRecordingCredential(FakeCredential):
+    def __init__(self, tokens):
+        super().__init__(tokens)
+        self.scopes = []
+
+    def get_token(self, *scopes, **kwargs):
+        self.scopes.append(scopes)
+        return super().get_token(*scopes)
+
+
+def _arm_client(credential=None):
+    cred = credential if credential is not None else ScopeRecordingCredential([AccessToken("tok", 10_000_000_000)])
+    return ArmClient(AuthConfig(mode="azure-cli"), credential=cred), cred
+
+
+@respx.mock
+def test_arm_requests_the_management_scope_and_sends_api_version():
+    route = respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(200, json={"value": []}))
+    client, cred = _arm_client()
+    client.get_paged("/subscriptions", params={"api-version": ARM_API_VERSIONS["subscriptions"]})
+    assert cred.scopes == [(ARM_SCOPE,)]
+    sent = route.calls[0].request
+    assert sent.url.params["api-version"] == ARM_API_VERSIONS["subscriptions"]
+    assert sent.headers["Authorization"] == "Bearer tok"
+
+
+@respx.mock
+def test_arm_follows_bare_nextlink_and_keeps_api_version_on_the_continuation():
+    page2 = f"{ARM_BASE}/subscriptions?api-version={ARM_API_VERSIONS['subscriptions']}&%24skiptoken=abc"
+    route = respx.get(f"{ARM_BASE}/subscriptions")
+    route.side_effect = [
+        httpx.Response(200, json={"value": [{"subscriptionId": "1"}], "nextLink": page2}),
+        httpx.Response(200, json={"value": [{"subscriptionId": "2"}]}),
+    ]
+    client, _cred = _arm_client()
+    items, capped = client.get_paged("/subscriptions", params={"api-version": ARM_API_VERSIONS["subscriptions"]})
+    assert [i["subscriptionId"] for i in items] == ["1", "2"]
+    assert capped is False
+    assert route.calls[1].request.url.params["api-version"] == ARM_API_VERSIONS["subscriptions"]
+    assert route.calls[1].request.url.params["$skiptoken"] == "abc"
+
+
+@respx.mock
+def test_arm_reports_capped_when_a_nextlink_remains():
+    page2 = f"{ARM_BASE}/subscriptions?api-version=x&%24skiptoken=abc"
+    respx.get(f"{ARM_BASE}/subscriptions").mock(
+        return_value=httpx.Response(200, json={"value": [{"subscriptionId": "1"}], "nextLink": page2})
+    )
+    client, _cred = _arm_client()
+    items, capped = client.get_paged("/subscriptions", params={"api-version": "x"}, max_pages=1)
+    assert len(items) == 1 and capped is True
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://evil.example/subscriptions?api-version=x",
+        "http://management.azure.com/subscriptions?api-version=x",
+        "https://management.azure.com:8443/subscriptions?api-version=x",
+    ],
+)
+def test_foreign_nextlink_is_not_followed_with_the_token(link):
+    # The bearer token goes on every request; a continuation link naming any
+    # other scheme/host/port would hand it to that host.
+    foreign = respx.get(url__regex=r"^https?://(evil\.example|management\.azure\.com:8443)/.*").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    plain_http = respx.get(url__regex=r"^http://management\.azure\.com/.*").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    respx.get(f"{ARM_BASE}/subscriptions").mock(
+        return_value=httpx.Response(200, json={"value": [{"subscriptionId": "1"}], "nextLink": link})
+    )
+    client, _cred = _arm_client()
+    with pytest.raises(ApiError, match="foreign host"):
+        client.get_paged("/subscriptions", params={"api-version": "x"}, max_pages=5)
+    assert foreign.call_count == 0 and plain_http.call_count == 0
+
+
+@respx.mock
+def test_graph_foreign_nextlink_is_not_followed_either(monkeypatch):
+    foreign = respx.get(url__regex=r"^https://evil\.example/.*").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{GRAPH_BASE}/auditLogs/signIns").mock(
+        return_value=httpx.Response(
+            200, json={"value": [{"id": "1"}], "@odata.nextLink": "https://evil.example/auditLogs/signIns?x=1"}
+        )
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiError, match="foreign host"):
+        client.get_paged("/auditLogs/signIns", max_pages=5)
+    assert foreign.call_count == 0
+
+
+@respx.mock
+def test_relative_nextlink_is_followed():
+    route = respx.get(f"{ARM_BASE}/subscriptions")
+    route.side_effect = [
+        httpx.Response(200, json={"value": [{"subscriptionId": "1"}], "nextLink": "/subscriptions?api-version=x&p=2"}),
+        httpx.Response(200, json={"value": [{"subscriptionId": "2"}]}),
+    ]
+    client, _cred = _arm_client()
+    items, capped = client.get_paged("/subscriptions", params={"api-version": "x"})
+    assert len(items) == 2 and capped is False
+
+
+@respx.mock
+def test_arm_authorization_failed_translates_to_the_reader_role_hint():
+    respx.get(f"{ARM_BASE}/subscriptions/s/providers/Microsoft.Compute/virtualMachines").mock(
+        return_value=httpx.Response(
+            403,
+            json={
+                "error": {
+                    "code": "AuthorizationFailed",
+                    "message": "The client does not have authorization to perform action "
+                    "'Microsoft.Compute/virtualMachines/read' over scope '/subscriptions/s'",
+                }
+            },
+        )
+    )
+    client, _cred = _arm_client()
+    with pytest.raises(ApiPermissionError) as info:
+        client.get("/subscriptions/s/providers/Microsoft.Compute/virtualMachines", params={"api-version": "x"})
+    message = str(info.value)
+    assert "Reader role" in message and "virtualMachines/read" in message
+    assert "Backup Reader alone is not enough" in message
+
+
+@respx.mock
+def test_arm_other_403_codes_fall_back_to_code_and_message():
+    respx.get(f"{ARM_BASE}/subscriptions").mock(
+        return_value=httpx.Response(403, json={"error": {"code": "DisallowedProvider", "message": "nope"}})
+    )
+    client, _cred = _arm_client()
+    with pytest.raises(ApiPermissionError, match="DisallowedProvider: nope"):
+        client.get("/subscriptions", params={"api-version": "x"})
+
+
+@respx.mock
+def test_arm_non_json_error_body_is_reported_without_a_traceback():
+    respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(400, text="<html>bad</html>"))
+    client, _cred = _arm_client()
+    with pytest.raises(ApiError, match=r"ARM request failed \(400\): <html>bad</html>"):
+        client.get("/subscriptions", params={"api-version": "x"})
+
+
+@respx.mock
+def test_arm_non_json_success_body_is_an_error_not_a_crash():
+    respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(200, text="not json"))
+    client, _cred = _arm_client()
+    with pytest.raises(ApiError, match="non-JSON"):
+        client.get("/subscriptions", params={"api-version": "x"})
+
+
+@respx.mock
+def test_arm_get_paged_folds_an_expired_deadline_into_capped():
+    import time
+
+    route = respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(200, json={"value": [{}]}))
+    client, _cred = _arm_client()
+    items, capped = client.get_paged("/subscriptions", params={"api-version": "x"}, deadline=time.monotonic() - 1)
+    assert items == [] and capped is True
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_graph_and_arm_share_one_credential_with_separate_token_caches(monkeypatch):
+    respx.get(f"{GRAPH_BASE}/users").mock(return_value=httpx.Response(200, json={"value": []}))
+    respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(200, json={"value": []}))
+    cred = ScopeRecordingCredential([AccessToken("g", 10_000_000_000), AccessToken("a", 10_000_000_000)])
+    graph = GraphClient(AuthConfig(mode="azure-cli"), credential=cred)
+    arm = ArmClient(AuthConfig(mode="azure-cli"), credential=graph.credential)
+    graph.get("/users")
+    arm.get("/subscriptions", params={"api-version": "x"})
+    graph.get("/users")
+    arm.get("/subscriptions", params={"api-version": "x"})
+    # one token per scope, each reused on the second call
+    assert cred.scopes == [(GRAPH_SCOPE,), (ARM_SCOPE,)]
+    assert graph._token == "g" and arm._token == "a"
+
+
+@respx.mock
+def test_arm_check_counts_visible_subscriptions_and_reports_errors():
+    respx.get(f"{ARM_BASE}/subscriptions").mock(
+        return_value=httpx.Response(200, json={"value": [{"subscriptionId": "1"}, {"subscriptionId": "2"}]})
+    )
+    client, _cred = _arm_client()
+    assert client.check() == {"auth": "ok", "detail": None, "subscriptions": 2}
+    respx.get(f"{ARM_BASE}/subscriptions").mock(return_value=httpx.Response(401))
+    client, _cred = _arm_client()
+    result = client.check()
+    assert result["auth"] == "error" and result["subscriptions"] is None and "401" in result["detail"]
