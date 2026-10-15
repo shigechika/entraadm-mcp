@@ -1,10 +1,18 @@
 # Copilot review instructions — entraadm-mcp
 
 This repo is a stdio MCP server ([MCPServer](https://github.com/modelcontextprotocol/python-sdk), mcp 2.x)
-for Microsoft Entra ID sign-in and audit-log triage. All 7 tools are
-read-only — there is no write/mutating tool in this server (no account
-unblock, password reset, or session revoke), and no approval-gate or
-write-tool allowlist to worry about.
+for Microsoft Entra ID sign-in and audit-log triage, plus Azure VM backup
+posture (Azure Resource Manager) and Microsoft 365 service health. All 13
+tools are read-only — there is no write/mutating tool in this server (no
+account unblock, password reset, or session revoke), and no approval-gate
+or write-tool allowlist to worry about.
+
+Two clients share one `_RestClient` base in `entraadm_mcp/client.py`:
+`GraphClient` (Graph v1.0, `@odata.nextLink`) and `ArmClient`
+(`https://management.azure.com`, bare `nextLink`, `api-version` on every
+call). They share one credential object and each caches its own scope's
+token. The exception hierarchy is `ApiError` / `ApiDeadline` /
+`ApiAuthError` / `ApiPermissionError`; `GraphError` and friends are aliases.
 
 ## What to flag
 
@@ -42,13 +50,44 @@ write-tool allowlist to worry about.
   not an `error` key (see CLAUDE.md's Conventions section for why). A new
   per-user tool, or an edit to these two, that collapses "not found" into
   the generic error path breaks that contract.
-- **A `GraphPermissionError` catch that doesn't set a *correct*
-  `missing_permission`.** Each tool hardcodes the actual Graph permission
-  its own call needs (`AuditLog.Read.All` for the sign-in/audit tools,
-  `UserAuthenticationMethod.Read.All` for `get_user_auth_methods`) — there
-  is no single global constant, because different tools genuinely need
-  different permissions. Copy-pasting one tool's except-block into another
-  without updating the permission name is a real bug, not a style nit.
+- **A permission-error catch that doesn't set a *correct*
+  `missing_permission`, or sets it for a non-permission failure.** Each
+  tool hardcodes what its own call needs: `AuditLog.Read.All` for the
+  sign-in/audit tools, `UserAuthenticationMethod.Read.All` for
+  `get_user_auth_methods`, `ServiceHealth.Read.All` for
+  `m365_service_health`, and the Azure RBAC hint `ARM_ROLE_HINT` (Reader on
+  the subscription) for the ARM tools via `_arm_error()`. Copy-pasting one
+  tool's except-block into another without updating the permission is a
+  real bug. The hint belongs only on `ApiPermissionError`: a 5xx, a network
+  failure or a rejected token caught as plain `ApiError` must not claim a
+  missing permission.
+- **A continuation link followed without the same-origin check.**
+  `_RestClient.get_paged()` attaches the bearer token to every request and
+  refuses a `nextLink` whose scheme/host/port differ from the client's base
+  URL (including a scheme-relative `//host/...`). New paging code that
+  calls `_request()` on a server-supplied URL without `_same_origin()`
+  would hand the token to that host.
+- **An ARM id or tool argument interpolated into a URL path without
+  validation.** `subscription` is resolved against `list_subscriptions`
+  and only ARM's own GUID-checked `subscriptionId` reaches a path. Vault
+  ids must match `_VAULT_ID_RE` (built from the resource-group and vault
+  naming rules, and the GUID must be the subscription being scanned) or
+  they go to `skipped_vaults` unrequested. A `[^/]+`-style pattern, or a
+  path built from a display name, is an injection gap.
+- **A partial scan turned into a definite diagnosis.** In
+  `vm_backup_status` a VM with no protected item is `protected: false`
+  only when the vault scan it could have appeared in completed (the named
+  subscription's, or every subscription's in the global join); otherwise
+  `null`. Orphans need a complete VM listing. A change that defaults an
+  unknown to `false`, or drops a failed/skipped subscription from
+  `capped` / `failed_subscriptions`, reintroduces the false "unprotected"
+  this server is built to avoid. Projections go through
+  `_str` / `_int` / `_dict` / `_parse_iso`, which turn a wrong type into
+  `null`; direct chained indexing of an ARM `properties` body is a crash
+  waiting for a schema change.
+- **Something that makes the ARM probe move `health_check.status`.** The
+  `arm` probe is informational by design (Azure RBAC is optional) and runs
+  under its own `_ARM_PROBE_SECONDS` budget.
 - **A new paged Graph call that doesn't propagate `capped`.** Every result
   built from `client.get_paged()` includes a `capped: bool` field, so a
   page-budget cutoff is never indistinguishable from "the window was fully
@@ -71,7 +110,11 @@ write-tool allowlist to worry about.
   `AuthConfig.from_env()` is the only place that reads these.
 - No write/mutating tools, so there is no approval-gate or write-tool
   allowlist pattern (unlike some other servers in this fleet) to check.
-- `msgraph-sdk`/`kiota` are intentionally not a dependency — Graph calls go
-  through the hand-rolled `GraphClient` in `client.py` (httpx + manual
-  paging/error translation) so tests can mock `httpx` directly with
-  `respx`. Don't suggest migrating a call site to the SDK as a "cleanup."
+- `msgraph-sdk`/`kiota` and the `azure-mgmt-*` SDKs are intentionally not
+  dependencies — Graph and ARM calls go through the hand-rolled clients in
+  `client.py` (httpx + manual paging/error translation) so tests can mock
+  `httpx` directly with `respx`. Don't suggest migrating a call site to an
+  SDK as a "cleanup."
+- ARM tools living in an Entra-named server is deliberate (same app
+  registration, same credential, same deployment); don't suggest
+  splitting them out.
