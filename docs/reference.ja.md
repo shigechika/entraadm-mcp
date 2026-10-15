@@ -157,7 +157,8 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 `subscription` は id か表示名。`None` は見える全サブスクリプションを走査して結合も全体で行うので、
 別サブスクリプションのコンテナーに保護されている VM も一致する。1 つ指定したときはその
 サブスクリプションのコンテナーだけ（`coverage` に明記）。無い名前は `{"found": false, "subscription",
-"listing_capped"}`、複数に一致する表示名は `ambiguous` 付き。サブスクリプションごとに `vm_count`、
+"listing_capped"}`、複数に一致する表示名は `ambiguous` 付き。一覧が途中で切れているときは表示名の一致も
+信用しない（`candidates` に見えた 1 件を出すので id で呼び直す）。サブスクリプションごとに `vm_count`、
 `protected`、`unprotected`、`unknown`、`stale`、`failed`、`vms`、`vaults`（それぞれ `capped` 付き）、
 `skipped_vaults`（検証に落ちた id・予算が届かなかったコンテナー・読めないコンテナー。理由付き）、
 `vms_capped`、`items_complete`、`capped`。読めないサブスクリプションは `{"error", "missing_permission"}`。

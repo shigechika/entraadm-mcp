@@ -1393,18 +1393,26 @@ def _resolve_subscriptions(
     Returns ``(targets, listing_capped, not_found)``. ``subscription`` is an
     untrusted MCP input: it is only ever compared against the ids and
     display names ARM returned, and the id that reaches a URL path is ARM's
-    own (GUID-checked) one. ``None`` means every visible subscription.
+    own (GUID-checked) one. ``None`` means every visible subscription. An id
+    resolves even on a capped listing; a display name only on a complete one
+    (``candidates`` then names the one match seen, so the caller can retry
+    by id).
     """
     subs, capped = _list_subscriptions(arm, max_pages)
     if subscription is None:
         return subs, capped, None
     wanted = subscription.strip()
-    matches = [s for s in subs if s["subscription_id"] == wanted.lower() or s["name"] == wanted]
-    if len(matches) == 1:
+    by_id = [s for s in subs if s["subscription_id"] == wanted.lower()]
+    if by_id:
+        return by_id[:1], capped, None  # an id is unique by construction, even on a partial listing
+    matches = [s for s in subs if s["name"] == wanted]
+    # A display name is not unique: one match on a complete listing resolves it; on a
+    # capped listing a same-named subscription may sit on an unread page, so it does not.
+    if len(matches) == 1 and not capped:
         return matches, capped, None
     not_found: dict = {"found": False, "subscription": subscription, "listing_capped": capped}
-    if len(matches) > 1:
-        not_found["ambiguous"] = [s["subscription_id"] for s in matches]
+    if matches:
+        not_found["ambiguous" if len(matches) > 1 else "candidates"] = [s["subscription_id"] for s in matches]
     return [], capped, not_found
 
 

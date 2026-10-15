@@ -1320,6 +1320,15 @@ def test_subscription_not_found_ambiguous_and_listing_capped(inject, inject_arm)
     assert result["found"] is False and result["ambiguous"] == [SUB_A, SUB_B]
 
 
+def test_display_name_needs_a_complete_listing_but_an_id_does_not(inject, inject_arm):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient({"/subscriptions": (_subs((SUB_A, "alpha")), True)}))
+    by_name = server.vm_backup_status(subscription="alpha", max_pages=1)
+    assert by_name == {"found": False, "subscription": "alpha", "listing_capped": True, "candidates": [SUB_A]}
+    by_id = server.vm_backup_status(subscription=SUB_A, max_pages=1)
+    assert [e["subscription_id"] for e in by_id["subscriptions"]] == [SUB_A]
+
+
 def test_vm_backup_status_classifies_every_state(inject, inject_arm, frozen_now):
     inject(FakeGraphClient())
     items = [

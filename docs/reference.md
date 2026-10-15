@@ -177,7 +177,8 @@ subscription and joins globally, so a VM backed up to a vault in another
 subscription is matched. With one subscription named, only its vaults are
 scanned (`coverage` says so). An unknown name returns `{"found": false,
 "subscription", "listing_capped"}`; a display name matching several
-subscriptions adds `ambiguous`. Per subscription: `vm_count`, `protected`,
+subscriptions adds `ambiguous`; a name matched on a capped listing is not
+trusted either (`candidates` names the match seen — retry by id). Per subscription: `vm_count`, `protected`,
 `unprotected`, `unknown`, `stale`, `failed`, `vms`, `vaults` (each with its
 own `capped`), `skipped_vaults` (an id that failed validation, a vault the
 budget did not reach, or one the credential cannot read, with the reason),
