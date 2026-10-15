@@ -37,20 +37,35 @@ but the valid ranges are still used.
 | `get_user` (base fields) | `User.Read.All` |
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
+| `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` (delegated auth also needs an Entra role that may read service health, e.g. Service Support Administrator or Global Reader) |
+
+### Required Azure RBAC
+
+| Tool(s) | Role |
+|---|---|
+| `list_subscriptions` | none (lists what the credential can see) |
+| `vm_backup_status`, `vm_backup_policies` | **Reader** on each subscription (`*/read`; `Backup Reader` alone lacks `Microsoft.Compute/virtualMachines/read`) |
+
+Azure RBAC is optional; `health_check`'s `arm` probe is informational.
 
 ## Tools
 
 ### `health_check()`
 
 No parameters. Returns `{service, version, status, auth_mode, graph,
-signin_probe, sites}`. `graph` probes basic Graph reachability
+signin_probe, arm, sites}`. `graph` probes basic Graph reachability
 (`GET /users` with `$top=1` -- needs only `User.Read.All`); `signin_probe` additionally checks sign-in log
 access. `status` is `"healthy"` when both succeed, `"degraded"` when Graph
 is reachable but sign-in log access is not, `"error"` when Graph itself is
 unreachable or auth is misconfigured. `graph`/`signin_probe` are each
 `{auth: "ok"|"error", detail: str|null}`. `sites` is `{configured, ranges,
 error}` for `ENTRAADM_SITES_INI`; a configured file with an `error` turns a
-`"healthy"` status into `"degraded"`.
+`"healthy"` status into `"degraded"`. `arm` is `{auth, detail, subscriptions,
+capped}` (one page of `GET /subscriptions` on Azure Resource Manager;
+`subscriptions` is how many the credential can see, `capped` whether more
+pages existed) and is informational: it never changes `status`,
+because Azure RBAC is optional for this server. It runs under its own
+10-second budget so an unresponsive ARM cannot stall the whole call.
 
 ### `get_user(upn)`
 
@@ -137,21 +152,101 @@ or platform credential/passkey). Needs `UserAuthenticationMethod.Read.All`
 typical role assignment. A nonexistent account returns
 `{"found": false, "user_principal_name": upn}`, same as `get_user`.
 
+### `list_subscriptions(max_pages=None)`
+
+The Azure subscriptions this credential can see (`subscription_id`, `name`,
+`state`), with `count` and `capped`. The discovery anchor for the two backup
+tools, which accept a subscription id or display name from this list. An
+empty list with ARM reachable means no Reader role has been granted anywhere.
+
+### `vm_backup_status(subscription=None, stale_hours=36, max_pages=None)`
+
+Joins every VM of a subscription with the Azure-VM protected items of its
+Recovery Services vaults, on the VM's ARM id (case-insensitively). Per VM:
+`protected` is `true` for `protectionState` `Protected` / `IRPending` (first
+backup pending, `note` says so), `false` when no item exists or protection is
+stopped / paused / in error (the state is shown), and `null` (unknown) when no
+item was found but the vault scan of that subscription was incomplete — a
+partial scan never produces a false "unprotected". `backup_ok` is whether
+`lastBackupStatus` is `Completed` / `CompletedWithWarnings`; `stale` means no
+recovery point (`lastRecoveryPoint`) within `stale_hours` (default 36 h, suits
+daily policies; raise it for weekly ones — `policy_name` is in the row).
+`backup_ok` is `false` only for `Failed`; a backup in flight (`InProgress`,
+`Warning`) leaves it `null`. An item whose `protectionState` is missing makes
+the VM `unknown`; when two vaults hold an item for one VM the live one wins
+(`duplicate_items`). `items_complete` assumes the subscription-scope Reader
+role: a Reader scoped to resource groups gets a silently filtered vault
+listing.
+
+`subscription` is an id or display name; `None` scans every visible
+subscription and joins globally, so a VM backed up to a vault in another
+subscription is matched. With one subscription named, only its vaults are
+scanned (`coverage` says so). An unknown name returns `{"found": false,
+"subscription", "listing_capped"}`; a display name matching several
+subscriptions adds `ambiguous`; a name matched on a capped listing is not
+trusted either (`candidates` names the match seen — retry by id). Per subscription: `vm_count`, `protected`,
+`unprotected`, `unknown`, `stale`, `failed`, `vms`, `vaults` (each with its
+own `capped`), `skipped_vaults` (an id that failed validation, a vault the
+budget did not reach, or one the credential cannot read, with the reason),
+`vms_capped`, `items_complete`, `capped`; or `{"error", "missing_permission"}`
+when that subscription is unreadable. In the global join an unmatched VM is
+`unknown` unless every subscription's vault scan completed (an unreadable or
+unreached subscription counts as incomplete, and `summary.failed_subscriptions`
+and `capped` say so). `orphans` are protected items whose VM
+no longer exists, reported only when that VM's subscription was listed
+completely; `unjoined_items` counts the rest. `skipped` lists the
+subscriptions the wall-clock budget did not reach; `summary` and `capped`
+on top.
+
+Every vault id is validated against the ARM naming rules before it is used in
+a request path; every call shares the tool's one deadline.
+
+### `vm_backup_policies(subscription=None, max_pages=None)`
+
+Per Recovery Services vault, the Azure-VM backup policies: `name`, `vault`,
+`resource_group`, `policy_type` (`V1` = `SimpleSchedulePolicy`, `V2` =
+`SimpleSchedulePolicyV2`), `schedule` (`frequency`, `run_times` in UTC,
+`weekdays`, or for V2 hourly `interval_hours` / `window_start` /
+`window_hours`), `retention` (`LongTermRetentionPolicy` as `daily` / `weekly`
+/ `monthly` / `yearly` blocks with their day selection and `{count, unit}`
+duration, or `SimpleRetentionPolicy`), `instant_rp_days`, `timezone` and
+`protected_item_count` (ARM's own count). A schedule or retention type this
+server does not know comes back as `{"type": <name>, "unparsed": true}`.
+Same `subscription` resolution and coverage flags as `vm_backup_status`.
+
+### `m365_service_health(max_pages=None)`
+
+`services`: one row per Microsoft 365 service with its current status
+(`healthOverviews`); `issues`: the unresolved incidents and advisories,
+newest first (`id`, `title`, `service`, `feature`, `classification`,
+`status`, `start`, `last_modified`, `impact`). `summary` carries
+`degraded_services` (services whose status is an open one — `serviceDegradation`,
+`serviceInterruption`, `investigating`, …; the post-resolution values Graph
+keeps for days such as `serviceRestored` are not counted),
+`services_without_status`, `open_incidents`, `open_advisories` and `capped`
+(both collections page; a capped scan is a lower bound). Each section degrades on
+its own with `{"error", "missing_permission": "ServiceHealth.Read.All"}`.
+The message center (`messages`) needs another permission and is not read.
+
 ### `daily_brief(hours=24, max_pages=None, samples=10)`
 
-One-call summary combining `signin_failure_stats` and `directory_audits`,
-with a compact `summary` on top. A permission failure in one section
-degrades only that section — the other still returns in full. Runs both
-sections synchronously in one tool call; `samples` is currently unused
-(reserved).
+One-call summary combining `m365_service_health`, `signin_failure_stats`
+and `directory_audits`, with a compact `summary` on top (`service_health`
+holds the degraded services, the open incident count and that section's
+`capped`, which is also folded into the top-level `summary.capped`). A permission failure in one section degrades only that section —
+the others still return in full. The sections run in that order,
+synchronously, under one shared deadline; Azure VM backup is deliberately
+not a section (its ARM fan-out could exhaust the budget — call
+`vm_backup_status` separately). `samples` is currently unused (reserved).
 
 ## Errors
 
-Every tool's entry point catches configuration and Graph-client errors and
-returns `{"error": "..."}` rather than raising, so a caller always gets a
-dict back. A `GraphPermissionError` additionally sets `missing_permission`
-naming the actual Graph permission or directory role that endpoint needs. A
-result built from a paged Graph collection always carries `capped: bool` —
+Every tool's entry point catches configuration and API-client errors (Graph
+and ARM) and returns `{"error": "..."}` rather than raising, so a caller
+always gets a dict back. A permission error additionally sets
+`missing_permission` naming the actual Graph permission, directory role or
+Azure RBAC role that endpoint needs. A result built from a paged Graph or
+ARM collection always carries `capped: bool` —
 a page-budget cutoff is never indistinguishable from "the window was fully
 scanned."
 
@@ -159,5 +254,5 @@ scanned."
 
 ```bash
 entraadm-mcp --version   # print version
-entraadm-mcp --check     # resolve auth, probe Graph + sign-in log reachability, exit 0 (or 1 on config error)
+entraadm-mcp --check     # resolve auth, probe Graph + sign-in log reachability (plus an ARM info line), exit 0 (or 1 on config error)
 ```

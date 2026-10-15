@@ -22,10 +22,12 @@ state of, anybody's actual account. A "found: true" result would be the
 surprise.
 """
 
+import json
+import re
 import secrets
 from typing import Any
 
-from smoke_harness import Caller, Probe
+from smoke_harness import Caller, Probe, SkipProbe
 
 #: Window and page bounds for the log-scanning tools. Small on purpose: one
 #: page over one day proves the fetch, the projection, and the capping logic
@@ -63,9 +65,27 @@ async def _test_net_ip_arg(call: Caller) -> dict[str, Any]:
     return {"ip": ".".join(("203", "0", "113", "1"))}
 
 
+_SUBSCRIPTION_ID_RE = re.compile(r'"subscription_id":\s*"([0-9a-fA-F-]{36})"')
+
+
+async def _one_subscription(call: Caller) -> dict[str, Any]:
+    """Discover one subscription id from a live ``list_subscriptions`` call.
+
+    The id is tenant-specific, so it is read at run time (the gwsadm-mcp
+    discovery pattern), never written here. A credential that sees no
+    subscription skips the probe: the tool is then unexercised, not broken.
+    """
+    payload = await call("list_subscriptions", {"max_pages": 1})
+    text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    match = _SUBSCRIPTION_ID_RE.search(text)
+    if not match:
+        raise SkipProbe("this credential sees no Azure subscription (no Reader role granted yet)")
+    return {"subscription": match.group(1)}
+
+
 PROBES: dict[str, Probe] = {
     "health_check": Probe(
-        require_keys=("service", "version", "status", "auth_mode", "graph", "signin_probe"),
+        require_keys=("service", "version", "status", "auth_mode", "graph", "signin_probe", "arm"),
         allow_empty=True,
     ),
     "get_user": Probe(
@@ -112,8 +132,36 @@ PROBES: dict[str, Probe] = {
     ),
     "daily_brief": Probe(
         args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES, "samples": 5},
-        require_keys=("window_hours", "summary", "signin_failure_stats", "directory_audits"),
+        require_keys=("window_hours", "summary", "m365_service_health", "signin_failure_stats", "directory_audits"),
         allow_empty=True,
         timeout=180,
+    ),
+    "list_subscriptions": Probe(
+        args={"max_pages": MAX_PAGES},
+        require_keys=("count", "capped", "subscriptions"),
+        rows_key="subscriptions",
+        allow_empty=True,
+    ),
+    "vm_backup_status": Probe(
+        args={"max_pages": MAX_PAGES},
+        args_factory=_one_subscription,
+        require_keys=("stale_hours", "coverage", "summary", "subscriptions", "orphans", "capped"),
+        rows_key="subscriptions",
+        allow_empty=True,
+        timeout=180,
+    ),
+    "vm_backup_policies": Probe(
+        args={"max_pages": MAX_PAGES},
+        args_factory=_one_subscription,
+        require_keys=("summary", "subscriptions", "capped"),
+        rows_key="subscriptions",
+        allow_empty=True,
+        timeout=180,
+    ),
+    "m365_service_health": Probe(
+        args={"max_pages": MAX_PAGES},
+        require_keys=("summary", "services", "issues", "capped"),
+        rows_key="services",
+        allow_empty=True,
     ),
 }

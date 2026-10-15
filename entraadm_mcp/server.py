@@ -9,9 +9,14 @@ Tools:
 - ``signin_failure_stats``   — tenant-wide failure aggregation, incl. password-spray suspects
 - ``directory_audits``       — who did what (block/unblock/attribute changes), and to whom
 - ``get_user_auth_methods``  — MFA registration state for one user
-- ``daily_brief``            — one-call summary combining signin_failure_stats + directory_audits
+- ``list_subscriptions``     — the Azure subscriptions this credential can see (ARM)
+- ``vm_backup_status``       — which Azure VMs are backed up, and whether the last backup succeeded (ARM)
+- ``vm_backup_policies``     — schedule and retention of the Azure VM backup policies (ARM)
+- ``m365_service_health``    — Microsoft 365 service status and open incidents
+- ``daily_brief``            — one-call summary combining m365_service_health,
+  signin_failure_stats and directory_audits
 
-Coverage contract: every result section that walks a paged Graph collection
+Coverage contract: every result section that walks a paged Graph or ARM collection
 carries a ``capped`` boolean when its window was not fully scanned, so
 partial coverage is never mistaken for "nothing more to find". A permission
 failure degrades only the section that hit it (``{"error": ...,
@@ -36,6 +41,11 @@ from mcp.shared.exceptions import MCPError
 
 from entraadm_mcp import __version__, sites
 from entraadm_mcp.client import (
+    ARM_API_VERSIONS,
+    ARM_ROLE_HINT,
+    ApiError,
+    ApiPermissionError,
+    ArmClient,
     GraphClient,
     GraphDeadline,
     GraphError,
@@ -99,8 +109,9 @@ class _Server(MCPServer):
 
 mcp = _Server("entraadm-mcp", version=__version__)
 
-#: Injection point for tests: monkeypatch.setitem(server._state, "client", FakeGraphClient(...)).
-_state: dict[str, Any] = {"client": None}
+#: Injection points for tests: monkeypatch.setitem(server._state, "client", FakeGraphClient(...))
+#: and, for the ARM-backed tools, monkeypatch.setitem(server._state, "arm", FakeArmClient(...)).
+_state: dict[str, Any] = {"client": None, "arm": None}
 
 _MIN_HOURS = 1
 #: Entra ID P1 sign-in/audit log retention is 30 days; a longer window returns nothing, not an error.
@@ -110,6 +121,9 @@ _MAX_TOP = 500
 _SPRAY_MIN_DISTINCT_USERS = 5
 
 _GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+#: Budget of health_check's informational ARM probe: short, so an unresponsive ARM
+#: cannot push the whole health_check past the client's tool-call timeout.
+_ARM_PROBE_SECONDS = 10.0
 
 #: AADSTS error codes worth annotating in triage output. Not exhaustive -- a
 #: code missing from this dict is returned with meaning=None, never hidden.
@@ -193,6 +207,13 @@ def _client() -> GraphClient:
     return _state["client"]
 
 
+def _arm() -> ArmClient:
+    """The ARM client, sharing the Graph client's credential (each caches its own scope's token)."""
+    if _state["arm"] is None:
+        _state["arm"] = ArmClient(AuthConfig.from_env(), credential=getattr(_client(), "credential", None))
+    return _state["arm"]
+
+
 def _find_user(client: GraphClient, upn: str, select: str) -> dict | None:
     """Look up one user by exact userPrincipalName via $filter (never via path interpolation).
 
@@ -262,6 +283,17 @@ def health_check() -> dict:
     load is an ``error`` here and leaves ``status`` no better than
     ``degraded``: without it every internal IP would be reported as an
     external spray suspect.
+
+    ``arm`` is a third, informational probe (Azure Resource Manager
+    reachable, and how many subscriptions this credential can see). It
+    never moves ``status``: Azure RBAC is optional for this server, and a
+    deployment used only for Entra triage must not sit at ``degraded``
+    forever because nobody granted it a Reader role. It runs last under its
+    own short budget (``_ARM_PROBE_SECONDS``) so an unresponsive ARM cannot
+    push this whole call past the client's tool-call timeout. The budget
+    bounds the request, not the first token acquisition (azure-identity is
+    synchronous; in azure-cli mode it shells out to ``az``), which is the
+    same limit every tool here has.
     """
     site_status = sites.load().status()
     try:
@@ -275,11 +307,13 @@ def health_check() -> dict:
             "auth_mode": "unknown",
             "graph": {"auth": "error", "detail": detail},
             "signin_probe": {"auth": "error", "detail": detail},
+            "arm": {"auth": "error", "detail": detail, "subscriptions": None, "capped": None},
             "sites": site_status,
         }
 
     graph = client.check()
     signin_probe = client.probe_signin_access()
+    arm = _arm().check(deadline=time.monotonic() + _ARM_PROBE_SECONDS)
     ok_count = sum(1 for probe in (graph, signin_probe) if probe["auth"] == "ok")
     status = "healthy" if ok_count == 2 else "degraded" if ok_count == 1 else "error"
     if status == "healthy" and site_status["error"] is not None:
@@ -292,6 +326,7 @@ def health_check() -> dict:
         "auth_mode": client.mode,
         "graph": graph,
         "signin_probe": signin_probe,
+        "arm": arm,
         "sites": site_status,
     }
 
@@ -1249,19 +1284,760 @@ def get_user_auth_methods(upn: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Azure Resource Manager: subscriptions, VM backup posture, backup policies
+# ---------------------------------------------------------------------------
+
+_GUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+#: A Recovery Services vault id as ARM returns it, built from the documented
+#: naming rules rather than ``[^/]+``. Resource group: letters and digits in
+#: any script, "_", ".", "(", ")", "-", 1-90 characters, not ending in a
+#: period, and not a segment made only of periods (so "." and ".." never
+#: reach a request path; "rg..prod" and ".prod" are valid names and pass).
+#: Vault: ASCII alphanumerics and "-", 2-50. "?", "#", "%", "\\" and whitespace
+#: are outside both alphabets. ARM casing varies between responses, hence
+#: IGNORECASE; the subscription GUID is compared against the one being
+#: scanned by the caller.
+_VAULT_ID_RE = re.compile(
+    rf"^/subscriptions/(?P<sub>{_GUID})"
+    r"/resourceGroups/(?P<rg>(?!\.+/)[\w.()\-]{1,90}(?<!\.))"
+    r"/providers/Microsoft\.RecoveryServices/vaults/(?P<vault>[A-Za-z0-9\-]{2,50})$",
+    re.IGNORECASE,
+)
+_RESOURCE_GROUP_IN_ID_RE = re.compile(r"/resourceGroups/([^/]+)/", re.IGNORECASE)
+_SUBSCRIPTION_IN_ID_RE = re.compile(rf"^/subscriptions/({_GUID})/", re.IGNORECASE)
+_ISO_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?$")
+
+#: Server-side filter for the Azure VM workload; a constant, never built from input.
+_IAAS_VM_FILTER = "backupManagementType eq 'AzureIaasVM'"
+_BACKUP_PARAMS = {"api-version": ARM_API_VERSIONS["backup"], "$filter": _IAAS_VM_FILTER}
+#: protectionState values under which backups are running (IRPending = first backup not done yet).
+_PROTECTED_STATES = ("Protected", "IRPending")
+#: lastBackupStatus values that settle backup_ok. Anything else (InProgress, Warning,
+#: an unknown value) is neither a success nor a failure: backup_ok stays null.
+_BACKUP_OK_STATUSES = ("Completed", "CompletedWithWarnings")
+_BACKUP_FAILED_STATUSES = ("Failed",)
+_DEFAULT_STALE_HOURS = 36
+_MIN_STALE_HOURS = 1
+_MAX_STALE_HOURS = 24 * 400
+
+
+def _str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _dict(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _str_list(value: Any) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _props(resource: Any) -> dict:
+    return _dict(_dict(resource).get("properties"))
+
+
+def _parse_iso(value: Any) -> datetime.datetime | None:
+    """Parse an ARM/Graph timestamp into an aware datetime; anything malformed is None, never an exception."""
+    if not isinstance(value, str):
+        return None
+    match = _ISO_RE.match(value.strip())
+    if not match:
+        return None
+    base, frac, tz = match.groups()
+    text = base + (f".{frac[:6].ljust(6, '0')}" if frac else "") + ("+00:00" if tz in (None, "Z") else tz)
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _clamp_stale_hours(hours: int) -> int:
+    return max(_MIN_STALE_HOURS, min(_MAX_STALE_HOURS, hours))
+
+
+def _arm_error(e: Exception) -> dict:
+    out: dict = {"error": str(e)}
+    if isinstance(e, ApiPermissionError):
+        out["missing_permission"] = ARM_ROLE_HINT
+    return out
+
+
+def _budget_left() -> bool:
+    deadline = _current_deadline()
+    return deadline is None or deadline - time.monotonic() > 0
+
+
+def _subscription_entry(s: dict) -> dict:
+    sid = _str(s.get("subscriptionId"))
+    if sid is None or not _GUID_RE.match(sid):
+        # Defense in depth: this id is about to be interpolated into URL paths.
+        raise ApiError("unexpected subscription id shape returned by ARM")
+    return {"subscription_id": sid.lower(), "name": _str(s.get("displayName")), "state": _str(s.get("state"))}
+
+
+def _list_subscriptions(arm: ArmClient, max_pages: int) -> tuple[list[dict], bool]:
+    raw, capped = arm.get_paged(
+        "/subscriptions",
+        params={"api-version": ARM_API_VERSIONS["subscriptions"]},
+        max_pages=max_pages,
+        deadline=_current_deadline(),
+    )
+    return [_subscription_entry(s) for s in raw], capped
+
+
+def _resolve_subscriptions(
+    arm: ArmClient, subscription: str | None, max_pages: int
+) -> tuple[list[dict], bool, dict | None]:
+    """Resolve the ``subscription`` argument against what this credential can see.
+
+    Returns ``(targets, listing_capped, not_found)``. ``subscription`` is an
+    untrusted MCP input: it is only ever compared against the ids and
+    display names ARM returned, and the id that reaches a URL path is ARM's
+    own (GUID-checked) one. ``None`` means every visible subscription. An id
+    resolves even on a capped listing; a display name only on a complete one
+    (``candidates`` then names the one match seen, so the caller can retry
+    by id).
+    """
+    subs, capped = _list_subscriptions(arm, max_pages)
+    if subscription is None:
+        return subs, capped, None
+    wanted = subscription.strip()
+    by_id = [s for s in subs if s["subscription_id"] == wanted.lower()]
+    if by_id:
+        return by_id[:1], capped, None  # an id is unique by construction, even on a partial listing
+    matches = [s for s in subs if s["name"] == wanted]
+    # A display name is not unique: one match on a complete listing resolves it; on a
+    # capped listing a same-named subscription may sit on an unread page, so it does not.
+    if len(matches) == 1 and not capped:
+        return matches, capped, None
+    not_found: dict = {"found": False, "subscription": subscription, "listing_capped": capped}
+    if matches:
+        not_found["ambiguous" if len(matches) > 1 else "candidates"] = [s["subscription_id"] for s in matches]
+    return [], capped, not_found
+
+
+@mcp.tool()
+@_with_call_deadline
+def list_subscriptions(max_pages: int | None = None) -> dict:
+    """The Azure subscriptions this credential can see, as ARM lists them.
+
+    Read-only (``GET /subscriptions``; needs no RBAC beyond being able to see a
+    subscription at all). The discovery anchor for ``vm_backup_status`` and
+    ``vm_backup_policies``: both accept a subscription id or display name from
+    this list. An empty list with ``auth`` working means no Reader role has
+    been granted anywhere yet. ``capped`` marks a listing cut short by the page
+    budget.
+    """
+    try:
+        subs, capped = _list_subscriptions(_arm(), _resolve_max_pages(max_pages))
+    except (ConfigError, ApiError) as e:
+        return _arm_error(e)
+    return {"count": len(subs), "capped": capped, "subscriptions": subs}
+
+
+def _scan_vaults(arm: ArmClient, sub: dict, max_pages: int, collection: str, params: dict) -> dict:
+    """List one subscription's Recovery Services vaults and, per vault, one backup collection.
+
+    ``collection`` is ``backupProtectedItems`` or ``backupPolicies``. Returns
+    ``{"vaults", "rows", "skipped_vaults", "complete"}``: ``rows`` is a list of
+    ``(vault_entry, resource)``; ``complete`` is False when the vault listing was
+    capped, a vault was skipped, or any vault's collection was capped -- the
+    callers must then not treat an absent row as proof of absence. ``complete``
+    assumes the documented subscription-scope Reader role: a Reader scoped to
+    some resource groups gets a vault listing silently filtered to those
+    groups, which this scan cannot tell from a complete one. A vault id
+    that does not match ``_VAULT_ID_RE`` (or names another subscription) is
+    never requested. A subscription-level ApiError propagates to the caller.
+    """
+    sid = sub["subscription_id"]
+    raw_vaults, capped = arm.get_paged(
+        f"/subscriptions/{sid}/providers/Microsoft.RecoveryServices/vaults",
+        params={"api-version": ARM_API_VERSIONS["vaults"]},
+        max_pages=max_pages,
+        deadline=_current_deadline(),
+    )
+    vaults: list[dict] = []
+    rows: list[tuple[dict, dict]] = []
+    skipped: list[dict] = []
+    complete = not capped
+    for v in raw_vaults:
+        vid = _str(_dict(v).get("id")) or ""
+        match = _VAULT_ID_RE.match(vid)
+        if not match or match.group("sub").lower() != sid:
+            skipped.append({"id": vid[:200], "reason": "id did not match the vault id pattern"})
+            complete = False
+            continue
+        vault = {
+            "id": vid.lower(),
+            "name": match.group("vault"),
+            "resource_group": match.group("rg"),
+            "location": _str(v.get("location")),
+            "capped": False,
+        }
+        if not _budget_left():
+            skipped.append({"id": vid.lower(), "reason": "deadline"})
+            complete = False
+            continue
+        try:
+            items, items_capped = arm.get_paged(
+                f"{vid}/{collection}", params=params, max_pages=max_pages, deadline=_current_deadline()
+            )
+        except ApiError as e:
+            # One unreadable vault (RBAC scoped to a resource group, a vault deleted
+            # between the listing and the read, a 5xx past the retry budget) must not
+            # hide the readable ones, be mistaken for an empty one, or discard the
+            # subscription's VM listing that already succeeded.
+            skipped.append({"id": vid.lower(), "reason": str(e)})
+            complete = False
+            continue
+        vault["capped"] = items_capped
+        complete = complete and not items_capped
+        vaults.append(vault)
+        rows.extend((vault, item) for item in items if isinstance(item, dict))
+    return {"vaults": vaults, "rows": rows, "skipped_vaults": skipped, "complete": complete}
+
+
+def _vm_row(vm: dict, match: tuple[dict, dict] | None, items_complete: bool, now, stale_hours: int) -> dict:
+    vid = (_str(vm.get("id")) or "").lower()
+    rg = _RESOURCE_GROUP_IN_ID_RE.search(vid)
+    row: dict = {
+        "name": _str(vm.get("name")),
+        "resource_group": rg.group(1) if rg else None,
+        "location": _str(vm.get("location")),
+        "id": vid,
+        "protected": None,
+        "vault": None,
+        "policy_name": None,
+        "protection_state": None,
+        "health_status": None,
+        "last_backup_status": None,
+        "backup_ok": None,
+        "last_backup_time": None,
+        "last_recovery_point": None,
+        "stale": None,
+    }
+    if match is None:
+        if items_complete:
+            row["protected"] = False
+        else:
+            row["note"] = "no protected item found, but the vault scan of this subscription was incomplete"
+        return row
+    item, vault = match
+    p = _props(item)
+    state = _str(p.get("protectionState"))
+    row.update(
+        vault=vault["name"],
+        policy_name=_str(p.get("policyName")),
+        protection_state=state,
+        health_status=_str(p.get("healthStatus")),
+        last_backup_status=_str(p.get("lastBackupStatus")),
+        last_backup_time=_str(p.get("lastBackupTime")),
+        last_recovery_point=_str(p.get("lastRecoveryPoint")),
+    )
+    if state is None:
+        # An item exists but its state is unreadable: unknown, not "unprotected".
+        row["note"] = "protected item found but its protectionState is missing"
+        return row
+    row["protected"] = state in _PROTECTED_STATES
+    if state == "IRPending":
+        row["note"] = "initial backup pending"
+        return row
+    status = row["last_backup_status"]
+    if status in _BACKUP_OK_STATUSES:
+        row["backup_ok"] = True
+    elif status in _BACKUP_FAILED_STATUSES:
+        row["backup_ok"] = False
+    if row["protected"]:
+        recovery_point = _parse_iso(row["last_recovery_point"])
+        row["stale"] = recovery_point is None or (now - recovery_point) > datetime.timedelta(hours=stale_hours)
+    return row
+
+
+def _count_vms(rows: list[dict]) -> dict:
+    return {
+        "vm_count": len(rows),
+        "protected": sum(1 for r in rows if r["protected"] is True),
+        "unprotected": sum(1 for r in rows if r["protected"] is False),
+        "unknown": sum(1 for r in rows if r["protected"] is None),
+        "stale": sum(1 for r in rows if r["stale"] is True),
+        "failed": sum(1 for r in rows if r["backup_ok"] is False),
+    }
+
+
+@mcp.tool()
+@_with_call_deadline
+def vm_backup_status(
+    subscription: str | None = None, stale_hours: int = _DEFAULT_STALE_HOURS, max_pages: int | None = None
+) -> dict:
+    """Which Azure VMs are backed up by Azure Backup, and whether the last backup succeeded.
+
+    Joins every VM of a subscription (``Microsoft.Compute/virtualMachines``)
+    with the Azure-VM protected items of its Recovery Services vaults, on the
+    VM's ARM id (case-insensitively; ARM casing differs between the two
+    services). Read-only; needs the Reader role on the subscription.
+
+    Per VM:
+
+    - ``protected``: ``true`` when a protected item exists with
+      ``protectionState`` ``Protected`` or ``IRPending`` (first backup not done
+      yet, ``note`` says so); ``false`` when there is none, or it is
+      ``ProtectionStopped`` / ``ProtectionPaused`` / ``ProtectionError`` (data
+      may be retained, backups are not running -- the state is shown);
+      ``null`` (unknown) when no item was found but the vault scan was
+      incomplete (``capped``, a skipped vault, an unreadable or unreached
+      subscription -- in the global join, any subscription's) -- a partial
+      scan never produces a false "unprotected".
+    - ``backup_ok``: ``true`` for ``lastBackupStatus`` ``Completed`` /
+      ``CompletedWithWarnings``, ``false`` for ``Failed``, ``null`` before any
+      backup ran or while one is running (``InProgress``, ``Warning``, an
+      unknown value). An item whose ``protectionState`` is missing is
+      ``protected: null`` with a note. When two vaults hold an item for one
+      VM, the one still backing up wins (``duplicate_items`` counts them).
+    - ``stale``: no recovery point (``lastRecoveryPoint``, the proof of a
+      successful backup) within ``stale_hours``. The default 36 h suits daily
+      policies; raise it for weekly ones (``policy_name`` is in the row).
+
+    ``subscription`` is an id or display name from ``list_subscriptions``;
+    ``None`` scans every visible subscription and joins globally, so a VM
+    backed up to a vault in another subscription is matched. With one
+    subscription named, only its vaults are scanned (``coverage`` says so).
+    An unknown or ambiguous name returns ``found: false``.
+
+    ``orphans`` are protected items whose VM no longer exists (backup data
+    retained for a deleted VM), reported only when that VM's subscription was
+    listed completely. One subscription's permission error is reported on its
+    own entry; the others still return. When the wall-clock budget runs out,
+    the remaining subscriptions are listed under ``skipped`` and ``capped`` is
+    set.
+    """
+    stale_hours = _clamp_stale_hours(stale_hours)
+    pages = _resolve_max_pages(max_pages)
+    try:
+        arm = _arm()
+        targets, listing_capped, not_found = _resolve_subscriptions(arm, subscription, pages)
+    except (ConfigError, ApiError) as e:
+        return _arm_error(e)
+    if not_found is not None:
+        return not_found
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    entries: list[dict] = []
+    skipped: list[dict] = []
+    raw_vms: dict[str, list[dict]] = {}
+    matches: dict[str, tuple[dict, dict]] = {}  # lower-cased VM id -> (protected item, vault)
+    item_subscription: dict[str, str] = {}  # lower-cased VM id -> subscription whose vault holds it
+    duplicate_items = 0
+    for sub in targets:
+        sid = sub["subscription_id"]
+        if not _budget_left():
+            skipped.append({"subscription_id": sid, "name": sub["name"], "reason": "deadline"})
+            continue
+        try:
+            vms, vms_capped = arm.get_paged(
+                f"/subscriptions/{sid}/providers/Microsoft.Compute/virtualMachines",
+                params={"api-version": ARM_API_VERSIONS["virtualMachines"]},
+                max_pages=pages,
+                deadline=_current_deadline(),
+            )
+            scan = _scan_vaults(arm, sub, pages, "backupProtectedItems", _BACKUP_PARAMS)
+        except ApiError as e:
+            entries.append({"subscription_id": sid, "name": sub["name"], **_arm_error(e)})
+            continue
+        raw_vms[sid] = [vm for vm in vms if isinstance(vm, dict)]
+        for vault, item in scan["rows"]:
+            p = _props(item)
+            key = (_str(p.get("virtualMachineId")) or _str(p.get("sourceResourceId")) or "").lower()
+            if not key:
+                continue
+            if key in matches:
+                # Two vaults hold an item for one VM (a stopped item left behind after a
+                # move): the one still backing up wins, whatever order ARM listed them in.
+                duplicate_items += 1
+                if _str(_props(matches[key][0]).get("protectionState")) in _PROTECTED_STATES:
+                    continue
+            matches[key] = (item, vault)
+            item_subscription[key] = sid
+        entries.append(
+            {
+                "subscription_id": sid,
+                "name": sub["name"],
+                "vms_capped": vms_capped,
+                "items_complete": scan["complete"],
+                "vaults": scan["vaults"],
+                "skipped_vaults": scan["skipped_vaults"],
+            }
+        )
+
+    vm_ids: set[str] = set()
+    totals = _count_vms([])
+    failed_subscriptions = sum(1 for e in entries if "error" in e)
+    # A subscription that errored or was never reached is missing from the inventory.
+    capped = listing_capped or bool(skipped) or failed_subscriptions > 0
+    # Global mode joins across subscriptions, so "no item anywhere" is only
+    # proof of absence when every subscription's vault scan completed.
+    vaults_complete_everywhere = not capped and all(e["items_complete"] for e in entries if "error" not in e)
+    for entry in entries:
+        if "error" in entry:
+            continue
+        rows = []
+        items_complete = entry["items_complete"] if subscription is not None else vaults_complete_everywhere
+        for vm in raw_vms[entry["subscription_id"]]:
+            vid = (_str(vm.get("id")) or "").lower()
+            vm_ids.add(vid)
+            rows.append(_vm_row(vm, matches.get(vid), items_complete, now, stale_hours))
+        counts = _count_vms(rows)
+        entry.update(counts)
+        entry["vms"] = rows
+        entry["capped"] = entry["vms_capped"] or not entry["items_complete"]
+        capped = capped or entry["capped"]
+        for k in totals:
+            totals[k] += counts[k]
+
+    complete_vm_listings = {e["subscription_id"] for e in entries if "error" not in e and not e["vms_capped"]}
+    orphans: list[dict] = []
+    unjoined = 0
+    for key, (item, vault) in matches.items():
+        if key in vm_ids:
+            continue
+        owner = _SUBSCRIPTION_IN_ID_RE.match(key)
+        if owner is not None and owner.group(1).lower() in complete_vm_listings:
+            p = _props(item)
+            orphans.append(
+                {
+                    "name": _str(p.get("friendlyName")),
+                    "vm_id": key,
+                    "vault": vault["name"],
+                    "subscription_id": item_subscription[key],
+                    "protection_state": _str(p.get("protectionState")),
+                    "last_recovery_point": _str(p.get("lastRecoveryPoint")),
+                }
+            )
+        else:
+            unjoined += 1
+
+    coverage = (
+        "every visible subscription; the VM/vault join is global"
+        if subscription is None
+        else "the named subscription's vaults only; a VM backed up to a vault in another subscription "
+        "(cross-subscription backup) appears unprotected here -- call without `subscription` for a global join"
+    )
+    return {
+        "stale_hours": stale_hours,
+        "coverage": coverage,
+        "summary": {
+            "subscriptions": len(entries),
+            "failed_subscriptions": failed_subscriptions,
+            **totals,
+            "orphans": len(orphans),
+            "capped": capped,
+        },
+        "subscriptions": entries,
+        "skipped": skipped,
+        "orphans": orphans,
+        "unjoined_items": unjoined,
+        "duplicate_items": duplicate_items,
+        "capped": capped,
+    }
+
+
+def _duration(value: Any) -> dict | None:
+    d = _dict(value)
+    if not d:
+        return None
+    return {"count": _int(d.get("count")), "unit": _str(d.get("durationType"))}
+
+
+def _schedule_entry(schedule: Any) -> dict:
+    s = _dict(schedule)
+    kind = _str(s.get("schedulePolicyType"))
+    frequency = _str(s.get("scheduleRunFrequency"))
+    if kind == "SimpleSchedulePolicy":
+        return {
+            "type": kind,
+            "frequency": frequency,
+            "run_times": _str_list(s.get("scheduleRunTimes")),
+            "weekdays": _str_list(s.get("scheduleRunDays")),
+        }
+    if kind == "SimpleSchedulePolicyV2":
+        out: dict = {"type": kind, "frequency": frequency}
+        if frequency == "Hourly":
+            h = _dict(s.get("hourlySchedule"))
+            out.update(
+                interval_hours=_int(h.get("interval")),
+                window_start=_str(h.get("scheduleWindowStartTime")),
+                window_hours=_int(h.get("scheduleWindowDuration")),
+            )
+        elif frequency == "Daily":
+            out["run_times"] = _str_list(_dict(s.get("dailySchedule")).get("scheduleRunTimes"))
+        elif frequency == "Weekly":
+            w = _dict(s.get("weeklySchedule"))
+            out.update(weekdays=_str_list(w.get("scheduleRunDays")), run_times=_str_list(w.get("scheduleRunTimes")))
+        else:
+            out["unparsed"] = True
+        return out
+    return {"type": kind, "unparsed": True}
+
+
+def _retention_schedule(block: Any) -> dict:
+    """The part of a monthly/yearly LongTermRetentionPolicy block that says *which* days."""
+    b = _dict(block)
+    out: dict = {"format": _str(b.get("retentionScheduleFormatType"))}
+    daily = _dict(b.get("retentionScheduleDaily"))
+    days = daily.get("daysOfTheMonth")
+    if isinstance(days, list):
+        out["days_of_month"] = [
+            {"day": _int(_dict(d).get("date")), "is_last": bool(_dict(d).get("isLast"))} for d in days
+        ]
+    weekly = _dict(b.get("retentionScheduleWeekly"))
+    if weekly:
+        out["weekdays"] = _str_list(weekly.get("daysOfTheWeek"))
+        out["weeks_of_month"] = _str_list(weekly.get("weeksOfTheMonth"))
+    months = b.get("monthsOfYear")
+    if isinstance(months, list):
+        out["months"] = _str_list(months)
+    out["retention"] = _duration(b.get("retentionDuration"))
+    return out
+
+
+def _retention_entry(retention: Any) -> dict:
+    r = _dict(retention)
+    kind = _str(r.get("retentionPolicyType"))
+    if kind == "LongTermRetentionPolicy":
+        out: dict = {"type": kind}
+        daily = _dict(r.get("dailySchedule"))
+        if daily:
+            out["daily"] = {"retention": _duration(daily.get("retentionDuration"))}
+        weekly = _dict(r.get("weeklySchedule"))
+        if weekly:
+            out["weekly"] = {
+                "weekdays": _str_list(weekly.get("daysOfTheWeek")),
+                "retention": _duration(weekly.get("retentionDuration")),
+            }
+        for name in ("monthlySchedule", "yearlySchedule"):
+            block = _dict(r.get(name))
+            if block:
+                out[name.removesuffix("Schedule")] = _retention_schedule(block)
+        return out
+    if kind == "SimpleRetentionPolicy":
+        return {"type": kind, "retention": _duration(r.get("retentionDuration"))}
+    return {"type": kind, "unparsed": True}
+
+
+def _policy_entry(policy: dict, vault: dict) -> dict:
+    p = _props(policy)
+    return {
+        "name": _str(policy.get("name")),
+        "vault": vault["name"],
+        "resource_group": vault["resource_group"],
+        "policy_type": _str(p.get("policyType")),
+        "schedule": _schedule_entry(p.get("schedulePolicy")),
+        "retention": _retention_entry(p.get("retentionPolicy")),
+        "instant_rp_days": _int(p.get("instantRpRetentionRangeInDays")),
+        "timezone": _str(p.get("timeZone")),
+        "protected_item_count": _int(p.get("protectedItemsCount")),
+    }
+
+
+@mcp.tool()
+@_with_call_deadline
+def vm_backup_policies(subscription: str | None = None, max_pages: int | None = None) -> dict:
+    """Schedule and retention of the Azure VM backup policies in each Recovery Services vault.
+
+    Read-only; needs the Reader role on the subscription. Per policy:
+    ``policy_type`` (``V1`` = ``SimpleSchedulePolicy``, ``V2`` =
+    ``SimpleSchedulePolicyV2`` with an hourly / daily / weekly schedule),
+    ``schedule`` (frequency, run times in UTC, weekdays, or the hourly window),
+    ``retention`` (``LongTermRetentionPolicy``: daily / weekly / monthly /
+    yearly blocks with their day selection and duration), ``instant_rp_days``,
+    ``timezone`` and ``protected_item_count`` (ARM's own count). A schedule or
+    retention type this server does not know is returned as
+    ``{"type": <name>, "unparsed": true}``, never dropped.
+
+    ``subscription`` is an id or display name from ``list_subscriptions``
+    (``None`` = every visible subscription); an unknown or ambiguous name
+    returns ``found: false``. Coverage flags as in ``vm_backup_status``:
+    ``skipped_vaults`` per subscription, ``skipped`` subscriptions when the
+    budget ran out, ``capped`` overall.
+    """
+    pages = _resolve_max_pages(max_pages)
+    try:
+        arm = _arm()
+        targets, listing_capped, not_found = _resolve_subscriptions(arm, subscription, pages)
+    except (ConfigError, ApiError) as e:
+        return _arm_error(e)
+    if not_found is not None:
+        return not_found
+
+    entries: list[dict] = []
+    skipped: list[dict] = []
+    capped = listing_capped
+    total = 0
+    for sub in targets:
+        sid = sub["subscription_id"]
+        if not _budget_left():
+            skipped.append({"subscription_id": sid, "name": sub["name"], "reason": "deadline"})
+            capped = True
+            continue
+        try:
+            scan = _scan_vaults(arm, sub, pages, "backupPolicies", _BACKUP_PARAMS)
+        except ApiError as e:
+            entries.append({"subscription_id": sid, "name": sub["name"], **_arm_error(e)})
+            capped = True  # part of the inventory is missing
+            continue
+        policies = [_policy_entry(policy, vault) for vault, policy in scan["rows"]]
+        total += len(policies)
+        capped = capped or not scan["complete"]
+        entries.append(
+            {
+                "subscription_id": sid,
+                "name": sub["name"],
+                "vaults": scan["vaults"],
+                "skipped_vaults": scan["skipped_vaults"],
+                "policies": policies,
+                "capped": not scan["complete"],
+            }
+        )
+    return {
+        "summary": {
+            "subscriptions": len(entries),
+            "failed_subscriptions": sum(1 for e in entries if "error" in e),
+            "policies": total,
+            "capped": capped,
+        },
+        "subscriptions": entries,
+        "skipped": skipped,
+        "capped": capped,
+    }
+
+
+# ---------------------------------------------------------------------------
+# m365_service_health
+# ---------------------------------------------------------------------------
+
+_SERVICE_HEALTH_PERMISSION = "ServiceHealth.Read.All"
+#: healthOverviews statuses that mean an issue is open now. Graph keeps post-resolution
+#: values (serviceRestored, postIncidentReviewPublished, falsePositive, resolved,
+#: mitigated, ...) on a service for days; those are not "degraded".
+_OPEN_HEALTH_STATUSES = (
+    "serviceDegradation",
+    "serviceInterruption",
+    "investigating",
+    "restoringService",
+    "verifyingService",
+    "extendedRecovery",
+    "investigationSuspended",
+    "confirmed",
+    "reported",
+)
+
+
+def _service_health_error(e: Exception) -> dict:
+    """A section's error; the permission hint only when the failure was a permission failure."""
+    out: dict = {"error": str(e)}
+    if isinstance(e, ApiPermissionError):
+        out["missing_permission"] = _SERVICE_HEALTH_PERMISSION
+    return out
+
+
+def _issue_entry(issue: dict) -> dict:
+    return {
+        "id": _str(issue.get("id")),
+        "title": _str(issue.get("title")),
+        "service": _str(issue.get("service")),
+        "feature": _str(issue.get("feature")),
+        "classification": _str(issue.get("classification")),
+        "status": _str(issue.get("status")),
+        "start": _str(issue.get("startDateTime")),
+        "last_modified": _str(issue.get("lastModifiedDateTime")),
+        "impact": _str(issue.get("impactDescription")),
+    }
+
+
+@mcp.tool()
+@_with_call_deadline
+def m365_service_health(max_pages: int | None = None) -> dict:
+    """Microsoft 365 service status per service, and the open incidents and advisories.
+
+    Two Graph reads (``ServiceHealth.Read.All``): ``healthOverviews`` (one row
+    per service with its current status) and the unresolved
+    ``serviceAnnouncement/issues``, newest first. A sign-in failure spike reads
+    very differently while Entra or Exchange has an open incident, which is
+    why ``daily_brief`` carries this section too. Each section degrades on its
+    own (``{"error", "missing_permission"}``); ``summary`` is computed from
+    whatever came back. ``capped`` means either collection was cut short by
+    the page budget, so the counts are lower bounds. The message center
+    (``messages``) needs a different permission and is not read.
+    """
+    pages = _resolve_max_pages(max_pages)
+    try:
+        client = _client()
+    except ConfigError as e:
+        return {"error": str(e)}
+
+    capped = False
+    services: Any
+    issues: Any
+    try:
+        raw, c = client.get_paged(
+            "/admin/serviceAnnouncement/healthOverviews", max_pages=pages, deadline=_current_deadline()
+        )
+        capped = capped or c
+        services = [{"service": _str(_dict(o).get("service")), "status": _str(_dict(o).get("status"))} for o in raw]
+    except ApiError as e:
+        services = _service_health_error(e)
+    try:
+        raw, c = client.get_paged(
+            "/admin/serviceAnnouncement/issues",
+            params={"$filter": "isResolved eq false", "$orderby": "startDateTime desc"},
+            max_pages=pages,
+            deadline=_current_deadline(),
+        )
+        capped = capped or c
+        issues = [_issue_entry(i) for i in raw if isinstance(i, dict)]
+    except ApiError as e:
+        issues = _service_health_error(e)
+
+    summary: dict = {"capped": capped}
+    if isinstance(services, list):
+        # Only an open issue counts; a row without a status is counted so it is not hidden.
+        summary["degraded_services"] = [
+            s["service"] or "(unnamed service)" for s in services if s["status"] in _OPEN_HEALTH_STATUSES
+        ]
+        summary["services_without_status"] = sum(1 for s in services if s["status"] is None)
+    else:
+        summary["degraded_services"] = services
+    if isinstance(issues, list):
+        summary["open_incidents"] = sum(1 for i in issues if i["classification"] == "incident")
+        summary["open_advisories"] = sum(1 for i in issues if i["classification"] == "advisory")
+    else:
+        summary["open_incidents"] = issues
+        summary["open_advisories"] = issues
+    return {"summary": summary, "services": services, "issues": issues, "capped": capped}
+
+
+# ---------------------------------------------------------------------------
 # daily_brief
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10) -> dict:
-    """One-call morning-patrol summary: sign-in failures, spray suspects, and admin actions.
+    """One-call morning-patrol summary: M365 service health, sign-in failures, spray suspects, admin actions.
 
-    Combines ``signin_failure_stats`` and ``directory_audits`` into one
-    result with a compact ``summary`` on top, matching the shape of this
-    fleet's other ``daily_brief`` tools. A permission failure in one section
-    degrades only that section's contribution to ``summary`` -- the other
-    section still returns in full.
+    Combines ``m365_service_health``, ``signin_failure_stats`` and
+    ``directory_audits`` into one result with a compact ``summary`` on top,
+    matching the shape of this fleet's other ``daily_brief`` tools. A
+    permission failure in one section degrades only that section's
+    contribution to ``summary`` -- the other sections still return in full.
+    Azure VM backup is deliberately not a section here: its ARM fan-out is
+    the one scan that could exhaust the shared budget, so call
+    ``vm_backup_status`` separately.
 
     Runs both sections synchronously in one tool call, unlike the sibling
     gwsadm-mcp's job+poll ``daily_brief``. If this proves too slow for a
@@ -1278,25 +2054,37 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
 
     token = _CALL_DEADLINE.set(_new_deadline())
     try:
-        # The audit log is the small, fast scan and the sign-in scan is the one that can use
-        # the whole budget, so audits run first: a slow sign-in scan cannot leave the audit
-        # section starting with an expired budget and reporting an empty list.
+        # Cheapest first: service health is two small reads, the audit log is the small, fast
+        # scan and the sign-in scan is the one that can use the whole budget. A slow sign-in
+        # scan therefore cannot leave the earlier sections starting with an expired budget and
+        # reporting an empty list.
+        health = m365_service_health(max_pages=max_pages)
         audits = directory_audits(hours=hours, max_pages=max_pages)
         stats = signin_failure_stats(hours=hours, max_pages=max_pages)
     finally:
         _CALL_DEADLINE.reset(token)
 
-    if "error" in stats:
-        summary: dict = {"sign_in_failures": stats}
+    if "error" in health:
+        summary: dict = {"service_health": health}
     else:
         summary = {
-            "sign_in_failures": stats["total_failures"],
-            "distinct_failing_users": stats["distinct_failing_users"],
-            "top_error_codes": stats["top_error_codes"][:5],
-            "spray_suspects": stats["spray_suspects"],
-            "internal_spray_suspects": stats["internal_spray_suspects"],
-            "capped": stats["capped"],
+            "service_health": {
+                "degraded_services": health["summary"]["degraded_services"],
+                "open_incidents": health["summary"]["open_incidents"],
+                "capped": health["capped"],
+            }
         }
+    if "error" in stats:
+        summary["sign_in_failures"] = stats
+    else:
+        summary.update(
+            sign_in_failures=stats["total_failures"],
+            distinct_failing_users=stats["distinct_failing_users"],
+            top_error_codes=stats["top_error_codes"][:5],
+            spray_suspects=stats["spray_suspects"],
+            internal_spray_suspects=stats["internal_spray_suspects"],
+            capped=stats["capped"],
+        )
         if stats["sites"]["error"] is not None:
             summary["sites_error"] = stats["sites"]["error"]
 
@@ -1305,10 +2093,13 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
     else:
         summary["admin_actions"] = audits["count"]
         summary["capped"] = summary.get("capped", False) or audits["capped"]
+    if "error" not in health:
+        summary["capped"] = summary.get("capped", False) or health["capped"]
 
     return {
         "window_hours": hours,
         "summary": summary,
+        "m365_service_health": health,
         "signin_failure_stats": stats,
         "directory_audits": audits,
     }

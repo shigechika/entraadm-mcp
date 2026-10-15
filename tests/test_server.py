@@ -72,6 +72,39 @@ class FakeGraphClient:
         return self._signin_probe_result
 
 
+class FakeArmClient:
+    """Test double for ArmClient, keyed like FakeGraphClient.
+
+    ``paged_responses`` maps a path (or ``"*"``) to ``(items, capped)`` or an
+    Exception; a callable value is called with ``(path, params, max_pages)``
+    for tests that need to see the request. ``check_result`` is what
+    health_check's ``arm`` probe reports.
+    """
+
+    def __init__(self, paged_responses=None, check_result=None):
+        self._paged_responses = paged_responses if paged_responses is not None else {}
+        self._check_result = (
+            check_result
+            if check_result is not None
+            else {"auth": "ok", "detail": None, "subscriptions": 0, "capped": False}
+        )
+        self.calls = []
+
+    def get_paged(self, path, params=None, max_pages=5, deadline=None):
+        self.calls.append(("get_paged", path, params, max_pages, deadline))
+        response = self._paged_responses.get(path, self._paged_responses.get("*"))
+        if callable(response):
+            response = response(path, params, max_pages)
+        if isinstance(response, Exception):
+            raise response
+        if response is None:
+            return [], False
+        return response
+
+    def check(self, deadline=None):
+        return self._check_result
+
+
 @pytest.fixture
 def inject(monkeypatch):
     # _license_cache is module-level state shared across get_user calls (by
@@ -82,9 +115,22 @@ def inject(monkeypatch):
     # A developer shell may point at a real sites file; tests opt in explicitly.
     monkeypatch.delenv("ENTRAADM_SITES_INI", raising=False)
 
+    # health_check also probes ARM; without a double here it would build a real
+    # ArmClient (and AzureCliCredential would shell out to `az`).
+    monkeypatch.setitem(server._state, "arm", FakeArmClient())
+
     def _inject(client):
         monkeypatch.setitem(server._state, "client", client)
         return client
+
+    return _inject
+
+
+@pytest.fixture
+def inject_arm(monkeypatch):
+    def _inject(arm):
+        monkeypatch.setitem(server._state, "arm", arm)
+        return arm
 
     return _inject
 
@@ -206,10 +252,50 @@ def test_health_check_shape_is_identical_across_all_statuses(inject):
     )
     errored = server.health_check()
     for result in (healthy, degraded, errored):
-        assert set(result.keys()) == {"service", "version", "status", "auth_mode", "graph", "signin_probe", "sites"}
+        assert set(result.keys()) == {
+            "service",
+            "version",
+            "status",
+            "auth_mode",
+            "graph",
+            "signin_probe",
+            "arm",
+            "sites",
+        }
         assert set(result["sites"].keys()) == {"configured", "ranges", "error"}
         assert set(result["graph"].keys()) == {"auth", "detail"}
         assert set(result["signin_probe"].keys()) == {"auth", "detail"}
+        assert set(result["arm"].keys()) == {"auth", "detail", "subscriptions", "capped"}
+
+
+def test_health_check_gives_the_arm_probe_its_own_short_budget(inject, inject_arm, monkeypatch):
+    import time
+
+    inject(FakeGraphClient())
+    seen = []
+
+    class RecordingArm(FakeArmClient):
+        def check(self, deadline=None):
+            seen.append(deadline)
+            return super().check(deadline)
+
+    inject_arm(RecordingArm())
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "0")  # even with the tool budget disabled
+    before = time.monotonic()
+    server.health_check()
+    assert len(seen) == 1 and seen[0] is not None
+    assert 0 < seen[0] - before <= server._ARM_PROBE_SECONDS + 0.5
+
+
+def test_health_check_arm_probe_is_informational(inject, inject_arm):
+    # Azure RBAC is optional: a deployment used only for Entra triage must not
+    # be degraded forever because ARM is unreachable or sees no subscription.
+    inject(FakeGraphClient())
+    probe = {"auth": "error", "detail": "no token", "subscriptions": None, "capped": None}
+    inject_arm(FakeArmClient(check_result=probe))
+    result = server.health_check()
+    assert result["status"] == "healthy"
+    assert result["arm"] == probe
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +1003,8 @@ def test_daily_brief_shares_one_deadline_between_sections(inject, monkeypatch):
     inject(client)
     monkeypatch.setenv("ENTRAADM_DEADLINE", "30")
     server.daily_brief(hours=1)
-    assert len(seen) == 2 and seen[0] is not None and seen[0] == seen[1]
+    # service health (2 reads), audits, sign-ins: one budget for all four
+    assert len(seen) == 4 and seen[0] is not None and len(set(seen)) == 1
 
 
 def test_deadline_disabled_by_zero(inject, monkeypatch):
@@ -969,7 +1056,12 @@ def test_daily_brief_runs_the_audit_scan_before_the_signin_scan(inject):
     client.get_paged = get_paged
     inject(client)
     server.daily_brief(hours=1)
-    assert order == ["/auditLogs/directoryAudits", "/auditLogs/signIns"]
+    assert order == [
+        "/admin/serviceAnnouncement/healthOverviews",
+        "/admin/serviceAnnouncement/issues",
+        "/auditLogs/directoryAudits",
+        "/auditLogs/signIns",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1095,3 +1187,855 @@ def test_daily_brief_summary_counts_internal_suspects(inject, sites_ini):
     assert result["summary"]["spray_suspects"] == []
     assert [s["ip_address"] for s in result["summary"]["internal_spray_suspects"]] == ["192.0.2.10"]
     assert "sites_error" not in result["summary"]
+
+
+# ---------------------------------------------------------------------------
+# ARM: list_subscriptions / vm_backup_status / vm_backup_policies
+# ---------------------------------------------------------------------------
+
+SUB_A = "aaaaaaaa-1111-1111-1111-111111111111"
+SUB_B = "22222222-2222-2222-2222-222222222222"
+ARM_PERM_ERROR = server.ApiPermissionError("ARM denied the request (x); this credential needs the Reader role")
+
+
+def _subs(*pairs):
+    return [{"subscriptionId": sid, "displayName": name, "state": "Enabled"} for sid, name in pairs]
+
+
+def _vm(sub, name, rg="rg1"):
+    # ARM's Compute responses use this casing; RecoveryServices lower-cases parts of it.
+    return {
+        "id": f"/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Compute/virtualMachines/{name}",
+        "name": name,
+        "location": "japaneast",
+    }
+
+
+def _vault(sub, name="vault1", rg="rg1"):
+    return {
+        "id": f"/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.RecoveryServices/vaults/{name}",
+        "name": name,
+        "location": "japaneast",
+    }
+
+
+def _item(sub, vm, state="Protected", last_status="Completed", recovery_point="2026-10-15T20:00:00Z", rg="rg1", **more):
+    props = {
+        "friendlyName": vm,
+        "virtualMachineId": (
+            f"/subscriptions/{sub}/resourcegroups/{rg}/providers/microsoft.compute/virtualmachines/{vm}"
+        ),
+        "protectionState": state,
+        "protectionStatus": "Healthy",
+        "healthStatus": "Passed",
+        "lastBackupStatus": last_status,
+        "lastBackupTime": "2026-10-15T20:00:00Z",
+        "lastRecoveryPoint": recovery_point,
+        "policyName": "DailyPolicy",
+    }
+    props.update(more)
+    return {
+        "id": f"{_vault(sub)['id']}/backupFabrics/Azure/protectionContainers/c/protectedItems/{vm}",
+        "properties": props,
+    }
+
+
+def _vms_path(sub):
+    return f"/subscriptions/{sub}/providers/Microsoft.Compute/virtualMachines"
+
+
+def _vaults_path(sub):
+    return f"/subscriptions/{sub}/providers/Microsoft.RecoveryServices/vaults"
+
+
+def _items_path(sub, name="vault1", rg="rg1"):
+    return f"{_vault(sub, name, rg)['id']}/backupProtectedItems"
+
+
+def _policies_path(sub, name="vault1", rg="rg1"):
+    return f"{_vault(sub, name, rg)['id']}/backupPolicies"
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    import datetime as dt
+
+    fixed = dt.datetime(2026, 10, 16, 8, 0, tzinfo=dt.timezone.utc)
+
+    class FrozenDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed if tz is None else fixed.astimezone(tz)
+
+    monkeypatch.setattr(server.datetime, "datetime", FrozenDateTime)
+    return fixed
+
+
+def test_list_subscriptions_projects_and_lowercases_ids(inject, inject_arm):
+    inject(FakeGraphClient())
+    arm = inject_arm(FakeArmClient({"/subscriptions": (_subs((SUB_A.upper(), "alpha")), True)}))
+    result = server.list_subscriptions(max_pages=2)
+    assert result == {
+        "count": 1,
+        "capped": True,
+        "subscriptions": [{"subscription_id": SUB_A, "name": "alpha", "state": "Enabled"}],
+    }
+    assert arm.calls[0][2] == {"api-version": server.ARM_API_VERSIONS["subscriptions"]}
+    assert arm.calls[0][3] == 2 and arm.calls[0][4] is not None
+
+
+def test_list_subscriptions_rejects_a_malformed_id_before_it_can_reach_a_path(inject, inject_arm):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient({"/subscriptions": ([{"subscriptionId": "../evil", "displayName": "x"}], False)}))
+    result = server.list_subscriptions()
+    assert "error" in result and "subscription id shape" in result["error"]
+
+
+def test_list_subscriptions_surfaces_the_rbac_hint(inject, inject_arm):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient({"/subscriptions": ARM_PERM_ERROR}))
+    result = server.list_subscriptions()
+    assert result["missing_permission"] == server.ARM_ROLE_HINT
+
+
+@pytest.mark.parametrize("wanted", [SUB_A, SUB_A.upper(), "alpha", " alpha "])
+def test_subscription_resolves_by_id_or_display_name(inject, inject_arm, wanted):
+    inject(FakeGraphClient())
+    arm = inject_arm(FakeArmClient({"/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False)}))
+    result = server.vm_backup_status(subscription=wanted)
+    assert [e["subscription_id"] for e in result["subscriptions"]] == [SUB_A]
+    # only ARM's own id reaches a path, never the argument
+    assert all(SUB_A.upper() not in c[1] for c in arm.calls)
+
+
+def test_subscription_not_found_ambiguous_and_listing_capped(inject, inject_arm):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient({"/subscriptions": (_subs((SUB_A, "dup"), (SUB_B, "dup")), True)}))
+    assert server.vm_backup_status(subscription="nope") == {
+        "found": False,
+        "subscription": "nope",
+        "listing_capped": True,
+    }
+    result = server.vm_backup_policies(subscription="dup")
+    assert result["found"] is False and result["ambiguous"] == [SUB_A, SUB_B]
+
+
+def test_display_name_needs_a_complete_listing_but_an_id_does_not(inject, inject_arm):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient({"/subscriptions": (_subs((SUB_A, "alpha")), True)}))
+    by_name = server.vm_backup_status(subscription="alpha", max_pages=1)
+    assert by_name == {"found": False, "subscription": "alpha", "listing_capped": True, "candidates": [SUB_A]}
+    by_id = server.vm_backup_status(subscription=SUB_A, max_pages=1)
+    assert [e["subscription_id"] for e in by_id["subscriptions"]] == [SUB_A]
+
+
+def test_vm_backup_status_classifies_every_state(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    items = [
+        _item(SUB_A, "ok"),
+        _item(SUB_A, "stopped", state="ProtectionStopped"),
+        _item(SUB_A, "pending", state="IRPending", last_status="", recovery_point=None),
+        _item(SUB_A, "failed", last_status="Failed", recovery_point="2026-10-10T20:00:00Z"),
+        _item(SUB_A, "weird", state="SomethingNew", last_status=None, recovery_point="garbage"),
+        _item(SUB_A, "running", last_status="InProgress"),
+        _item(SUB_A, "stateless", state=None),
+        _item(SUB_A, "gone"),  # the VM no longer exists
+    ]
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): (
+                    [
+                        _vm(SUB_A, n)
+                        for n in ("ok", "stopped", "pending", "failed", "weird", "running", "stateless", "none")
+                    ],
+                    False,
+                ),
+                _vaults_path(SUB_A): ([_vault(SUB_A)], False),
+                _items_path(SUB_A): (items, False),
+            }
+        )
+    )
+    result = server.vm_backup_status(stale_hours=36)
+    rows = {r["name"]: r for r in result["subscriptions"][0]["vms"]}
+    assert rows["ok"]["protected"] is True and rows["ok"]["backup_ok"] is True and rows["ok"]["stale"] is False
+    assert rows["ok"]["vault"] == "vault1" and rows["ok"]["policy_name"] == "DailyPolicy"
+    assert rows["ok"]["resource_group"] == "rg1"
+    assert rows["stopped"]["protected"] is False and rows["stopped"]["protection_state"] == "ProtectionStopped"
+    assert rows["pending"]["protected"] is True and rows["pending"]["stale"] is None
+    assert rows["pending"]["backup_ok"] is None and rows["pending"]["note"] == "initial backup pending"
+    assert (
+        rows["failed"]["protected"] is True and rows["failed"]["backup_ok"] is False and rows["failed"]["stale"] is True
+    )
+    assert rows["weird"]["protected"] is False and rows["weird"]["stale"] is None
+    assert rows["none"]["protected"] is False and rows["none"]["vault"] is None and "note" not in rows["none"]
+    # a backup in flight is neither a success nor a failure
+    assert rows["running"]["protected"] is True and rows["running"]["backup_ok"] is None
+    # an item whose state is unreadable is unknown, not unprotected
+    assert rows["stateless"]["protected"] is None and rows["stateless"]["vault"] == "vault1"
+    assert "protectionState is missing" in rows["stateless"]["note"]
+    counts = result["subscriptions"][0]
+    assert (counts["vm_count"], counts["protected"], counts["unprotected"], counts["unknown"]) == (8, 4, 3, 1)
+    assert (counts["stale"], counts["failed"]) == (1, 1)
+    assert result["summary"] == {
+        "subscriptions": 1,
+        "failed_subscriptions": 0,
+        "vm_count": 8,
+        "protected": 4,
+        "unprotected": 3,
+        "unknown": 1,
+        "stale": 1,
+        "failed": 1,
+        "orphans": 1,
+        "capped": False,
+    }
+    assert result["duplicate_items"] == 0
+    assert result["orphans"][0]["name"] == "gone" and result["orphans"][0]["vault"] == "vault1"
+    assert result["capped"] is False and result["skipped"] == []
+    assert result["coverage"].startswith("every visible subscription")
+
+
+def test_vm_backup_status_incomplete_item_scan_yields_unknown_not_unprotected(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok"), _vm(SUB_A, "unmatched")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A)], False),
+                _items_path(SUB_A): ([_item(SUB_A, "ok")], True),  # page budget ran out
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    rows = {r["name"]: r for r in result["subscriptions"][0]["vms"]}
+    assert rows["ok"]["protected"] is True
+    assert rows["unmatched"]["protected"] is None and "incomplete" in rows["unmatched"]["note"]
+    entry = result["subscriptions"][0]
+    assert entry["unknown"] == 1 and entry["unprotected"] == 0 and entry["capped"] is True
+    assert entry["vaults"][0]["capped"] is True
+    assert result["capped"] is True and result["summary"]["capped"] is True
+
+
+def test_vm_backup_status_orphans_need_a_complete_vm_listing(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], True),  # VM listing capped
+                _vaults_path(SUB_A): ([_vault(SUB_A)], False),
+                _items_path(SUB_A): ([_item(SUB_A, "ok"), _item(SUB_A, "maybe-gone")], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    assert result["orphans"] == [] and result["unjoined_items"] == 1
+    assert result["subscriptions"][0]["vms_capped"] is True and result["capped"] is True
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        f"/subscriptions/{SUB_A}/resourceGroups/../providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/./providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg./providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg 1/providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg1/providers/Microsoft.RecoveryServices/vaults/v1?x=1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg1/providers/Microsoft.RecoveryServices/vaults/v1#frag",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg%2F1/providers/Microsoft.RecoveryServices/vaults/v1",
+        f"/subscriptions/{SUB_A}/resourceGroups/rg1/providers/Microsoft.RecoveryServices/vaults/v1/extra",
+        f"/subscriptions/{SUB_B}/resourceGroups/rg1/providers/Microsoft.RecoveryServices/vaults/v1",
+        "",
+    ],
+)
+def test_vm_backup_status_never_requests_a_vault_id_that_fails_validation(inject, inject_arm, frozen_now, bad_id):
+    inject(FakeGraphClient())
+    arm = inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([{"id": bad_id, "name": "v1"}], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    assert entry["vaults"] == [] and len(entry["skipped_vaults"]) == 1
+    assert entry["skipped_vaults"][0]["reason"] == "id did not match the vault id pattern"
+    assert all("backupProtectedItems" not in c[1] for c in arm.calls)
+    assert entry["vms"][0]["protected"] is None  # the scan was incomplete, so not "unprotected"
+    assert entry["items_complete"] is False and result["capped"] is True
+
+
+@pytest.mark.parametrize("rg", ["My.RG_(1)", "rg..prod", ".prod", "東京-rg", "a"])
+def test_vm_backup_status_accepts_arm_casing_differences_and_valid_group_names(inject, inject_arm, frozen_now, rg):
+    inject(FakeGraphClient())
+    odd = f"/SUBSCRIPTIONS/{SUB_A.upper()}/resourcegroups/{rg}/providers/microsoft.recoveryservices/vaults/My-Vault"
+    arm = inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok", rg=rg)], False),
+                _vaults_path(SUB_A): ([{"id": odd, "name": "My-Vault"}], False),
+                f"{odd}/backupProtectedItems": ([_item(SUB_A, "ok", rg=rg.lower())], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    assert entry["vaults"][0]["name"] == "My-Vault" and entry["vaults"][0]["resource_group"] == rg
+    assert entry["vms"][0]["protected"] is True
+    assert any(c[1] == f"{odd}/backupProtectedItems" for c in arm.calls)
+
+
+def test_vm_backup_status_one_subscription_error_degrades_only_that_entry(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+                _vms_path(SUB_A): ARM_PERM_ERROR,
+                _vms_path(SUB_B): ([_vm(SUB_B, "ok")], False),
+                _vaults_path(SUB_B): ([_vault(SUB_B)], False),
+                _items_path(SUB_B): ([_item(SUB_B, "ok")], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    a, b = result["subscriptions"]
+    assert a["subscription_id"] == SUB_A and a["missing_permission"] == server.ARM_ROLE_HINT and "vms" not in a
+    assert b["vms"][0]["protected"] is True
+    assert result["summary"]["subscriptions"] == 2 and result["summary"]["vm_count"] == 1
+    # part of the inventory is missing, so the result is capped and an unmatched VM would be unknown
+    assert result["summary"]["failed_subscriptions"] == 1 and result["capped"] is True
+    only_b = server.vm_backup_status(subscription="beta")
+    assert only_b["capped"] is False and only_b["summary"]["failed_subscriptions"] == 0
+
+
+def test_vm_backup_status_global_join_needs_every_vault_scan_complete(inject, inject_arm, frozen_now):
+    # The VM is in A (complete scan); B's vault scan was capped. Globally the VM
+    # may be protected by a vault in B that was not read, so it is unknown.
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([], False),
+                _vms_path(SUB_B): ([], False),
+                _vaults_path(SUB_B): ([_vault(SUB_B)], False),
+                _items_path(SUB_B): ([], True),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    assert result["subscriptions"][0]["vms"][0]["protected"] is None
+    assert result["summary"]["unknown"] == 1 and result["capped"] is True
+    # Named alone, A's own (complete) scan is the authority.
+    assert server.vm_backup_status(subscription="alpha")["subscriptions"][0]["vms"][0]["protected"] is False
+    # Every subscription denied: nothing is known, and the summary says so.
+    inject_arm(
+        FakeArmClient({"/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False), "*": ARM_PERM_ERROR})
+    )
+    result = server.vm_backup_status()
+    assert result["summary"]["failed_subscriptions"] == 2 and result["capped"] is True
+    policies = server.vm_backup_policies()
+    assert policies["summary"]["failed_subscriptions"] == 2 and policies["capped"] is True
+
+
+def test_vm_backup_status_a_vault_that_errors_is_skipped_not_fatal(inject, inject_arm, frozen_now):
+    # A 5xx past the retry budget on one vault keeps the subscription's VM listing.
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A), _vault(SUB_A, "vault2")], False),
+                _items_path(SUB_A): GraphError("ARM request failed (500): boom"),
+                _items_path(SUB_A, "vault2"): ([_item(SUB_A, "ok")], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    assert "error" not in entry and entry["vms"][0]["protected"] is True
+    assert entry["skipped_vaults"][0]["reason"] == "ARM request failed (500): boom"
+    assert entry["items_complete"] is False and result["summary"]["failed_subscriptions"] == 0
+
+
+def test_vm_backup_status_prefers_the_live_item_when_two_vaults_hold_one_vm(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    old = _item(SUB_A, "ok", state="ProtectionStopped")
+    live = _item(SUB_A, "ok")
+    for order in ((old, live), (live, old)):
+        inject_arm(
+            FakeArmClient(
+                {
+                    "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                    _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                    _vaults_path(SUB_A): ([_vault(SUB_A, "vault-old"), _vault(SUB_A, "vault-new")], False),
+                    _items_path(SUB_A, "vault-old"): ([order[0]], False),
+                    _items_path(SUB_A, "vault-new"): ([order[1]], False),
+                }
+            )
+        )
+        result = server.vm_backup_status()
+        row = result["subscriptions"][0]["vms"][0]
+        assert row["protected"] is True and row["protection_state"] == "Protected"
+        assert result["duplicate_items"] == 1
+
+
+def test_vm_backup_status_unreadable_vault_is_skipped_with_its_reason(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A), _vault(SUB_A, "vault2")], False),
+                _items_path(SUB_A): ARM_PERM_ERROR,
+                _items_path(SUB_A, "vault2"): ([_item(SUB_A, "ok")], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    assert [v["name"] for v in entry["vaults"]] == ["vault2"]
+    assert (
+        entry["skipped_vaults"][0]["id"].endswith("/vaults/vault1") and "Reader" in entry["skipped_vaults"][0]["reason"]
+    )
+    assert entry["vms"][0]["protected"] is True and entry["items_complete"] is False
+
+
+def test_vm_backup_status_stops_at_the_deadline_and_lists_the_rest_as_skipped(
+    inject, inject_arm, frozen_now, monkeypatch
+):
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A)], False),
+                _items_path(SUB_A): ([_item(SUB_A, "ok")], False),
+            }
+        )
+    )
+    budget = iter([True, True, False])  # subscription A, its vault, then the budget is gone
+    monkeypatch.setattr(server, "_budget_left", lambda: next(budget))
+    result = server.vm_backup_status()
+    assert [e["subscription_id"] for e in result["subscriptions"]] == [SUB_A]
+    assert result["skipped"] == [{"subscription_id": SUB_B, "name": "beta", "reason": "deadline"}]
+    assert result["capped"] is True
+
+
+def test_vm_backup_status_deadline_runs_out_between_vaults(inject, inject_arm, frozen_now, monkeypatch):
+    inject(FakeGraphClient())
+    arm = inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A), _vault(SUB_A, "vault2")], False),
+                _items_path(SUB_A): ([_item(SUB_A, "ok")], False),
+            }
+        )
+    )
+    budget = iter([True, True, False])
+    monkeypatch.setattr(server, "_budget_left", lambda: next(budget))
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    assert entry["skipped_vaults"] == [{"id": _vault(SUB_A, "vault2")["id"].lower(), "reason": "deadline"}]
+    assert all("vault2/backupProtectedItems" not in c[1] for c in arm.calls)
+    assert entry["vms"][0]["protected"] is True and result["capped"] is True
+
+
+def test_vm_backup_status_cross_subscription_vault(inject, inject_arm, frozen_now):
+    # The VM lives in A, its vault in B.
+    inject(FakeGraphClient())
+    responses = {
+        "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+        _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+        _vaults_path(SUB_A): ([], False),
+        _vms_path(SUB_B): ([], False),
+        _vaults_path(SUB_B): ([_vault(SUB_B)], False),
+        _items_path(SUB_B): ([_item(SUB_A, "ok")], False),
+    }
+    inject_arm(FakeArmClient(responses))
+    globally = server.vm_backup_status()
+    assert globally["subscriptions"][0]["vms"][0]["protected"] is True
+    assert globally["orphans"] == [] and globally["unjoined_items"] == 0
+    only_a = server.vm_backup_status(subscription="alpha")
+    assert only_a["subscriptions"][0]["vms"][0]["protected"] is False
+    assert "another subscription" in only_a["coverage"]
+
+
+def test_vm_backup_status_passes_one_deadline_to_every_arm_call(inject, inject_arm, frozen_now, monkeypatch):
+    inject(FakeGraphClient())
+    arm = inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok")], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A)], False),
+                _items_path(SUB_A): ([_item(SUB_A, "ok")], False),
+            }
+        )
+    )
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "30")
+    server.vm_backup_status()
+    deadlines = {c[4] for c in arm.calls}
+    assert len(arm.calls) == 4 and len(deadlines) == 1 and None not in deadlines
+
+
+def test_vm_backup_status_tolerates_null_and_wrong_typed_fields(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    broken_item = {
+        "id": "x",
+        "properties": {
+            "virtualMachineId": _vm(SUB_A, "ok")["id"],
+            "protectionState": None,
+            "lastBackupStatus": 7,
+            "lastRecoveryPoint": "2026-13-45T99:99:99Z",
+            "policyName": ["list"],
+        },
+    }
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vms_path(SUB_A): ([_vm(SUB_A, "ok"), {"id": None, "name": 5}, "not a dict"], False),
+                _vaults_path(SUB_A): ([_vault(SUB_A), "junk", {"id": 3}], False),
+                _items_path(SUB_A): ([broken_item, {"properties": None}, "junk"], False),
+            }
+        )
+    )
+    result = server.vm_backup_status()
+    entry = result["subscriptions"][0]
+    rows = {r["id"]: r for r in entry["vms"]}
+    ok = rows[_vm(SUB_A, "ok")["id"].lower()]
+    # protectionState is null: an item exists but says nothing, so unknown rather than unprotected
+    assert ok["protected"] is None and ok["policy_name"] is None and ok["last_backup_status"] is None
+    assert rows[""]["name"] is None and rows[""]["protected"] is None  # no id: cannot join; scan was incomplete
+    assert len(entry["skipped_vaults"]) == 2
+
+
+def test_parse_iso_handles_fractions_offsets_and_garbage():
+    import datetime as dt
+
+    assert server._parse_iso("2026-10-15T08:29:28.08Z") == dt.datetime(
+        2026, 10, 15, 8, 29, 28, 80000, tzinfo=dt.timezone.utc
+    )
+    assert server._parse_iso("2026-10-15T08:29:28.1234567Z").microsecond == 123456
+    assert server._parse_iso("2026-10-15T08:29:28+09:00").utcoffset() == dt.timedelta(hours=9)
+    assert server._parse_iso("2026-10-15T08:29:28").tzinfo == dt.timezone.utc
+    for bad in (None, 5, "", "yesterday", "2026-13-45T99:99:99Z", "2026-10-15"):
+        assert server._parse_iso(bad) is None
+
+
+def test_stale_hours_is_clamped(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient({"/subscriptions": ([], False)}))
+    assert server.vm_backup_status(stale_hours=0)["stale_hours"] == 1
+    assert server.vm_backup_status(stale_hours=10**9)["stale_hours"] == 24 * 400
+
+
+def _policy(name, props):
+    return {"id": f"policy/{name}", "name": name, "properties": props}
+
+
+V1_POLICY = _policy(
+    "DailyV1",
+    {
+        "backupManagementType": "AzureIaasVM",
+        "policyType": "V1",
+        "instantRpRetentionRangeInDays": 2,
+        "timeZone": "Tokyo Standard Time",
+        "protectedItemsCount": 7,
+        "schedulePolicy": {
+            "schedulePolicyType": "SimpleSchedulePolicy",
+            "scheduleRunFrequency": "Daily",
+            "scheduleRunTimes": ["2026-01-01T20:00:00Z"],
+            "scheduleWeeklyFrequency": 0,
+        },
+        "retentionPolicy": {
+            "retentionPolicyType": "LongTermRetentionPolicy",
+            "dailySchedule": {
+                "retentionTimes": ["2026-01-01T20:00:00Z"],
+                "retentionDuration": {"count": 6, "durationType": "Days"},
+            },
+            "weeklySchedule": {
+                "daysOfTheWeek": ["Sunday"],
+                "retentionDuration": {"count": 3, "durationType": "Weeks"},
+            },
+            "monthlySchedule": {
+                "retentionScheduleFormatType": "Daily",
+                "retentionScheduleDaily": {"daysOfTheMonth": [{"date": 1, "isLast": False}]},
+                "retentionDuration": {"count": 12, "durationType": "Months"},
+            },
+            "yearlySchedule": {
+                "retentionScheduleFormatType": "Weekly",
+                "monthsOfYear": ["January"],
+                "retentionScheduleWeekly": {"daysOfTheWeek": ["Sunday"], "weeksOfTheMonth": ["First"]},
+                "retentionDuration": {"count": 1, "durationType": "Years"},
+            },
+        },
+    },
+)
+
+
+def _v2(frequency, **schedule):
+    return _policy(
+        f"{frequency}V2",
+        {
+            "policyType": "V2",
+            "schedulePolicy": {
+                "schedulePolicyType": "SimpleSchedulePolicyV2",
+                "scheduleRunFrequency": frequency,
+                **schedule,
+            },
+            "retentionPolicy": {
+                "retentionPolicyType": "SimpleRetentionPolicy",
+                "retentionDuration": {"count": 30, "durationType": "Days"},
+            },
+        },
+    )
+
+
+def test_vm_backup_policies_parses_v1_and_every_v2_frequency(inject, inject_arm):
+    inject(FakeGraphClient())
+    policies = [
+        V1_POLICY,
+        _v2(
+            "Hourly",
+            hourlySchedule={
+                "interval": 4,
+                "scheduleWindowStartTime": "2026-01-01T08:00:00Z",
+                "scheduleWindowDuration": 12,
+            },
+        ),
+        _v2("Daily", dailySchedule={"scheduleRunTimes": ["2026-01-01T20:00:00Z"]}),
+        _v2(
+            "Weekly",
+            weeklySchedule={"scheduleRunDays": ["Monday", "Thursday"], "scheduleRunTimes": ["2026-01-01T20:00:00Z"]},
+        ),
+        _v2("Monthly"),  # a frequency this server does not know
+        _policy(
+            "Unknown",
+            {
+                "schedulePolicy": {"schedulePolicyType": "LogSchedulePolicy"},
+                "retentionPolicy": {"retentionPolicyType": "NewRetention"},
+            },
+        ),
+        _policy("Empty", {"schedulePolicy": None, "retentionPolicy": "junk"}),
+    ]
+    arm = inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha")), False),
+                _vaults_path(SUB_A): ([_vault(SUB_A)], False),
+                _policies_path(SUB_A): (policies, False),
+            }
+        )
+    )
+    result = server.vm_backup_policies(subscription="alpha")
+    by_name = {p["name"]: p for p in result["subscriptions"][0]["policies"]}
+    v1 = by_name["DailyV1"]
+    assert v1["policy_type"] == "V1" and v1["vault"] == "vault1" and v1["protected_item_count"] == 7
+    assert v1["instant_rp_days"] == 2 and v1["timezone"] == "Tokyo Standard Time"
+    assert v1["schedule"] == {
+        "type": "SimpleSchedulePolicy",
+        "frequency": "Daily",
+        "run_times": ["2026-01-01T20:00:00Z"],
+        "weekdays": [],
+    }
+    assert v1["retention"]["daily"] == {"retention": {"count": 6, "unit": "Days"}}
+    assert v1["retention"]["weekly"] == {"weekdays": ["Sunday"], "retention": {"count": 3, "unit": "Weeks"}}
+    assert v1["retention"]["monthly"] == {
+        "format": "Daily",
+        "days_of_month": [{"day": 1, "is_last": False}],
+        "retention": {"count": 12, "unit": "Months"},
+    }
+    assert v1["retention"]["yearly"] == {
+        "format": "Weekly",
+        "weekdays": ["Sunday"],
+        "weeks_of_month": ["First"],
+        "months": ["January"],
+        "retention": {"count": 1, "unit": "Years"},
+    }
+    assert by_name["HourlyV2"]["schedule"] == {
+        "type": "SimpleSchedulePolicyV2",
+        "frequency": "Hourly",
+        "interval_hours": 4,
+        "window_start": "2026-01-01T08:00:00Z",
+        "window_hours": 12,
+    }
+    assert by_name["DailyV2"]["schedule"]["run_times"] == ["2026-01-01T20:00:00Z"]
+    assert by_name["WeeklyV2"]["schedule"]["weekdays"] == ["Monday", "Thursday"]
+    assert by_name["DailyV2"]["retention"] == {
+        "type": "SimpleRetentionPolicy",
+        "retention": {"count": 30, "unit": "Days"},
+    }
+    assert by_name["MonthlyV2"]["schedule"] == {
+        "type": "SimpleSchedulePolicyV2",
+        "frequency": "Monthly",
+        "unparsed": True,
+    }
+    assert by_name["Unknown"]["schedule"] == {"type": "LogSchedulePolicy", "unparsed": True}
+    assert by_name["Unknown"]["retention"] == {"type": "NewRetention", "unparsed": True}
+    assert by_name["Empty"]["schedule"] == {"type": None, "unparsed": True}
+    assert by_name["Empty"]["protected_item_count"] is None
+    assert result["summary"] == {"subscriptions": 1, "failed_subscriptions": 0, "policies": 7, "capped": False}
+    # the policy listing uses the workload filter and the backup api-version; no second item scan
+    policy_calls = [c for c in arm.calls if c[1].endswith("/backupPolicies")]
+    assert policy_calls[0][2] == {"api-version": server.ARM_API_VERSIONS["backup"], "$filter": server._IAAS_VM_FILTER}
+    assert not any(c[1].endswith("/backupProtectedItems") for c in arm.calls)
+
+
+def test_vm_backup_policies_degrades_per_subscription_and_flags_capping(inject, inject_arm, monkeypatch):
+    inject(FakeGraphClient())
+    inject_arm(
+        FakeArmClient(
+            {
+                "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+                _vaults_path(SUB_A): ARM_PERM_ERROR,
+                _vaults_path(SUB_B): ([_vault(SUB_B)], True),
+                _policies_path(SUB_B): ([V1_POLICY], False),
+            }
+        )
+    )
+    result = server.vm_backup_policies()
+    a, b = result["subscriptions"]
+    assert a["missing_permission"] == server.ARM_ROLE_HINT
+    assert b["capped"] is True and len(b["policies"]) == 1
+    assert result["capped"] is True and result["summary"]["policies"] == 1
+    budget = iter([False])
+    monkeypatch.setattr(server, "_budget_left", lambda: next(budget, False))
+    result = server.vm_backup_policies()
+    assert result["subscriptions"] == [] and len(result["skipped"]) == 2 and result["capped"] is True
+
+
+# ---------------------------------------------------------------------------
+# m365_service_health and its daily_brief section
+# ---------------------------------------------------------------------------
+
+OVERVIEWS = "/admin/serviceAnnouncement/healthOverviews"
+ISSUES = "/admin/serviceAnnouncement/issues"
+
+
+def _issue(iid, classification="incident", **more):
+    row = {
+        "id": iid,
+        "title": "Users may not receive notifications",
+        "service": "Microsoft Teams",
+        "feature": "Notifications",
+        "classification": classification,
+        "status": "serviceDegradation",
+        "startDateTime": "2026-10-15T08:29:28.08Z",
+        "lastModifiedDateTime": "2026-10-15T09:10:26.557Z",
+        "impactDescription": "Some users may not receive meeting-started notifications.",
+        "isResolved": False,
+        "posts": [{"description": {"content": "long"}}],
+    }
+    row.update(more)
+    return row
+
+
+def test_m365_service_health_summarises_services_and_open_issues(inject):
+    client = inject(
+        FakeGraphClient(
+            paged_responses={
+                OVERVIEWS: (
+                    [
+                        {"id": "a", "service": "Exchange Online", "status": "serviceDegradation"},
+                        {"id": "b", "service": "SharePoint Online", "status": "serviceOperational"},
+                        # post-resolution values Graph keeps for days are not "degraded"
+                        {"id": "c", "service": "Microsoft Teams", "status": "serviceRestored"},
+                        {"id": "d", "service": "OneDrive", "status": "postIncidentReviewPublished"},
+                        {"id": "e", "service": "Microsoft Entra", "status": "investigating"},
+                        "junk",
+                    ],
+                    False,
+                ),
+                ISSUES: ([_issue("TM1"), _issue("EX2", "advisory"), _issue("X3", None), "junk"], True),
+            }
+        )
+    )
+    result = server.m365_service_health(max_pages=3)
+    assert result["summary"] == {
+        "capped": True,
+        "degraded_services": ["Exchange Online", "Microsoft Entra"],
+        "services_without_status": 1,
+        "open_incidents": 1,
+        "open_advisories": 1,
+    }
+    assert result["services"][0] == {"service": "Exchange Online", "status": "serviceDegradation"}
+    assert result["issues"][0] == {
+        "id": "TM1",
+        "title": "Users may not receive notifications",
+        "service": "Microsoft Teams",
+        "feature": "Notifications",
+        "classification": "incident",
+        "status": "serviceDegradation",
+        "start": "2026-10-15T08:29:28.08Z",
+        "last_modified": "2026-10-15T09:10:26.557Z",
+        "impact": "Some users may not receive meeting-started notifications.",
+    }
+    assert "posts" not in result["issues"][0] and result["capped"] is True
+    issues_call = next(c for c in client.calls if c[1] == ISSUES)
+    assert issues_call[2] == {"$filter": "isResolved eq false", "$orderby": "startDateTime desc"}
+    assert issues_call[3] == 3
+
+
+def test_m365_service_health_permission_hint_only_for_permission_failures(inject):
+    outage = GraphError("Graph request failed (503): try later")
+    inject(FakeGraphClient(paged_responses={OVERVIEWS: outage, ISSUES: PERM_ERROR}))
+    result = server.m365_service_health()
+    assert result["services"] == {"error": str(outage)}
+    assert result["issues"]["missing_permission"] == "ServiceHealth.Read.All"
+
+
+def test_m365_service_health_degrades_each_section_on_its_own(inject):
+    inject(FakeGraphClient(paged_responses={OVERVIEWS: PERM_ERROR, ISSUES: ([_issue("TM1")], False)}))
+    result = server.m365_service_health()
+    assert result["services"] == {"error": str(PERM_ERROR), "missing_permission": "ServiceHealth.Read.All"}
+    assert result["summary"]["degraded_services"] == result["services"]
+    assert result["summary"]["open_incidents"] == 1 and len(result["issues"]) == 1
+    inject(FakeGraphClient(paged_responses={OVERVIEWS: ([], False), ISSUES: PERM_ERROR}))
+    result = server.m365_service_health()
+    assert result["issues"]["missing_permission"] == "ServiceHealth.Read.All"
+    assert result["summary"]["open_incidents"] == result["issues"] and result["summary"]["degraded_services"] == []
+
+
+def test_daily_brief_carries_a_service_health_section(inject):
+    inject(
+        FakeGraphClient(
+            paged_responses={
+                OVERVIEWS: ([{"service": "Microsoft Entra", "status": "serviceDegradation"}], False),
+                ISSUES: ([_issue("AA1"), _issue("AA2", "advisory")], True),
+                "/auditLogs/directoryAudits": ([], False),
+                "/auditLogs/signIns": ([], False),
+            }
+        )
+    )
+    result = server.daily_brief(hours=1)
+    assert result["summary"]["service_health"] == {
+        "degraded_services": ["Microsoft Entra"],
+        "open_incidents": 1,
+        "capped": True,
+    }
+    assert result["m365_service_health"]["summary"]["open_advisories"] == 1
+    # one coverage contract: a capped service-health listing caps the brief
+    assert result["summary"]["capped"] is True
+
+
+def test_daily_brief_service_health_config_error_degrades_only_that_section(inject, monkeypatch):
+    inject(FakeGraphClient(paged_responses={OVERVIEWS: PERM_ERROR, ISSUES: PERM_ERROR}))
+    result = server.daily_brief(hours=1)
+    health = result["summary"]["service_health"]
+    assert health["degraded_services"]["missing_permission"] == "ServiceHealth.Read.All"
+    assert result["summary"]["sign_in_failures"] == 0 and result["summary"]["admin_actions"] == 0

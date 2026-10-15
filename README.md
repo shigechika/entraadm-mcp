@@ -4,7 +4,9 @@
 
 English | [日本語](README.ja.md)
 
-MCP server for Microsoft Entra ID sign-in and audit-log triage. Read-only.
+MCP server for Microsoft Entra ID sign-in and audit-log triage, plus the two
+Azure-side questions a morning patrol asks with the same credential: are our
+Azure VMs backed up, and is Microsoft 365 itself degraded right now. Read-only.
 
 ## Why this instead of the official Microsoft MCP Server for Enterprise
 
@@ -20,7 +22,7 @@ and is not a fit for an unattended triage bot:
   server exposes one tool that lets the model construct arbitrary
   `GET`/schema-discovery calls against Microsoft Graph. That is flexible for
   a human, and awkward to put behind an allow-list for an automated triage
-  profile. entraadm-mcp exposes nine fixed, read-only tools instead.
+  profile. entraadm-mcp exposes thirteen fixed, read-only tools instead.
 - **No AADSTS translation.** Sign-in failures come back as raw error codes;
   triage still needs a lookup table. entraadm-mcp annotates every sign-in
   failure with what the code actually means.
@@ -42,10 +44,22 @@ and is not a fit for an unattended triage bot:
 | `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when? |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
-| `daily_brief` | One-call summary combining `signin_failure_stats` and `directory_audits` |
+| `list_subscriptions` | Which Azure subscriptions can this credential see? (ARM) |
+| `vm_backup_status` | Which Azure VMs are backed up by Azure Backup, did the last backup succeed, and is any recovery point stale? (ARM) |
+| `vm_backup_policies` | What schedule and retention do the Azure VM backup policies have? (ARM) |
+| `m365_service_health` | Is a Microsoft 365 service degraded, and which incidents and advisories are open? |
+| `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
 
 Every tool is read-only. Write operations (unblocking an account, resetting a
 password, revoking a session) are out of scope for this server.
+
+The three Azure Resource Manager tools live in an Entra-named server on
+purpose: they use the same app registration and the same `azure-identity`
+credential object (a second token scope, `https://management.azure.com/.default`),
+run in the same deployment and are covered by the same `health_check`. A
+separate server for two tools would double the operational surface. They
+are governance reads, not resource management; a subscription the credential
+has no Reader role on simply does not appear in `list_subscriptions`.
 
 ## Auth model
 
@@ -67,6 +81,18 @@ different auth mode than intended.
 | `get_user` (base fields) | `User.Read.All` | |
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
+| `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` | Under delegated auth the signed-in user also needs an Entra role that may read service health (for example Service Support Administrator or Global Reader) |
+
+### Required Azure RBAC
+
+| Tool(s) | Role | Notes |
+|---|---|---|
+| `list_subscriptions` | none | Lists whatever the credential can see; an empty list means no role has been granted anywhere yet |
+| `vm_backup_status`, `vm_backup_policies` | **Reader** on each subscription | `Reader` is `*/read` and covers every endpoint used. `Backup Reader` alone is not enough (it has no `Microsoft.Compute/virtualMachines/read`). Granted to the service principal (app-only) or to the signed-in user (azure-cli) |
+
+Azure RBAC is optional: `health_check` reports ARM reachability and the number
+of visible subscriptions as an informational `arm` probe that never changes
+`status`, so a deployment used only for Entra triage stays `healthy`.
 
 A missing permission never crashes a tool. It degrades that tool (or that
 one field) to `{"error": "...", "missing_permission": "..."}` with a
@@ -155,7 +181,7 @@ entraadm-mcp
 | Option | Effect |
 |---|---|
 | `--version` | Print the version and exit |
-| `--check` | Resolve auth, probe Graph reachability and sign-in log access, print a report, exit 0 (or 1 on config error) |
+| `--check` | Resolve auth, probe Graph reachability and sign-in log access, print a report (plus an informational ARM line), exit 0 (or 1 on config error) |
 
 ## Notes
 

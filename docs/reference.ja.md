@@ -33,19 +33,33 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 | `get_user`（基本フィールド） | `User.Read.All` |
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
+| `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All`（delegated 認証ではサービス正常性を読める Entra ロール——Service Support Administrator や Global Reader 等——も必要） |
+
+### 必要な Azure RBAC
+
+| ツール | ロール |
+|---|---|
+| `list_subscriptions` | なし（クレデンシャルから見えるものを列挙する） |
+| `vm_backup_status`、`vm_backup_policies` | 各サブスクリプションの **Reader**（`*/read`。`Backup Reader` だけでは `Microsoft.Compute/virtualMachines/read` が無い） |
+
+Azure RBAC は任意。`health_check` の `arm` プローブは情報扱い。
 
 ## ツール
 
 ### `health_check()`
 
-引数なし。`{service, version, status, auth_mode, graph, signin_probe, sites}` を返す。
+引数なし。`{service, version, status, auth_mode, graph, signin_probe, arm, sites}` を返す。
 `graph` は基本的な Graph 到達性（`GET /users`、`$top=1` — `User.Read.All` のみで通る）を、`signin_probe` は
 サインインログ読み取り可否を追加でプローブする。`status` は両方成功で
 `"healthy"`、Graph到達可だがサインインログ読み取り不可で `"degraded"`、
 Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`signin_probe` は
 それぞれ `{auth: "ok"|"error", detail: str|null}`。`sites` は `ENTRAADM_SITES_INI` の
 `{configured, ranges, error}` で，指定したファイルに `error` があると `"healthy"` を
-`"degraded"` に下げる。
+`"degraded"` に下げる。`arm` は `{auth, detail, subscriptions, capped}`（Azure Resource Manager の
+`GET /subscriptions` の 1 ページ。`subscriptions` はクレデンシャルから見える数、`capped` は続きのページが
+あったか）で情報扱い——Azure RBAC は
+このサーバでは任意なので `status` を変えない。ARM が応答しなくても呼び出し全体が止まらないよう，
+このプローブだけ 10 秒の予算で走る。
 
 ### `get_user(upn)`
 
@@ -123,25 +137,82 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 必要——典型的なロール割り当てでは `az login` 経由の delegated 認証では利用不可。
 存在しないアカウントは `get_user` と同様 `{"found": false, "user_principal_name": upn}` を返す。
 
+### `list_subscriptions(max_pages=None)`
+
+このクレデンシャルから見える Azure サブスクリプション（`subscription_id`、`name`、`state`）と
+`count`、`capped`。バックアップ系 2 ツールの起点で、両方ともこの一覧の id か表示名を受け取る。
+ARM に到達できるのに空なら、どこにも Reader ロールが付いていない。
+
+### `vm_backup_status(subscription=None, stale_hours=36, max_pages=None)`
+
+サブスクリプションの全 VM を、その Recovery Services コンテナーの Azure VM 保護アイテムと
+VM の ARM id で結合する（大文字小文字は区別しない）。VM ごとに：`protected` は
+`protectionState` が `Protected`／`IRPending`（初回バックアップ待ち。`note` に出る）なら `true`、
+アイテムが無い・停止・一時停止・エラーなら `false`（状態は表示する）、アイテムは見つからないが
+そのサブスクリプションのコンテナー走査が不完全なら `null`（不明）——部分的な走査から「未保護」を
+作らない。`backup_ok` は `lastBackupStatus` が `Completed`／`CompletedWithWarnings` か。`stale` は
+`stale_hours` 以内の復旧ポイント（`lastRecoveryPoint`）が無いこと（既定 36 時間は日次ポリシー向け。
+週次なら増やす——行に `policy_name` がある）。`backup_ok` が `false` になるのは `Failed` だけで、実行中
+（`InProgress`・`Warning`）は `null`。`protectionState` の無いアイテムは VM を `unknown` にし、2 つのコンテナーが
+同じ VM のアイテムを持つときは動いている方を採る（`duplicate_items`）。`items_complete` はサブスクリプション
+スコープの Reader を前提にする（リソースグループに絞った Reader ではコンテナー一覧が黙って絞られる）。
+
+`subscription` は id か表示名。`None` は見える全サブスクリプションを走査して結合も全体で行うので、
+別サブスクリプションのコンテナーに保護されている VM も一致する。1 つ指定したときはその
+サブスクリプションのコンテナーだけ（`coverage` に明記）。無い名前は `{"found": false, "subscription",
+"listing_capped"}`、複数に一致する表示名は `ambiguous` 付き。一覧が途中で切れているときは表示名の一致も
+信用しない（`candidates` に見えた 1 件を出すので id で呼び直す）。サブスクリプションごとに `vm_count`、
+`protected`、`unprotected`、`unknown`、`stale`、`failed`、`vms`、`vaults`（それぞれ `capped` 付き）、
+`skipped_vaults`（検証に落ちた id・予算が届かなかったコンテナー・読めないコンテナー。理由付き）、
+`vms_capped`、`items_complete`、`capped`。読めないサブスクリプションは `{"error", "missing_permission"}`。
+全体の結合では、全サブスクリプションのコンテナー走査が完了していない限り一致しない VM は `unknown`
+（読めない・届かなかったサブスクリプションも未完了に数え、`summary.failed_subscriptions` と `capped` に出る）。
+`orphans` は VM がもう無い保護アイテムで、その VM のサブスクリプションを完全に列挙できたときだけ出す。
+残りは `unjoined_items` の数。`skipped` は時間予算が届かなかったサブスクリプション。上に `summary` と `capped`。
+
+コンテナー id は ARM の命名規則で検証してからリクエストのパスに使う。全呼び出しがツールの 1 つの
+期限を共有する。
+
+### `vm_backup_policies(subscription=None, max_pages=None)`
+
+コンテナーごとの Azure VM バックアップポリシー：`name`、`vault`、`resource_group`、`policy_type`
+（`V1` = `SimpleSchedulePolicy`、`V2` = `SimpleSchedulePolicyV2`）、`schedule`（`frequency`、UTC の
+`run_times`、`weekdays`、V2 の hourly は `interval_hours`／`window_start`／`window_hours`）、`retention`
+（`LongTermRetentionPolicy` を `daily`／`weekly`／`monthly`／`yearly` のブロックに日付の選び方と
+`{count, unit}` の期間付きで、または `SimpleRetentionPolicy`）、`instant_rp_days`、`timezone`、
+`protected_item_count`（ARM 自身の数）。知らないスケジュール・保持の型は `{"type": <名前>,
+"unparsed": true}` で返す。`subscription` の解決と網羅性のフラグは `vm_backup_status` と同じ。
+
+### `m365_service_health(max_pages=None)`
+
+`services`：Microsoft 365 の各サービスと現在の状態（`healthOverviews`）。`issues`：未解決の
+インシデント・アドバイザリを新しい順に（`id`、`title`、`service`、`feature`、`classification`、
+`status`、`start`、`last_modified`、`impact`）。`summary` に `degraded_services`（状態が開いているもの——`serviceDegradation`・`serviceInterruption`・
+`investigating` 等。Graph が数日残す `serviceRestored` などの解決後の値は数えない）、`services_without_status`、
+`open_incidents`、`open_advisories`、`capped`（どちらもページングするので、途中で切れた数は下限）。各セクションは
+`{"error", "missing_permission": "ServiceHealth.Read.All"}` に個別に劣化する。メッセージセンター
+（`messages`）は別の権限が要るので読まない。
+
 ### `daily_brief(hours=24, max_pages=None, samples=10)`
 
-`signin_failure_stats` と `directory_audits` を、コンパクトな `summary` を添えて
-1回でまとめる。片方のセクションの権限エラーはそのセクションだけを劣化させ、
-もう片方は全体が返る。両セクションを1回のツール呼び出し内で同期実行する。
-`samples` は現状未使用（予約）。
+`m365_service_health`・`signin_failure_stats`・`directory_audits` を、コンパクトな `summary` を
+添えて1回でまとめる（`service_health` に劣化中のサービス・開いているインシデント数・そのセクションの
+`capped`。これは上位の `summary.capped` にも畳み込む）。1 つのセクションの権限エラーはそのセクションだけを劣化させ、残りは全体が返る。
+この順に 1 つの期限を共有して同期実行する。Azure VM のバックアップは意図的に入れていない
+（ARM の走査が予算を使い切りうるので `vm_backup_status` を別に呼ぶ）。`samples` は現状未使用（予約）。
 
 ## エラー
 
-全ツールの入口は設定エラーと Graph クライアントのエラーを捕まえて
+全ツールの入口は設定エラーと API クライアント（Graph・ARM）のエラーを捕まえて
 `{"error": "..."}` を返し、例外を投げない——呼び出し側は常に dict を受け取れる。
-`GraphPermissionError` の場合はさらに `missing_permission` が、そのエンドポイントに
-実際に必要な Graph 権限またはディレクトリロールの名前を持つ。ページングを伴う
-Graph コレクションから組み立てた結果は必ず `capped: bool` を持つ——ページ予算の
+権限エラーの場合はさらに `missing_permission` が、そのエンドポイントに
+実際に必要な Graph 権限・ディレクトリロール・Azure RBAC ロールの名前を持つ。ページングを伴う
+Graph・ARM のコレクションから組み立てた結果は必ず `capped: bool` を持つ——ページ予算の
 打ち切りが「窓を完全に走査した」と見分けがつかなくなることはない。
 
 ## CLI
 
 ```bash
 entraadm-mcp --version   # バージョンを表示
-entraadm-mcp --check     # 認証を解決し、Graph・サインインログ到達性をプローブ。exit 0（設定エラー時は 1）
+entraadm-mcp --check     # 認証を解決し、Graph・サインインログ到達性をプローブ（ARM の情報行付き）。exit 0（設定エラー時は 1）
 ```

@@ -1,10 +1,13 @@
-"""Synchronous Microsoft Graph client: auth, paging, and error translation.
+"""Synchronous Microsoft Graph and Azure Resource Manager clients: auth, paging, error translation.
 
-Deliberately not built on msgraph-sdk/kiota -- that SDK is heavy and its
-generated request builders don't play well with the respx-based testing used
-throughout this family of servers. Every tool in server.py talks to Graph
-exclusively through GraphClient, so the request/response shape (paging,
-permission-error translation, retry policy) lives in exactly one place.
+Deliberately not built on msgraph-sdk/kiota or the azure-mgmt-* SDKs -- those
+are heavy and their generated request builders don't play well with the
+respx-based testing used throughout this family of servers. Every tool in
+server.py talks to Graph exclusively through GraphClient and to ARM
+exclusively through ArmClient, so the request/response shape (paging,
+permission-error translation, retry policy) lives in exactly one place:
+``_RestClient``, which both subclass with their own base URL, token scope,
+paging key and 403 translation.
 """
 
 from __future__ import annotations
@@ -20,6 +23,19 @@ from .config import DEFAULT_MAX_PAGES, AuthConfig
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
+ARM_BASE = "https://management.azure.com"
+ARM_SCOPE = "https://management.azure.com/.default"
+
+#: ARM requires ``api-version`` on every request. One constant per resource
+#: provider; the tests assert each one is sent (continuation pages carry it
+#: inside ``nextLink``).
+ARM_API_VERSIONS = {
+    "subscriptions": "2022-12-01",
+    "virtualMachines": "2024-07-01",
+    "vaults": "2023-04-01",
+    "backup": "2023-04-01",
+}
+
 #: Refresh the cached token this many seconds before its real expiry, so a
 #: request never starts with a token that expires mid-flight.
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
@@ -27,25 +43,34 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 300
 _UPN_LIKE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
-class GraphError(Exception):
-    """Base error for anything that goes wrong talking to Microsoft Graph."""
+class ApiError(Exception):
+    """Base error for anything that goes wrong talking to a Microsoft API (Graph or ARM)."""
 
 
-class GraphDeadline(GraphError):
+class ApiDeadline(ApiError):
     """The caller's wall-clock budget ran out before a request could finish."""
 
 
-class GraphAuthError(GraphError):
-    """The credential could not produce a usable access token, or Graph rejected it outright."""
+class ApiAuthError(ApiError):
+    """The credential could not produce a usable access token, or the API rejected it outright."""
 
 
-class GraphPermissionError(GraphError):
-    """Graph rejected the request because the caller lacks a required permission.
+class ApiPermissionError(ApiError):
+    """The API rejected the request because the caller lacks a required permission or role.
 
-    The message is a human-readable translation of Graph's error code (see
-    _translate_permission_error), not the raw JSON -- a tool caller should be
-    able to act on str(e) directly without parsing anything.
+    The message is a human-readable translation of the API's error code (see
+    _translate_permission_error / _translate_arm_permission_error), not the
+    raw JSON -- a tool caller should be able to act on str(e) directly
+    without parsing anything.
     """
+
+
+#: Historical names, kept so existing imports and ``except`` clauses keep
+#: working: the hierarchy predates ArmClient and was named after Graph.
+GraphError = ApiError
+GraphDeadline = ApiDeadline
+GraphAuthError = ApiAuthError
+GraphPermissionError = ApiPermissionError
 
 
 def odata_quote(value: str) -> str:
@@ -96,15 +121,37 @@ _PERMISSION_HINTS = {
     ),
 }
 
+#: What an ARM 403 means for this server's tools, as the ``missing_permission``
+#: value. ``Reader`` is ``*/read`` and covers every endpoint they use;
+#: ``Backup Reader`` alone does not (no ``Microsoft.Compute/virtualMachines/read``).
+ARM_ROLE_HINT = "Azure RBAC: Reader role on the subscription"
+
+
+def _error_of(body) -> dict:
+    error = body.get("error") if isinstance(body, dict) else None
+    return error if isinstance(error, dict) else {}
+
 
 def _translate_permission_error(body: dict) -> str:
-    error = body.get("error") if isinstance(body, dict) else None
-    error = error if isinstance(error, dict) else {}
+    error = _error_of(body)
     code = error.get("code", "")
     hint = _PERMISSION_HINTS.get(code)
     if hint:
         return hint
     message = error.get("message") or "permission denied"
+    return f"{code or 'permission denied'}: {message}"
+
+
+def _translate_arm_permission_error(body: dict) -> str:
+    error = _error_of(body)
+    code = error.get("code", "")
+    message = str(error.get("message") or "permission denied")
+    if code == "AuthorizationFailed":
+        return (
+            f"ARM denied the request ({message[:300]}); this credential needs the Reader role "
+            "on the subscription (*/read). Backup Reader alone is not enough: the VM list "
+            "needs Microsoft.Compute/virtualMachines/read"
+        )
     return f"{code or 'permission denied'}: {message}"
 
 
@@ -126,22 +173,34 @@ def _parse_retry_after(value: str | None) -> float:
         return 1.0
 
 
-class GraphClient:
-    """Thin Microsoft Graph client: token handling, paging, permission translation.
+class _RestClient:
+    """Bearer-token REST client shared by GraphClient and ArmClient.
+
+    Subclasses set ``api_name`` (for messages), ``base_url``, ``scope``,
+    ``next_link_key`` and override ``_translate_403``. Everything else --
+    token caching, retry budgets, the deadline-bounded request, paging -- is
+    identical for the two APIs.
 
     Args:
         config: Resolved AuthConfig (see config.AuthConfig.from_env).
         credential: Injectable azure-identity credential (`# injectable for
             tests` -- a stub with a `get_token(*scopes) -> AccessToken`
             method). Defaults to building the real credential for config.mode.
+            One credential object may be shared by a GraphClient and an
+            ArmClient; each client caches its own scope's token.
         http_client: Injectable httpx.Client (`# injectable for tests`, used
-            with respx). Defaults to a real client against the Graph v1.0 root.
+            with respx). Defaults to a real client against ``base_url``.
     """
+
+    api_name = "API"
+    base_url = ""
+    scope = ""
+    next_link_key = "nextLink"
 
     def __init__(self, config: AuthConfig, credential=None, http_client: httpx.Client | None = None):
         self._config = config
         self._credential = credential if credential is not None else _build_credential(config)
-        self._http = http_client if http_client is not None else httpx.Client(base_url=GRAPH_BASE, timeout=30.0)
+        self._http = http_client if http_client is not None else httpx.Client(base_url=self.base_url, timeout=30.0)
         self._token: str | None = None
         self._token_expires_at: float = 0.0
 
@@ -150,14 +209,19 @@ class GraphClient:
         """The resolved auth mode ("app-only" or "azure-cli"), surfaced by health_check as auth_mode."""
         return self._config.mode
 
+    @property
+    def credential(self):
+        """The azure-identity credential, so a second client for another scope can share it."""
+        return self._credential
+
     def _access_token(self) -> str:
         now = time.time()
         if self._token is not None and self._token_expires_at - now > _TOKEN_REFRESH_MARGIN_SECONDS:
             return self._token
         try:
-            token = self._credential.get_token(GRAPH_SCOPE)
+            token = self._credential.get_token(self.scope)
         except Exception as e:  # azure-identity raises its own exception hierarchy
-            raise GraphAuthError(f"could not obtain a Graph access token ({type(e).__name__})") from e
+            raise ApiAuthError(f"could not obtain a {self.api_name} access token ({type(e).__name__})") from e
         self._token = token.token
         self._token_expires_at = token.expires_on
         return self._token
@@ -169,7 +233,7 @@ class GraphClient:
         # Token acquisition (azure-identity, synchronous) cannot itself be bounded: a
         # cold token that blocks past the deadline is noticed here, before any request.
         if deadline is not None and deadline - time.monotonic() <= 0:
-            raise GraphDeadline("deadline passed while obtaining the access token")
+            raise ApiDeadline("deadline passed while obtaining the access token")
         # Independent budgets per failure kind, not one shared attempt
         # counter: a network error (or a 5xx) consuming an early "attempt"
         # must not leave a *later* 429 unretried -- each kind gets its own
@@ -185,7 +249,7 @@ class GraphClient:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise GraphDeadline("deadline passed before the request could start")
+                    raise ApiDeadline("deadline passed before the request could start")
                 timeout = min(30.0, max(remaining, 0.05))  # httpx needs a positive value
             try:
                 if timeout is None:
@@ -195,13 +259,13 @@ class GraphClient:
             except httpx.RequestError as e:
                 # A connection/DNS/timeout failure never reaches _parse(), so
                 # without this it would propagate as a bare httpx exception --
-                # none of the GraphError family a tool's except clause
+                # none of the ApiError family a tool's except clause
                 # catches, crashing the tool call instead of degrading it.
                 if network_retries_left > 0:
                     self._sleep_within(2 ** (2 - network_retries_left), deadline)
                     network_retries_left -= 1
                     continue
-                raise GraphError(f"Graph request failed: network error ({type(e).__name__})") from e
+                raise ApiError(f"{self.api_name} request failed: network error ({type(e).__name__})") from e
             if resp.status_code == 429 and not retried_429:
                 retried_429 = True
                 self._sleep_within(_parse_retry_after(resp.headers.get("Retry-After")), deadline)
@@ -217,7 +281,7 @@ class GraphClient:
 
         httpx's timeout is per operation and the read timeout restarts on every chunk, so a
         response that trickles in would outlast it. The body is read chunk by chunk and the
-        wall clock is checked between chunks (GraphDeadline past it).
+        wall clock is checked between chunks (ApiDeadline past it).
         """
         with self._http.stream(method, url, params=params, headers=headers, timeout=timeout) as resp:
             chunks = []
@@ -225,7 +289,7 @@ class GraphClient:
                 # Checked before taking the next chunk: a body that has just finished
                 # arriving is kept even if it ended a little past the deadline.
                 if time.monotonic() >= deadline:
-                    raise GraphDeadline("deadline passed while reading the response")
+                    raise ApiDeadline("deadline passed while reading the response")
                 chunks.append(chunk)
             return httpx.Response(
                 resp.status_code, headers=resp.headers, content=b"".join(chunks), request=resp.request
@@ -233,15 +297,34 @@ class GraphClient:
 
     @staticmethod
     def _sleep_within(seconds: float, deadline: float | None) -> None:
-        """Sleep, or raise GraphDeadline when the wait would end past ``deadline``."""
+        """Sleep, or raise ApiDeadline when the wait would end past ``deadline``."""
         if deadline is not None and time.monotonic() + seconds >= deadline:
-            raise GraphDeadline("deadline reached while waiting to retry")
+            raise ApiDeadline("deadline reached while waiting to retry")
         time.sleep(seconds)
 
     def get(self, path: str, params: dict | None = None, deadline: float | None = None) -> dict:
-        """GET a single Graph resource (no paging). ``path`` is relative to the v1.0 root, e.g. "/users"."""
+        """GET a single resource (no paging). ``path`` is relative to ``base_url``, e.g. "/users"."""
         resp = self._request("GET", path, params=params, deadline=deadline)
         return self._parse(resp)
+
+    def _same_origin(self, url: str) -> bool:
+        """Whether a continuation URL stays on this client's own API host.
+
+        The bearer token goes on every request this client makes, so a
+        ``nextLink`` naming any other scheme/host/port must not be followed:
+        it would hand the token to that host. A relative link is fine (httpx
+        resolves it against ``base_url``).
+        """
+        try:
+            link = httpx.URL(url)
+            base = httpx.URL(self.base_url)
+        except (httpx.InvalidURL, TypeError):
+            return False
+        if not link.host and not link.scheme:
+            return True  # path-relative; httpx resolves it against base_url
+        # A scheme-relative "//host/path" has a host but no scheme: it is not
+        # absolute to httpx, and it names another host.
+        return (link.scheme, link.host, link.port) == (base.scheme, base.host, base.port)
 
     def get_paged(
         self,
@@ -250,7 +333,7 @@ class GraphClient:
         max_pages: int = DEFAULT_MAX_PAGES,
         deadline: float | None = None,
     ) -> tuple[list, bool]:
-        """GET a Graph collection, following ``@odata.nextLink`` up to ``max_pages``.
+        """GET a collection, following the continuation link up to ``max_pages``.
 
         Returns ``(items, capped)`` where ``capped`` is True iff a nextLink
         still existed when the page budget ran out -- callers must surface
@@ -259,6 +342,9 @@ class GraphClient:
         ``deadline`` is an absolute ``time.monotonic()`` timestamp. When it passes
         (between pages, or while a request or its retry wait is in flight) the pages
         fetched so far are returned with ``capped=True``.
+
+        A continuation link that points at a foreign host raises ApiError
+        rather than being followed with the token attached.
         """
         items: list = []
         url: str | None = path
@@ -267,15 +353,52 @@ class GraphClient:
         while url is not None and pages < max_pages:
             try:
                 resp = self._request("GET", url, params=query, deadline=deadline)
-            except GraphDeadline:
+            except ApiDeadline:
                 return items, True
             body = self._parse(resp)
-            items.extend(body.get("value", []))
-            url = body.get("@odata.nextLink")
+            value = body.get("value", [])
+            items.extend(value if isinstance(value, list) else [])
+            url = body.get(self.next_link_key)
+            if url is not None and not (isinstance(url, str) and self._same_origin(url)):
+                raise ApiError(f"{self.api_name} returned a continuation link to a foreign host; not followed")
             query = None  # nextLink already carries the full query string
             pages += 1
         capped = url is not None
         return items, capped
+
+    def _translate_403(self, body: dict) -> str:
+        return _translate_permission_error(body)
+
+    def _parse(self, resp: httpx.Response) -> dict:
+        if resp.status_code == 401:
+            raise ApiAuthError(f"{self.api_name} rejected the access token (401)")
+        if resp.status_code == 403:
+            try:
+                body = resp.json()
+            except ValueError:
+                body = {}
+            raise ApiPermissionError(self._translate_403(body))
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+                message = _error_of(body).get("message", resp.text[:200])
+            except ValueError:
+                message = resp.text[:200]
+            raise ApiError(f"{self.api_name} request failed ({resp.status_code}): {message}")
+        try:
+            body = resp.json()
+        except ValueError:
+            raise ApiError(f"{self.api_name} returned a non-JSON body ({resp.status_code})") from None
+        return body if isinstance(body, dict) else {"value": body}
+
+
+class GraphClient(_RestClient):
+    """Thin Microsoft Graph client: token handling, paging, permission translation."""
+
+    api_name = "Graph"
+    base_url = GRAPH_BASE
+    scope = GRAPH_SCOPE
+    next_link_key = "@odata.nextLink"
 
     def check(self) -> dict:
         """Cheapest possible Graph round-trip, for health_check's `graph` probe.
@@ -291,7 +414,7 @@ class GraphClient:
         """
         try:
             self.get("/users", params={"$top": 1, "$select": "id"})
-        except GraphError as e:
+        except ApiError as e:
             return {"auth": "error", "detail": str(e)}
         return {"auth": "ok", "detail": None}
 
@@ -304,24 +427,43 @@ class GraphClient:
         """
         try:
             self.get("/auditLogs/signIns", params={"$top": 1})
-        except GraphError as e:
+        except ApiError as e:
             return {"auth": "error", "detail": str(e)}
         return {"auth": "ok", "detail": None}
 
-    def _parse(self, resp: httpx.Response) -> dict:
-        if resp.status_code == 401:
-            raise GraphAuthError("Graph rejected the access token (401)")
-        if resp.status_code == 403:
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            raise GraphPermissionError(_translate_permission_error(body))
-        if resp.status_code >= 400:
-            try:
-                body = resp.json()
-                message = body.get("error", {}).get("message", resp.text[:200])
-            except ValueError:
-                message = resp.text[:200]
-            raise GraphError(f"Graph request failed ({resp.status_code}): {message}")
-        return resp.json()
+
+class ArmClient(_RestClient):
+    """Azure Resource Manager client for the backup-posture tools.
+
+    Same credential object as GraphClient, different token scope. ARM pages
+    with a bare ``nextLink`` and reports an RBAC denial as
+    ``AuthorizationFailed``; both differences live here.
+    """
+
+    api_name = "ARM"
+    base_url = ARM_BASE
+    scope = ARM_SCOPE
+    next_link_key = "nextLink"
+
+    def _translate_403(self, body: dict) -> str:
+        return _translate_arm_permission_error(body)
+
+    def check(self, deadline: float | None = None) -> dict:
+        """ARM round-trip for health_check's informational ``arm`` probe.
+
+        ``GET /subscriptions`` needs no RBAC at all (it lists what the
+        credential can see), so ``auth: ok`` with ``subscriptions: 0`` means
+        "ARM reachable, no Reader role granted anywhere yet". ``capped`` is
+        True when ARM had more pages than the one this probe reads.
+        """
+        try:
+            # One page via get(), not get_paged(): a deadline that expires before ARM
+            # answers must surface as an error here, not as "ok, 0 subscriptions".
+            body = self.get(
+                "/subscriptions", params={"api-version": ARM_API_VERSIONS["subscriptions"]}, deadline=deadline
+            )
+        except ApiError as e:
+            return {"auth": "error", "detail": str(e), "subscriptions": None, "capped": None}
+        value = body.get("value", [])
+        count = len(value) if isinstance(value, list) else 0
+        return {"auth": "ok", "detail": None, "subscriptions": count, "capped": body.get("nextLink") is not None}
