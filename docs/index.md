@@ -41,6 +41,7 @@ and not a fit for an unattended triage bot:
 | `list_subscriptions` | Which Azure subscriptions this credential can see (ARM) |
 | `vm_backup_status` | Which Azure VMs are backed up, whether the last backup succeeded, and whether a recovery point is stale (ARM) |
 | `vm_backup_policies` | Schedule and retention of the Azure VM backup policies (ARM) |
+| `vm_activity` | Who or what restarted an Azure VM: activity log and Resource Health for a time window (ARM) |
 | `m365_service_health` | Microsoft 365 service status and the open incidents and advisories |
 | `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
 

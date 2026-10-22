@@ -1917,6 +1917,358 @@ def vm_backup_policies(subscription: str | None = None, max_pages: int | None = 
 
 
 # ---------------------------------------------------------------------------
+# Azure activity log: who did what to a VM, and what Azure itself did to it
+# ---------------------------------------------------------------------------
+
+#: The activity log keeps 90 days; one call reads at most a week of it.
+_ACTIVITY_RETENTION_DAYS = 90
+_ACTIVITY_MAX_HOURS = 24 * 7
+_ACTIVITY_DEFAULT_HOURS = 24
+#: Administrative events on other resources of the subscription listed in full up to this many (the newest).
+_ACTIVITY_OTHER_OPS_LIMIT = 50
+_ACTIVITY_DETAIL_CHARS = 300
+#: Share of the call's budget the VM search may use, so the log reads keep the rest.
+_VM_SEARCH_BUDGET_SHARE = 0.5
+#: Azure VM names: Linux allows 64 characters, Windows 15 (a subset).
+_VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_RESOURCE_GROUP_RE = re.compile(r"^(?!\.+$)[\w.()\-]{1,90}(?<!\.)$")
+#: A minute-precision timestamp with an offset; the seconds are added before parsing.
+_ISO_MINUTES_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$")
+_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def _parse_window_time(value: str, label: str) -> datetime.datetime:
+    """An ISO timestamp with an explicit offset; a bare local time would be read in the wrong zone."""
+    text = value.strip()
+    minutes = _ISO_MINUTES_RE.match(text)
+    if minutes:
+        text = f"{minutes.group(1)}:00{minutes.group(2)}"
+    match = _ISO_RE.match(text)
+    parsed = _parse_iso(text) if match and match.group(3) is not None else None
+    if parsed is None:
+        raise ValueError(f"{label} must be an ISO timestamp with an offset, e.g. 2026-10-21T22:00:00+09:00")
+    return parsed
+
+
+def _activity_window(
+    start: str | None, end: str | None, hours: int, now: datetime.datetime
+) -> tuple[datetime.datetime, datetime.datetime]:
+    end_dt = _parse_window_time(end, "end") if end else now
+    start_dt = (
+        _parse_window_time(start, "start")
+        if start
+        else end_dt - datetime.timedelta(hours=max(1, min(_ACTIVITY_MAX_HOURS, hours)))
+    )
+    if end_dt > now:
+        end_dt = now
+    if start_dt >= end_dt:
+        raise ValueError("start must be before end (and before now)")
+    if end_dt - start_dt > datetime.timedelta(hours=_ACTIVITY_MAX_HOURS):
+        raise ValueError(f"the window may span at most {_ACTIVITY_MAX_HOURS} hours")
+    if start_dt < now - datetime.timedelta(days=_ACTIVITY_RETENTION_DAYS):
+        raise ValueError(f"the activity log keeps {_ACTIVITY_RETENTION_DAYS} days; start is older")
+    return start_dt, end_dt
+
+
+def _utc_text(dt: datetime.datetime) -> str:
+    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _value(field: Any) -> str | None:
+    """The ``value`` of an activity-log ``{value, localizedValue}`` pair."""
+    return _str(_dict(field).get("value"))
+
+
+def _short(value: Any) -> str | None:
+    text = _str(value)
+    return text if text is None or len(text) <= _ACTIVITY_DETAIL_CHARS else text[:_ACTIVITY_DETAIL_CHARS] + "…"
+
+
+def _operation_row(event: dict) -> dict:
+    return {
+        "time": _str(event.get("eventTimestamp")),
+        "operation": _value(event.get("operationName")),
+        "status": _value(event.get("status")),
+        "caller": _str(event.get("caller")),
+        "resource": _str(event.get("resourceId")),
+        "correlation_id": _str(event.get("correlationId")),
+    }
+
+
+def _health_row(event: dict) -> dict:
+    p = _dict(event.get("properties"))
+    return {
+        "time": _str(event.get("eventTimestamp")),
+        "stage": _value(event.get("status")),
+        "title": _str(p.get("title")),
+        "cause": _str(p.get("cause")),
+        "type": _str(p.get("type")),
+        "current_health": _str(p.get("currentHealthStatus")),
+        "previous_health": _str(p.get("previousHealthStatus")),
+        "details": _short(p.get("details")),
+    }
+
+
+def _service_health_row(event: dict) -> dict:
+    p = _dict(event.get("properties"))
+    return {
+        "time": _str(event.get("eventTimestamp")),
+        "stage": _str(p.get("stage")) or _value(event.get("status")),
+        "title": _str(p.get("title")),
+        "incident_type": _str(p.get("incidentType")),
+        "tracking_id": _str(p.get("trackingId")),
+        "impacted_services": _short(p.get("impactedServices")),
+    }
+
+
+def _by_time(rows: list[dict]) -> list[dict]:
+    """Oldest first, on the parsed time (ARM's fractional seconds vary in length, so the strings do not sort)."""
+    return sorted(rows, key=lambda r: _parse_iso(r["time"]) or _EPOCH)
+
+
+def _find_vm(
+    arm: ArmClient, targets: list[dict], name: str, resource_group: str | None, pages: int, deadline: float | None
+) -> tuple[list[dict], bool, list[dict]]:
+    """The VMs named ``name`` (case-insensitively) in ``targets``.
+
+    Returns ``(found, complete, errors)``: ``complete`` is False when a listing was
+    capped, failed or not reached by ``deadline``; ``errors`` names each subscription
+    whose listing failed.
+    """
+    found: list[dict] = []
+    errors: list[dict] = []
+    complete = True
+    for sub in targets:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return found, False, errors
+        try:
+            vms, capped = arm.get_paged(
+                f"/subscriptions/{sub['subscription_id']}/providers/Microsoft.Compute/virtualMachines",
+                params={"api-version": ARM_API_VERSIONS["virtualMachines"]},
+                max_pages=pages,
+                deadline=deadline,
+            )
+        except ApiError as e:
+            complete = False
+            errors.append({"subscription_name": sub["name"], **_arm_error(e)})
+            continue
+        complete = complete and not capped
+        for raw in vms:
+            vm = _dict(raw)
+            vid = _str(vm.get("id")) or ""
+            sid = _SUBSCRIPTION_IN_ID_RE.match(vid)
+            rg = _RESOURCE_GROUP_IN_ID_RE.search(vid)
+            if (_str(vm.get("name")) or "").lower() != name.lower() or not sid or not rg:
+                continue
+            if sid.group(1).lower() != sub["subscription_id"]:
+                continue
+            if resource_group is not None and rg.group(1).lower() != resource_group.lower():
+                continue
+            found.append(
+                {
+                    "name": _str(vm.get("name")),
+                    "id": vid,
+                    "resource_group": rg.group(1),
+                    "subscription_id": sub["subscription_id"],
+                    "subscription_name": sub["name"],
+                    "location": _str(vm.get("location")),
+                }
+            )
+    return found, complete, errors
+
+
+def _read_activity_log(arm: ArmClient, subscription_id: str, log_filter: str, pages: int) -> tuple[list, bool]:
+    return arm.get_paged(
+        f"/subscriptions/{subscription_id}/providers/Microsoft.Insights/eventtypes/management/values",
+        params={"api-version": ARM_API_VERSIONS["activityLog"], "$filter": log_filter},
+        max_pages=pages,
+        deadline=_current_deadline(),
+    )
+
+
+@mcp.tool()
+@_with_call_deadline
+def vm_activity(
+    vm: str,
+    subscription: str | None = None,
+    resource_group: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    hours: int = _ACTIVITY_DEFAULT_HOURS,
+    max_pages: int | None = None,
+) -> dict:
+    """What happened to an Azure VM in a time window: operations people ran, and events Azure raised.
+
+    Answers "did someone restart this VM, or did Azure?" from the Azure activity
+    log of the VM's subscription. Read-only; needs the Reader role on the
+    subscription. Two reads: the VM's resource group (server-side filter, so a
+    busy subscription cannot crowd the VM's own events out of the page budget)
+    feeds ``health`` and ``vm_operations``; the whole subscription feeds the rest.
+
+    - ``health``: Resource Health events of the VM (``cause``
+      ``PlatformInitiated`` = Azure, e.g. ``Redeploying due to host failure``;
+      ``UserInitiated`` = an operation on the VM, or ``Reboot initiated from
+      inside the machine`` for a restart from the guest OS).
+    - ``vm_operations``: Administrative events on the VM and its
+      sub-resources (restart, deallocate, redeploy, extension changes), with
+      ``caller`` (a user principal name or an application id). One operation
+      usually logs several events (Started, Accepted, Succeeded) sharing a
+      ``correlation_id``.
+    - ``other_operations``: Administrative events on any other resource of
+      the subscription (``count`` of events, ``operations`` = distinct
+      correlation ids, ``items`` = the newest 50). Zero here and in
+      ``vm_operations`` means nobody operated the subscription through Azure
+      Resource Manager in the window; it says nothing about actions inside
+      the guest OS.
+    - ``service_health``: Azure incidents and planned maintenance announced
+      to the subscription.
+    - ``other_categories``: counts of the remaining categories (Alert,
+      Policy, other resources' health events, ...).
+
+    ``vm`` is the VM name, matched case-insensitively across the
+    subscriptions this credential can see; narrow it with ``subscription``
+    (id or display name from ``list_subscriptions``) or ``resource_group``
+    when the name is not unique (``ambiguous`` lists the candidates). A
+    single match found while some subscription could not be listed
+    completely is not taken as unique: it comes back as ``candidates`` with
+    ``search_complete: false``, to be confirmed by naming its subscription.
+    Naming the subscription also keeps the search short: without it every
+    visible subscription is listed, and the search may use at most half of
+    the call's time budget.
+    The window is ``start``..``end`` (ISO timestamps with an offset, e.g.
+    ``2026-10-21T21:00:00+09:00``; seconds may be omitted), or the ``hours``
+    before ``end`` (default 24; ``end`` defaults to now); at most 168 hours,
+    within the 90 days the activity log keeps. Times in the result are UTC as
+    Azure returns them. ``capped`` marks a read cut short by the page or time
+    budget (``capped_reads`` says which): then an empty section is not proof
+    that nothing happened.
+    """
+    if not isinstance(vm, str) or not _VM_NAME_RE.match(vm.strip()):
+        return {"error": "vm must be an Azure VM name (letters, digits, '.', '_', '-'; at most 64 characters)"}
+    name = vm.strip()
+    if resource_group is not None and not _RESOURCE_GROUP_RE.match(resource_group.strip()):
+        return {"error": "resource_group is not a valid resource group name"}
+    rg_name = resource_group.strip() if resource_group is not None else None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        start_dt, end_dt = _activity_window(start, end, hours, now)
+    except ValueError as e:
+        return {"error": str(e)}
+    pages = _resolve_max_pages(max_pages)
+    deadline = _current_deadline()
+    search_deadline = (
+        None if deadline is None else time.monotonic() + (deadline - time.monotonic()) * _VM_SEARCH_BUDGET_SHARE
+    )
+    try:
+        arm = _arm()
+        targets, listing_capped, not_found = _resolve_subscriptions(arm, subscription, pages)
+        if not_found is not None:
+            return not_found
+        matches, search_complete, search_errors = _find_vm(arm, targets, name, rg_name, pages, search_deadline)
+    except (ConfigError, ApiError) as e:
+        return _arm_error(e)
+    search_complete = search_complete and not listing_capped
+    candidates = [{k: m[k] for k in ("id", "subscription_name", "resource_group")} for m in matches]
+    unresolved: dict = {"found": False, "vm": name, "search_complete": search_complete, "capped": not search_complete}
+    if search_errors:
+        unresolved["search_errors"] = search_errors
+    if not matches:
+        if not search_complete:
+            unresolved["note"] = (
+                "not found among the VMs that could be listed; some subscriptions were unreadable or capped"
+            )
+        return unresolved
+    if len(matches) > 1:
+        return {**unresolved, "ambiguous": candidates, "note": "pass subscription or resource_group to pick one"}
+    if not search_complete:
+        # One match on a partial listing does not make the name unique: another VM of
+        # that name may sit in a subscription or page that could not be read.
+        return {
+            **unresolved,
+            "candidates": candidates,
+            "note": "some subscriptions could not be listed completely; pass this VM's subscription to confirm it",
+        }
+    target = matches[0]
+    vm_id = target["id"].lower()
+    window = {"start": _utc_text(start_dt), "end": _utc_text(end_dt)}
+    # The filters are built from the parsed datetimes and ARM's own resource group
+    # name (validated again below), never from the raw input.
+    time_filter = f"eventTimestamp ge '{window['start']}' and eventTimestamp le '{window['end']}'"
+    if not _RESOURCE_GROUP_RE.match(target["resource_group"]):
+        return {"found": True, "vm": target, "window": window, "error": "unexpected resource group name from ARM"}
+    try:
+        rg_events, rg_capped = _read_activity_log(
+            arm,
+            target["subscription_id"],
+            f"{time_filter} and resourceGroupName eq '{target['resource_group']}'",
+            pages,
+        )
+    except ApiError as e:
+        return {"found": True, "vm": target, "window": window, **_arm_error(e)}
+
+    health: list[dict] = []
+    vm_operations: list[dict] = []
+    for event in rg_events:
+        if not isinstance(event, dict):
+            continue
+        rid = (_str(event.get("resourceId")) or "").lower()
+        if not (rid == vm_id or rid.startswith(vm_id + "/")):
+            continue
+        category = _value(event.get("category"))
+        if category == "ResourceHealth":
+            health.append(_health_row(event))
+        elif category == "Administrative":
+            vm_operations.append(_operation_row(event))
+
+    other_operations: list[dict] = []
+    service_health: list[dict] = []
+    other_categories: collections.Counter = collections.Counter()
+    sub_capped = False
+    sub_error: dict | None = None
+    sub_events: list = []
+    try:
+        sub_events, sub_capped = _read_activity_log(arm, target["subscription_id"], time_filter, pages)
+    except ApiError as e:
+        sub_error = _arm_error(e)
+    for event in sub_events:
+        if not isinstance(event, dict):
+            continue
+        rid = (_str(event.get("resourceId")) or "").lower()
+        if rid == vm_id or rid.startswith(vm_id + "/"):
+            continue  # read from the resource group above
+        category = _value(event.get("category")) or "Unknown"
+        if category == "Administrative":
+            other_operations.append(_operation_row(event))
+        elif category == "ServiceHealth":
+            service_health.append(_service_health_row(event))
+        else:
+            other_categories[category] += 1
+
+    other_sorted = _by_time(other_operations)
+    result = {
+        "found": True,
+        "vm": target,
+        "window": window,
+        "health": _by_time(health),
+        "vm_operations": _by_time(vm_operations),
+        "other_operations": {
+            "count": len(other_sorted),
+            "operations": len({r["correlation_id"] or id(r) for r in other_sorted}),
+            "items": other_sorted[-_ACTIVITY_OTHER_OPS_LIMIT:],
+            "truncated": len(other_sorted) > _ACTIVITY_OTHER_OPS_LIMIT,
+        },
+        "service_health": _by_time(service_health),
+        "other_categories": dict(other_categories),
+        "events_read": len(rg_events) + len(sub_events),
+        "capped_reads": {"resource_group": rg_capped, "subscription": sub_capped or sub_error is not None},
+        "capped": rg_capped or sub_capped or sub_error is not None,
+    }
+    if sub_error is not None:
+        result["subscription_read_error"] = sub_error
+    return result
+
+
+# ---------------------------------------------------------------------------
 # m365_service_health
 # ---------------------------------------------------------------------------
 

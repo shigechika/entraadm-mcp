@@ -22,7 +22,7 @@ and is not a fit for an unattended triage bot:
   server exposes one tool that lets the model construct arbitrary
   `GET`/schema-discovery calls against Microsoft Graph. That is flexible for
   a human, and awkward to put behind an allow-list for an automated triage
-  profile. entraadm-mcp exposes thirteen fixed, read-only tools instead.
+  profile. entraadm-mcp exposes fourteen fixed, read-only tools instead.
 - **No AADSTS translation.** Sign-in failures come back as raw error codes;
   triage still needs a lookup table. entraadm-mcp annotates every sign-in
   failure with what the code actually means.
@@ -47,17 +47,18 @@ and is not a fit for an unattended triage bot:
 | `list_subscriptions` | Which Azure subscriptions can this credential see? (ARM) |
 | `vm_backup_status` | Which Azure VMs are backed up by Azure Backup, did the last backup succeed, and is any recovery point stale? (ARM) |
 | `vm_backup_policies` | What schedule and retention do the Azure VM backup policies have? (ARM) |
+| `vm_activity` | Did someone restart this Azure VM, or did Azure (host failure, maintenance)? Activity log and Resource Health for a time window (ARM) |
 | `m365_service_health` | Is a Microsoft 365 service degraded, and which incidents and advisories are open? |
 | `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
 
 Every tool is read-only. Write operations (unblocking an account, resetting a
 password, revoking a session) are out of scope for this server.
 
-The three Azure Resource Manager tools live in an Entra-named server on
+The four Azure Resource Manager tools live in an Entra-named server on
 purpose: they use the same app registration and the same `azure-identity`
 credential object (a second token scope, `https://management.azure.com/.default`),
 run in the same deployment and are covered by the same `health_check`. A
-separate server for two tools would double the operational surface. They
+separate server for these tools would double the operational surface. They
 are governance reads, not resource management; a subscription the credential
 has no Reader role on simply does not appear in `list_subscriptions`.
 
@@ -88,7 +89,7 @@ different auth mode than intended.
 | Tool(s) | Role | Notes |
 |---|---|---|
 | `list_subscriptions` | none | Lists whatever the credential can see; an empty list means no role has been granted anywhere yet |
-| `vm_backup_status`, `vm_backup_policies` | **Reader** on each subscription | `Reader` is `*/read` and covers every endpoint used. `Backup Reader` alone is not enough (it has no `Microsoft.Compute/virtualMachines/read`). Granted to the service principal (app-only) or to the signed-in user (azure-cli) |
+| `vm_backup_status`, `vm_backup_policies`, `vm_activity` | **Reader** on each subscription | `Reader` is `*/read` and covers every endpoint used. `Backup Reader` alone is not enough (it has no `Microsoft.Compute/virtualMachines/read`). Granted to the service principal (app-only) or to the signed-in user (azure-cli) |
 
 Azure RBAC is optional: `health_check` reports ARM reachability and the number
 of visible subscriptions as an informational `arm` probe that never changes

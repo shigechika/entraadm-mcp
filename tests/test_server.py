@@ -2039,3 +2039,228 @@ def test_daily_brief_service_health_config_error_degrades_only_that_section(inje
     health = result["summary"]["service_health"]
     assert health["degraded_services"]["missing_permission"] == "ServiceHealth.Read.All"
     assert result["summary"]["sign_in_failures"] == 0 and result["summary"]["admin_actions"] == 0
+
+
+# --- vm_activity ---
+
+
+def _log_path(sub):
+    return f"/subscriptions/{sub}/providers/Microsoft.Insights/eventtypes/management/values"
+
+
+def _event(category, rid, when, op="Microsoft.Compute/virtualMachines/restart/action", status="Succeeded", **props):
+    return {
+        "category": {"value": category},
+        "resourceId": rid,
+        "eventTimestamp": when,
+        "operationName": {"value": op},
+        "status": {"value": status},
+        "caller": props.pop("caller", None),
+        "properties": props,
+    }
+
+
+def _vm_id(sub, name, rg="rg1"):
+    return _vm(sub, name, rg)["id"]
+
+
+def _activity_arm(events, capped=False, vms=None, rg_events=None, sub_response=None):
+    """The resource-group read gets ``rg_events`` (default: ``events``), the subscription read ``events``."""
+
+    def log(path, params, max_pages):
+        if "resourceGroupName eq" in params["$filter"]:
+            return (events if rg_events is None else rg_events), capped
+        return sub_response if sub_response is not None else (events, capped)
+
+    return FakeArmClient(
+        {
+            "/subscriptions": (_subs((SUB_A, "alpha"), (SUB_B, "beta")), False),
+            _vms_path(SUB_A): (vms if vms is not None else [_vm(SUB_A, "web1"), _vm(SUB_A, "db1")], False),
+            _vms_path(SUB_B): ([_vm(SUB_B, "other")], False),
+            _log_path(SUB_A): log,
+        }
+    )
+
+
+def test_vm_activity_separates_azure_events_from_operations(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    web1 = _vm_id(SUB_A, "web1")
+    events = [
+        _event(
+            "ResourceHealth",
+            web1.upper(),  # Resource Health upper-cases the id
+            "2026-10-16T07:11:02Z",
+            op="Microsoft.Resourcehealth/healthevent/Updated/action",
+            status="Updated",
+            title="Redeploying due to host failure",
+            cause="PlatformInitiated",
+            type="Downtime",
+            currentHealthStatus="Unavailable",
+            previousHealthStatus="Available",
+            details="x" * 400,
+        ),
+        _event("Administrative", web1 + "/extensions/ama", "2026-10-16T06:00:00Z", caller="ops@example.ac.jp"),
+        _event("Administrative", _vm_id(SUB_A, "db1"), "2026-10-16T05:00:00Z", caller="app-id"),
+        _event("ResourceHealth", _vm_id(SUB_A, "db1"), "2026-10-16T05:00:00Z"),
+        _event("ServiceHealth", f"/subscriptions/{SUB_A}", "2026-10-16T04:00:00Z", title="Outage", stage="Active"),
+        _event("Alert", f"/subscriptions/{SUB_A}/resourceGroups/rg1", "2026-10-16T04:00:00Z"),
+    ]
+    arm = inject_arm(_activity_arm(events))
+    result = server.vm_activity("WEB1")
+    assert result["found"] is True and result["vm"]["name"] == "web1" and result["vm"]["subscription_name"] == "alpha"
+    assert result["window"] == {"start": "2026-10-15T08:00:00Z", "end": "2026-10-16T08:00:00Z"}
+    [health] = result["health"]
+    assert health["cause"] == "PlatformInitiated" and health["title"] == "Redeploying due to host failure"
+    assert health["details"].endswith("…") and len(health["details"]) == 301
+    assert [o["caller"] for o in result["vm_operations"]] == ["ops@example.ac.jp"]
+    assert result["other_operations"] == {
+        "count": 1,
+        "operations": 1,
+        "items": [
+            {
+                "time": "2026-10-16T05:00:00Z",
+                "operation": "Microsoft.Compute/virtualMachines/restart/action",
+                "status": "Succeeded",
+                "caller": "app-id",
+                "resource": _vm_id(SUB_A, "db1"),
+                "correlation_id": None,
+            }
+        ],
+        "truncated": False,
+    }
+    assert result["service_health"][0]["title"] == "Outage"
+    # another VM's health event is not this VM's, and is only counted
+    assert result["other_categories"] == {"ResourceHealth": 1, "Alert": 1}
+    assert result["capped"] is False and result["events_read"] == 12
+    window = "eventTimestamp ge '2026-10-15T08:00:00Z' and eventTimestamp le '2026-10-16T08:00:00Z'"
+    filters = [c[2]["$filter"] for c in arm.calls if c[1] == _log_path(SUB_A)]
+    assert filters == [f"{window} and resourceGroupName eq 'rg1'", window]
+    # the VM's subscription only: the other subscription's log is not read
+    assert not any(c[1] == _log_path(SUB_B) for c in arm.calls)
+
+
+def test_vm_activity_window_from_offset_timestamps(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(_activity_arm([]))
+    result = server.vm_activity("web1", start="2026-10-15T21:00:00+09:00", end="2026-10-15T23:00:00+09:00")
+    assert result["window"] == {"start": "2026-10-15T12:00:00Z", "end": "2026-10-15T14:00:00Z"}
+    assert result["health"] == [] and result["vm_operations"] == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"start": "2026-10-15T21:00:00"}, "with an offset"),
+        ({"start": "2026-10-15T21:00"}, "with an offset"),
+        ({"start": "yesterday"}, "with an offset"),
+        ({"start": "2026-10-16T09:00:00Z", "end": "2026-10-16T08:00:00Z"}, "before end"),
+        ({"start": "2026-10-01T00:00:00Z"}, "at most 168 hours"),
+        ({"start": "2026-06-01T00:00:00Z", "end": "2026-06-02T00:00:00Z"}, "keeps 90 days"),
+    ],
+)
+def test_vm_activity_rejects_a_bad_window_before_any_request(inject, inject_arm, frozen_now, kwargs, message):
+    inject(FakeGraphClient())
+    arm = inject_arm(_activity_arm([]))
+    result = server.vm_activity("web1", **kwargs)
+    assert message in result["error"] and arm.calls == []
+
+
+@pytest.mark.parametrize("name", ["", "../x", "web 1", "a" * 65, "-web"])
+def test_vm_activity_rejects_names_that_could_not_be_a_vm(inject, inject_arm, frozen_now, name):
+    inject(FakeGraphClient())
+    arm = inject_arm(_activity_arm([]))
+    assert "error" in server.vm_activity(name) and arm.calls == []
+
+
+def test_vm_activity_ambiguous_name_needs_narrowing(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(_activity_arm([], vms=[_vm(SUB_A, "web1"), _vm(SUB_A, "web1", rg="rg2")]))
+    result = server.vm_activity("web1")
+    assert result["found"] is False and len(result["ambiguous"]) == 2
+    narrowed = server.vm_activity("web1", resource_group="RG2")
+    assert narrowed["found"] is True and narrowed["vm"]["resource_group"] == "rg2"
+
+
+def test_vm_activity_not_found_says_when_the_search_was_partial(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    arm = _activity_arm([])
+    arm._paged_responses[_vms_path(SUB_B)] = ARM_PERM_ERROR
+    inject_arm(arm)
+    result = server.vm_activity("nowhere")
+    assert result["found"] is False and result["search_complete"] is False and "note" in result
+
+
+def test_vm_activity_one_match_on_a_partial_search_is_not_taken_as_unique(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    arm = _activity_arm([])
+    arm._paged_responses[_vms_path(SUB_B)] = ARM_PERM_ERROR
+    inject_arm(arm)
+    result = server.vm_activity("web1")
+    assert result["found"] is False and result["search_complete"] is False
+    assert [c["subscription_name"] for c in result["candidates"]] == ["alpha"]
+    assert not any(c[1] == _log_path(SUB_A) for c in arm.calls)
+    # naming the subscription confirms it
+    assert server.vm_activity("web1", subscription="alpha")["found"] is True
+
+
+def test_vm_activity_capped_log_and_log_errors_are_disclosed(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(_activity_arm([], capped=True))
+    assert server.vm_activity("web1")["capped"] is True
+    arm = _activity_arm([])
+    arm._paged_responses[_log_path(SUB_A)] = ARM_PERM_ERROR
+    inject_arm(arm)
+    result = server.vm_activity("web1")
+    assert result["found"] is True and result["missing_permission"] == server.ARM_ROLE_HINT
+
+
+def test_vm_activity_lists_the_newest_50_other_operations(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    db1 = _vm_id(SUB_A, "db1")
+    events = [_event("Administrative", db1, f"2026-10-16T07:{i:02d}:00Z") for i in range(60)]
+    for i, e in enumerate(events):
+        e["correlationId"] = f"op{i // 3}"
+    inject_arm(_activity_arm(events, rg_events=[]))
+    other = server.vm_activity("web1")["other_operations"]
+    assert other["count"] == 60 and other["operations"] == 20 and other["truncated"] is True
+    assert other["items"][0]["time"] == "2026-10-16T07:10:00Z" and other["items"][-1]["time"] == "2026-10-16T07:59:00Z"
+
+
+def test_vm_activity_sorts_on_parsed_time_not_the_string(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    web1 = _vm_id(SUB_A, "web1")
+    events = [
+        _event("ResourceHealth", web1, "2026-10-16T07:11:02.1234567Z", title="later"),
+        _event("ResourceHealth", web1, "2026-10-16T07:11:02Z", title="earlier"),
+    ]
+    inject_arm(_activity_arm([], rg_events=events))
+    assert [h["title"] for h in server.vm_activity("web1")["health"]] == ["earlier", "later"]
+
+
+def test_vm_activity_accepts_minute_precision_with_an_offset(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    inject_arm(_activity_arm([]))
+    result = server.vm_activity("web1", start="2026-10-15T21:00+09:00", end="2026-10-15T23:30+09:00")
+    assert result["window"] == {"start": "2026-10-15T12:00:00Z", "end": "2026-10-15T14:30:00Z"}
+
+
+def test_vm_activity_keeps_the_vm_sections_when_the_subscription_read_fails(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    web1 = _vm_id(SUB_A, "web1")
+    rg = [_event("ResourceHealth", web1, "2026-10-16T07:00:00Z", cause="PlatformInitiated")]
+    inject_arm(_activity_arm([], rg_events=rg, sub_response=ARM_PERM_ERROR))
+    result = server.vm_activity("web1")
+    assert len(result["health"]) == 1 and result["capped"] is True
+    assert result["capped_reads"] == {"resource_group": False, "subscription": True}
+    assert result["subscription_read_error"]["missing_permission"] == server.ARM_ROLE_HINT
+
+
+def test_vm_activity_search_reports_permission_errors_and_skips_junk_items(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    arm = _activity_arm([], vms=[None, "junk", _vm(SUB_A, "db1")])
+    arm._paged_responses[_vms_path(SUB_B)] = ARM_PERM_ERROR
+    inject_arm(arm)
+    result = server.vm_activity("web1")
+    assert result["found"] is False and result["capped"] is True
+    assert result["search_errors"][0]["subscription_name"] == "beta"
+    assert result["search_errors"][0]["missing_permission"] == server.ARM_ROLE_HINT

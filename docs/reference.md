@@ -44,7 +44,7 @@ but the valid ranges are still used.
 | Tool(s) | Role |
 |---|---|
 | `list_subscriptions` | none (lists what the credential can see) |
-| `vm_backup_status`, `vm_backup_policies` | **Reader** on each subscription (`*/read`; `Backup Reader` alone lacks `Microsoft.Compute/virtualMachines/read`) |
+| `vm_backup_status`, `vm_backup_policies`, `vm_activity` | **Reader** on each subscription (`*/read`; `Backup Reader` alone lacks `Microsoft.Compute/virtualMachines/read`) |
 
 Azure RBAC is optional; `health_check`'s `arm` probe is informational.
 
@@ -213,6 +213,49 @@ duration, or `SimpleRetentionPolicy`), `instant_rp_days`, `timezone` and
 `protected_item_count` (ARM's own count). A schedule or retention type this
 server does not know comes back as `{"type": <name>, "unparsed": true}`.
 Same `subscription` resolution and coverage flags as `vm_backup_status`.
+
+### `vm_activity(vm, subscription=None, resource_group=None, start=None, end=None, hours=24, max_pages=None)`
+
+What happened to one VM in a time window, from the activity log of its
+subscription (`Microsoft.Insights/eventtypes/management/values`). Two reads,
+each filtered server-side on `eventTimestamp`: one also on the VM's resource
+group (`resourceGroupName eq`), so a busy subscription cannot crowd the VM's
+own events out of the page budget, and one over the whole subscription.
+
+`vm` is the VM name, matched case-insensitively over the visible
+subscriptions; `subscription` (id or display name) and `resource_group`
+narrow it. A name that is not unique returns `found: false` with `ambiguous`
+candidates. A partial listing (`search_complete: false`, `capped: true`,
+`search_errors` naming each subscription whose listing failed, with
+`missing_permission` when that is the cause) never resolves a name: one match
+there comes back as `candidates`, to be confirmed by naming its subscription.
+Without `subscription` every visible subscription is listed, and that search
+may use at most half of the call's time budget.
+
+The window is `start`..`end` (ISO timestamps with an explicit offset; seconds
+may be omitted; a bare local time is rejected rather than read as UTC), or the
+`hours` before `end` (default 24, `end` defaults to now); at most 168 hours
+and within the 90 days the activity log keeps. The result has `vm`, `window`
+(UTC), and:
+
+- `health` (resource-group read): Resource Health events of the VM (`stage`,
+  `title`, `cause` — `PlatformInitiated` for Azure, `UserInitiated` for an
+  operation or a reboot from inside the guest —, `type`, `current_health`,
+  `previous_health`, `details` cut at 300 characters);
+- `vm_operations` (resource-group read): Administrative events on the VM and
+  its sub-resources (`operation`, `status`, `caller`, `resource`,
+  `correlation_id`; one operation usually logs several events);
+- `other_operations` (subscription read): Administrative events on the rest
+  of the subscription (`count` of events, `operations` = distinct correlation
+  ids, the newest 50 `items`, `truncated`);
+- `service_health`: Azure incidents and maintenance announced to the
+  subscription;
+- `other_categories`: counts of the rest (Alert, Policy, other resources'
+  health events, ...);
+- `events_read`, `capped_reads` (`resource_group`, `subscription`) and
+  `capped` (either read hit the page or time budget, or the subscription read
+  failed — `subscription_read_error` then says why): an empty section is then
+  not proof that nothing happened.
 
 ### `m365_service_health(max_pages=None)`
 
