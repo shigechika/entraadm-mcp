@@ -83,6 +83,16 @@ async def _one_subscription(call: Caller) -> dict[str, Any]:
     return {"subscription": match.group(1)}
 
 
+async def _missing_vm_in_one_subscription(call: Caller) -> dict[str, Any]:
+    """A random VM name that no tenant uses, in one discovered subscription.
+
+    Exercises the subscription resolution and the VM listing without naming a
+    tenant VM here; ``found: false`` is the expected answer.
+    """
+    args = await _one_subscription(call)
+    return {**args, "vm": f"smoke-test-{secrets.token_hex(8)}"}
+
+
 PROBES: dict[str, Probe] = {
     "health_check": Probe(
         require_keys=("service", "version", "status", "auth_mode", "graph", "signin_probe", "arm"),
@@ -155,6 +165,13 @@ PROBES: dict[str, Probe] = {
         args_factory=_one_subscription,
         require_keys=("summary", "subscriptions", "capped"),
         rows_key="subscriptions",
+        allow_empty=True,
+        timeout=180,
+    ),
+    "vm_activity": Probe(
+        args={"hours": 1, "max_pages": MAX_PAGES},
+        args_factory=_missing_vm_in_one_subscription,
+        require_keys=("found", "vm", "search_complete"),
         allow_empty=True,
         timeout=180,
     ),

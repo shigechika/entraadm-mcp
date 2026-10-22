@@ -37,6 +37,7 @@ Microsoft は Entra ID データ向けに
 | `list_subscriptions` | このクレデンシャルから見える Azure サブスクリプション（ARM） |
 | `vm_backup_status` | 保護されている Azure VM、直近のバックアップの成否、復旧ポイントの鮮度（ARM） |
 | `vm_backup_policies` | Azure VM バックアップポリシーのスケジュールと保持期間（ARM） |
+| `vm_activity` | Azure VM を再起動したのは人か Azure か：指定した時間帯のアクティビティログとリソース正常性（ARM） |
 | `m365_service_health` | Microsoft 365 のサービス状態と開いているインシデント・アドバイザリ |
 | `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
 

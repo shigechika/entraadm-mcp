@@ -41,15 +41,16 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `list_subscriptions` | このクレデンシャルから見える Azure サブスクリプションはどれか（ARM） |
 | `vm_backup_status` | Azure Backup で保護されている Azure VM はどれか、直近のバックアップは成功したか、復旧ポイントが古くなっていないか（ARM） |
 | `vm_backup_policies` | Azure VM のバックアップポリシーのスケジュールと保持期間（ARM） |
+| `vm_activity` | この Azure VM を再起動したのは人か Azure（ホスト障害・メンテナンス）か。指定した時間帯のアクティビティログとリソース正常性（ARM） |
 | `m365_service_health` | Microsoft 365 のサービスが劣化していないか、どのインシデント・アドバイザリが開いているか |
 | `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
 
 全ツールが読み取り専用。書き込み操作（アカウントのブロック解除・パスワードリセット・
 セッション失効）はこのサーバのスコープ外。
 
-Azure Resource Manager の 3 ツールを Entra の名を持つサーバに置いているのは意図的。同じアプリ登録・
+Azure Resource Manager の 4 ツールを Entra の名を持つサーバに置いているのは意図的。同じアプリ登録・
 同じ `azure-identity` のクレデンシャル（トークンのスコープが `https://management.azure.com/.default` に
-なるだけ）・同じ配備で動き、同じ `health_check` で見える。2 ツールのために別サーバを立てると運用面が
+なるだけ）・同じ配備で動き、同じ `health_check` で見える。これらのツールのために別サーバを立てると運用面が
 倍になる。資源の管理ではなくガバナンスの読み取りであり、Reader ロールの無いサブスクリプションは
 `list_subscriptions` に出てこないだけ。
 
@@ -79,7 +80,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | ツール | ロール | 備考 |
 |---|---|---|
 | `list_subscriptions` | なし | クレデンシャルから見えるものを列挙する。空ならどこにもロールが付いていない |
-| `vm_backup_status`、`vm_backup_policies` | 各サブスクリプションの **Reader** | `Reader` は `*/read` で、使う全エンドポイントを満たす。`Backup Reader` だけでは足りない（`Microsoft.Compute/virtualMachines/read` が無い）。app-only ならサービスプリンシパルに、azure-cli ならサインインしたユーザに付与する |
+| `vm_backup_status`、`vm_backup_policies`、`vm_activity` | 各サブスクリプションの **Reader** | `Reader` は `*/read` で、使う全エンドポイントを満たす。`Backup Reader` だけでは足りない（`Microsoft.Compute/virtualMachines/read` が無い）。app-only ならサービスプリンシパルに、azure-cli ならサインインしたユーザに付与する |
 
 Azure RBAC は任意。`health_check` は ARM の到達性と見えるサブスクリプション数を情報扱いの `arm` プローブとして
 報告し、`status` は変えない。Entra の triage だけに使う配備は `healthy` のまま。

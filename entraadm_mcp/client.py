@@ -34,6 +34,7 @@ ARM_API_VERSIONS = {
     "virtualMachines": "2024-07-01",
     "vaults": "2023-04-01",
     "backup": "2023-04-01",
+    "activityLog": "2015-04-01",
 }
 
 #: Refresh the cached token this many seconds before its real expiry, so a

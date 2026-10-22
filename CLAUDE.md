@@ -4,7 +4,7 @@
 
 MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
 plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
-service health. Transport is stdio only. All 13 tools are read-only — there
+service health. Transport is stdio only. All 14 tools are read-only — there
 is no write/mutating tool. Auth is env-var driven (see below); no config file. The
 one optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
 ranges, same format as keycloak-mcp's `KEYCLOAK_SITES_INI`), loaded by
@@ -50,7 +50,7 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   stack trace. 429 retries once (respecting `Retry-After`); 5xx retries twice
   with exponential backoff. `credential`/`http_client` constructor params
   are `# injectable for tests` (respx-mocked httpx, a stub credential).
-- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 13 tools.
+- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 14 tools.
   `AADSTS_CODES` is a hand-maintained dict (not exhaustive) annotating
   sign-in failure codes; missing codes return `meaning: null`, never hidden.
   `_state = {"client": None, "arm": None}` holds the two test-injection

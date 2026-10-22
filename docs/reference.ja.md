@@ -40,7 +40,7 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 | ツール | ロール |
 |---|---|
 | `list_subscriptions` | なし（クレデンシャルから見えるものを列挙する） |
-| `vm_backup_status`、`vm_backup_policies` | 各サブスクリプションの **Reader**（`*/read`。`Backup Reader` だけでは `Microsoft.Compute/virtualMachines/read` が無い） |
+| `vm_backup_status`、`vm_backup_policies`、`vm_activity` | 各サブスクリプションの **Reader**（`*/read`。`Backup Reader` だけでは `Microsoft.Compute/virtualMachines/read` が無い） |
 
 Azure RBAC は任意。`health_check` の `arm` プローブは情報扱い。
 
@@ -182,6 +182,28 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 `{count, unit}` の期間付きで、または `SimpleRetentionPolicy`）、`instant_rp_days`、`timezone`、
 `protected_item_count`（ARM 自身の数）。知らないスケジュール・保持の型は `{"type": <名前>,
 "unparsed": true}` で返す。`subscription` の解決と網羅性のフラグは `vm_backup_status` と同じ。
+
+### `vm_activity(vm, subscription=None, resource_group=None, start=None, end=None, hours=24, max_pages=None)`
+
+1 台の VM に指定した時間帯に何が起きたかを、その VM のサブスクリプションのアクティビティログ
+（`Microsoft.Insights/eventtypes/management/values`、サーバ側の絞り込みは `eventTimestamp` だけ）から返す。
+`vm` は VM 名で、見えるサブスクリプションを大文字小文字を区別せずに探す。`subscription`（id か表示名）と
+`resource_group` で絞れる。名前が一意でなければ `found: false` と候補の `ambiguous` を返す。一部の
+サブスクリプションを読めずに見つからなかったときは `search_complete: false` で伝える。
+
+時間帯は `start`〜`end`（オフセット付きの ISO 時刻。オフセットの無い時刻は UTC と読まずに拒否する）か、
+`end` の前の `hours` 時間（既定 24、`end` の既定は現在）。最大 168 時間で、アクティビティログが保つ 90 日以内。
+結果は `vm`、`window`（UTC）と次の項目：
+
+- `health`：VM のリソース正常性イベント（`stage`、`title`、`cause`（Azure 起因は `PlatformInitiated`、
+  操作やゲスト OS 内からの再起動は `UserInitiated`）、`type`、`current_health`、`previous_health`、
+  300 字で切った `details`）
+- `vm_operations`：VM とその配下のリソースへの Administrative 操作（`operation`、`status`、`caller`、`resource`）
+- `other_operations`：サブスクリプションのほかのリソースへの Administrative 操作（`count`、先頭 50 件の
+  `items`、`truncated`）
+- `service_health`：サブスクリプションに告知された Azure の障害・メンテナンス
+- `other_categories`：残りの件数（Alert、Policy、ほかのリソースの正常性イベントなど）
+- `events_read` と `capped`（ページか時間の予算に達した。そのときは空の項目が「何も無かった」証拠にならない）
 
 ### `m365_service_health(max_pages=None)`
 
