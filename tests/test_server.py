@@ -2182,6 +2182,19 @@ def test_vm_activity_not_found_says_when_the_search_was_partial(inject, inject_a
     assert result["found"] is False and result["search_complete"] is False and "note" in result
 
 
+def test_vm_activity_one_match_on_a_partial_search_is_not_taken_as_unique(inject, inject_arm, frozen_now):
+    inject(FakeGraphClient())
+    arm = _activity_arm([])
+    arm._paged_responses[_vms_path(SUB_B)] = ARM_PERM_ERROR
+    inject_arm(arm)
+    result = server.vm_activity("web1")
+    assert result["found"] is False and result["search_complete"] is False
+    assert [c["subscription_name"] for c in result["candidates"]] == ["alpha"]
+    assert not any(c[1] == _log_path(SUB_A) for c in arm.calls)
+    # naming the subscription confirms it
+    assert server.vm_activity("web1", subscription="alpha")["found"] is True
+
+
 def test_vm_activity_capped_log_and_log_errors_are_disclosed(inject, inject_arm, frozen_now):
     inject(FakeGraphClient())
     inject_arm(_activity_arm([], capped=True))

@@ -2092,7 +2092,10 @@ def vm_activity(
     ``vm`` is the VM name, matched case-insensitively across the
     subscriptions this credential can see; narrow it with ``subscription``
     (id or display name from ``list_subscriptions``) or ``resource_group``
-    when the name is not unique (``ambiguous`` lists the candidates).
+    when the name is not unique (``ambiguous`` lists the candidates). A
+    single match found while some subscription could not be listed
+    completely is not taken as unique: it comes back as ``candidates`` with
+    ``search_complete: false``, to be confirmed by naming its subscription.
     The window is ``start``..``end`` (ISO timestamps with an offset, e.g.
     ``2026-10-21T21:00:00+09:00``), or the ``hours`` before ``end`` (default
     24; ``end`` defaults to now); at most 168 hours, within the 90 days the
@@ -2126,12 +2129,23 @@ def vm_activity(
         if not search_complete:
             out["note"] = "not found among the VMs that could be listed; some subscriptions were unreadable or capped"
         return out
+    candidates = [{k: m[k] for k in ("id", "subscription_name", "resource_group")} for m in matches]
     if len(matches) > 1:
         return {
             "found": False,
             "vm": name,
-            "ambiguous": [{k: m[k] for k in ("id", "subscription_name", "resource_group")} for m in matches],
+            "ambiguous": candidates,
             "note": "pass subscription or resource_group to pick one",
+        }
+    if not search_complete:
+        # One match on a partial listing does not make the name unique: another VM of
+        # that name may sit in a subscription or page that could not be read.
+        return {
+            "found": False,
+            "vm": name,
+            "search_complete": False,
+            "candidates": candidates,
+            "note": "some subscriptions could not be listed completely; pass this VM's subscription to confirm it",
         }
     target = matches[0]
     vm_id = target["id"].lower()

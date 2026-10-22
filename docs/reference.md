@@ -221,8 +221,9 @@ subscription (`Microsoft.Insights/eventtypes/management/values`, one
 server-side filter on `eventTimestamp`). `vm` is the VM name, matched
 case-insensitively over the visible subscriptions; `subscription` (id or
 display name) and `resource_group` narrow it, and a name that is not unique
-returns `found: false` with `ambiguous` candidates. Not found on a partial
-listing says so (`search_complete: false`).
+returns `found: false` with `ambiguous` candidates. A partial listing
+(`search_complete: false`) never resolves a name: one match there comes back
+as `candidates`, to be confirmed by naming its subscription.
 
 The window is `start`..`end` (ISO timestamps with an explicit offset; a bare
 local time is rejected rather than read as UTC), or the `hours` before `end`

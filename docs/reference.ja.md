@@ -189,7 +189,7 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 （`Microsoft.Insights/eventtypes/management/values`、サーバ側の絞り込みは `eventTimestamp` だけ）から返す。
 `vm` は VM 名で、見えるサブスクリプションを大文字小文字を区別せずに探す。`subscription`（id か表示名）と
 `resource_group` で絞れる。名前が一意でなければ `found: false` と候補の `ambiguous` を返す。一部の
-サブスクリプションを読めずに見つからなかったときは `search_complete: false` で伝える。
+サブスクリプションを読み切れなかったとき（`search_complete: false`）は名前を確定しない。見つかった 1 台も `candidates` として返すので、その購読を指定して確かめる。
 
 時間帯は `start`〜`end`（オフセット付きの ISO 時刻。オフセットの無い時刻は UTC と読まずに拒否する）か、
 `end` の前の `hours` 時間（既定 24、`end` の既定は現在）。最大 168 時間で、アクティビティログが保つ 90 日以内。
