@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/shigechika/entraadm-mcp/compare/v1.3.0...v1.4.0) (2026-10-22)
+
+
+### Features
+
+* vm_activity — who or what restarted an Azure VM ([#21](https://github.com/shigechika/entraadm-mcp/issues/21)) ([2356a64](https://github.com/shigechika/entraadm-mcp/commit/2356a64a800874305575d4dea70b6e79e54e6c60))
+
 ## [1.3.0](https://github.com/shigechika/entraadm-mcp/compare/v1.2.0...v1.3.0) (2026-10-15)
 
 
