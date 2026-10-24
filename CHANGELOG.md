@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/shigechika/entraadm-mcp/compare/v1.7.0...v1.8.0) (2026-10-24)
+
+
+### Features
+
+* report Identity Protection licensing and use Microsoft risky users when licensed ([#31](https://github.com/shigechika/entraadm-mcp/issues/31)) ([6965cf1](https://github.com/shigechika/entraadm-mcp/commit/6965cf109bd18205c9c334b2e9860bb95ebd4181))
+
 ## [1.7.0](https://github.com/shigechika/entraadm-mcp/compare/v1.6.0...v1.7.0) (2026-10-24)
 
 
