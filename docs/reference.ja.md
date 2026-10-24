@@ -272,6 +272,32 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 この順に 1 つの期限を共有して同期実行する。Azure VM のバックアップは意図的に入れていない
 （ARM の走査が予算を使い切りうるので `vm_backup_status` を別に呼ぶ）。`samples` は現状未使用（予約）。
 
+### `revoke_sign_in_sessions(upn)`
+
+オプトインの，状態を変えるツール。`ENTRAADM_ENABLE_REVOKE_SESSIONS=1`（ちょうど "1"）のときだけ
+登録され，呼び出しの中でもスイッチを確かめ直す。userPrincipalName の完全一致でアカウントを引いたうえで，
+Graph の `POST /users/{id}/revokeSignInSessions` ですべての場所からサインアウトさせる（リフレッシュ
+トークンとセッション Cookie を無効化）。ゲストは断る。侵害が確定したときに使う（本人も再サインインが要る）。
+
+引数は `upn` だけで，意図的に `tenant` の上書きは無い。複数のテナントがあっても，対象のテナントは
+常に UPN のドメインを持つテナントで，引数で書き込みを別のテナントに向けられないようにしている。
+どのテナントも持たないドメインは `revoked: false`・`found: null`・`tenant_configured: false`・
+`configured_domains` で断り，何も送らない。
+
+結果のキーはいつも同じ: `found`・`user_principal_name`・`account_enabled`（実行前）・`revoked`・`at`・
+`error`・`missing_permission`・`tenant`・`tenant_configured`・`configured_domains`・`not_covered`。
+`revoked` は，Graph が認めたら `true`，何もしていなければ `false`（スイッチが無効・存在しないかゲストの
+アカウント・照会の失敗・要求を送る前の期限切れ・Graph の 4xx），結果が分からなければ `null`
+（通信エラーで応答が失われた・再試行後も 5xx・送った後の期限切れ・成功の応答が読めない）。`null` なら
+もう一度呼んでも安全（失効は冪等）。`not_covered` はしないことの一覧: アカウントの無効化・パスワードの
+リセット・MFA 方式の削除。発行済みのアクセストークンは期限（通常 1 時間程度）まで使え，レガシー認証とアプリパスワードは
+テナントの方針に従う。
+
+権限: app-only では `User.RevokeSessions.All`（アプリケーションの権限，管理者の同意），delegated
+（`az login`）では User Administrator か Helpdesk Administrator のディレクトリロール（管理者アカウントが
+対象なら Privileged Authentication Administrator）。先に行う照会には `User.Read.All` が要る。403 のときは
+認証方式に応じた `missing_permission` を返す。
+
 ## エラー
 
 全ツールの入口は設定エラーと API クライアント（Graph・ARM）のエラーを捕まえて
