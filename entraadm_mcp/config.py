@@ -361,22 +361,24 @@ def load_tenants(env: dict | None = None) -> Tenants:
 
 #: Env var with the ISO 3166-1 alpha-2 codes of the countries the tenant's users sign in from.
 HOME_COUNTRIES_ENV = "ENTRAADM_HOME_COUNTRIES"
-_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 
 
 def home_countries(env: dict | None = None) -> tuple[frozenset[str] | None, str | None]:
     """The home countries from ``ENTRAADM_HOME_COUNTRIES`` (e.g. "JP" or "JP, US"), and an error.
 
     Unset or empty: ``(None, None)`` -- the caller skips anything that needs
-    them rather than guessing. A value that is not a comma list of two-letter
-    codes: ``(None, message)``. Codes are upper-cased.
+    them rather than guessing. A value with any code that is not an assigned
+    ISO 3166-1 alpha-2 code (``JPN``, ``ZZ``): ``(None, message)``, so a typo
+    never makes every country look foreign. Codes are upper-cased.
     """
     e = os.environ if env is None else env
     raw = (e.get(HOME_COUNTRIES_ENV) or "").strip()
     if not raw:
         return None, None
+    from entraadm_mcp.iso3166 import ISO_3166_ALPHA2
+
     codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
-    bad = [c for c in codes if not _COUNTRY_RE.match(c)]
+    bad = [c for c in codes if c not in ISO_3166_ALPHA2]
     if bad or not codes:
-        return None, f"{HOME_COUNTRIES_ENV} must be ISO 3166-1 alpha-2 codes such as 'JP' (got {bad or raw!r})"
+        return None, f"{HOME_COUNTRIES_ENV} must be assigned ISO 3166-1 alpha-2 codes such as 'JP' (not {bad or raw!r})"
     return frozenset(codes), None

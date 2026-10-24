@@ -2812,7 +2812,7 @@ def _suspects(inject, rows, capped=False, **kwargs):
     return server.compromise_suspects(**kwargs), client
 
 
-def test_a_spray_source_that_got_in_is_a_breach(inject, home_jp):
+def test_a_spray_source_that_got_in_is_a_breach(inject, home_jp, sites_ini):
     rows = _spray() + [
         _ok("victim3@example.edu", _SPRAY_IP, when="2026-08-21T02:00:00Z", client="Authenticated SMTP"),
         _ok("victim3@example.edu", _SPRAY_IP, when="2026-08-21T03:00:00Z"),
@@ -2860,6 +2860,7 @@ def test_foreign_successes_are_grouped_per_account(inject, home_jp):
     assert row["countries"] == ["DE", "FR"] and row["distinct_ips"] == 2 and row["successes"] == 2
     assert row["first_seen"] == "2026-08-21T05:00:00Z" and row["last_seen"] == "2026-08-21T07:00:00Z"
     assert row["home_success_in_window"] is True and row["legacy_auth"] is False
+    assert row["ips"] == [{"ip_address": "203.0.113.1", "successes": 1}, {"ip_address": "203.0.113.2", "successes": 1}]
     assert out["counts"] == {
         "high": 0,
         "medium": 1,
@@ -2888,7 +2889,7 @@ def test_a_foreign_legacy_success_is_high_and_sorted_first(inject, home_jp):
     assert out["counts"]["high"] == 1 and out["counts"]["medium"] == 1
 
 
-def test_a_foreign_account_in_a_spray_breach_is_high_and_counted_once(inject, home_jp):
+def test_a_foreign_account_in_a_spray_breach_is_high_and_counted_once(inject, home_jp, sites_ini):
     rows = _spray() + [_ok("victim2@example.edu", _SPRAY_IP, country="US")]
     out, _ = _suspects(inject, rows)
     (row,) = out["foreign_successes"]
@@ -2936,7 +2937,7 @@ def test_compromise_suspects_follows_the_tenant_argument(two_tenants):
     assert out["tenant"] == "students" and students.calls and not staff.calls
 
 
-def test_daily_brief_carries_compromise_suspects_from_the_same_walk(inject, home_jp):
+def test_daily_brief_carries_compromise_suspects_from_the_same_walk(inject, home_jp, sites_ini):
     rows = _spray() + [_ok(f"victim{i}@example.edu", _SPRAY_IP) for i in range(5)]
     rows += [_ok(f"far{i}@example.edu", f"203.0.113.{i}", country="FR") for i in range(1, 8)]
     client = inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
@@ -2945,7 +2946,12 @@ def test_daily_brief_carries_compromise_suspects_from_the_same_walk(inject, home
     assert len(section["spray_breaches"]) == 5 and section["spray_breaches_capped"] is False
     assert len(section["foreign_successes"]) == 5 and section["foreign_successes_capped"] is True
     assert section["counts"]["foreign_accounts"] == 12
-    assert out["summary"]["compromise_suspects"] == {"high": 5, "medium": 7}
+    assert out["summary"]["compromise_suspects"] == {
+        "high": 5,
+        "medium": 7,
+        "home_countries": {"configured": True, "error": None},
+        "internal_ranges_known": True,
+    }
     assert out["summary"]["sign_in_failures"] == 5
     assert sum(1 for c in client.calls if c[0] == "get_paged" and c[1] == "/auditLogs/signIns") == 1
 
@@ -2968,3 +2974,142 @@ def test_unset_home_countries_does_not_change_health(inject, monkeypatch):
     inject(FakeGraphClient())
     out = server.health_check()
     assert out["home_countries"]["configured"] is False and out["status"] == "healthy"
+
+
+def test_home_countries_must_be_assigned_iso_codes():
+    from entraadm_mcp.config import home_countries
+
+    assert home_countries({"ENTRAADM_HOME_COUNTRIES": "jp"}) == (frozenset({"JP"}), None)
+    for bad in ("ZZ", "JPN", "JP, ZZ"):
+        codes, error = home_countries({"ENTRAADM_HOME_COUNTRIES": bad})
+        assert codes is None and "ISO 3166-1" in error
+
+
+def test_an_unassigned_home_code_disables_foreign_findings(inject, monkeypatch):
+    monkeypatch.setenv("ENTRAADM_HOME_COUNTRIES", "ZZ")
+    out, _ = _suspects(inject, [_ok("x@example.edu", "203.0.113.1", country="JP", client="IMAP4")])
+    assert out["foreign_successes"] == [] and out["home_countries"]["configured"] is False
+
+
+@pytest.mark.parametrize("code", [50058, 50072, 50074, 50076, 50079, 53003, 50055])
+def test_mfa_interrupt_and_ca_codes_do_not_make_a_spray_source(inject, home_jp, sites_ini, code):
+    rows = [
+        _signin_row(userPrincipalName=f"u{i}@example.edu", ipAddress=_SPRAY_IP, status={"errorCode": code})
+        for i in range(8)
+    ] + [_ok("u1@example.edu", _SPRAY_IP)]
+    out, _ = _suspects(inject, rows)
+    assert out["spray_breaches"] == []
+
+
+@pytest.mark.parametrize("code", sorted(server._CREDENTIAL_FAILURE_CODES))
+def test_credential_failures_make_a_spray_source(inject, home_jp, sites_ini, code):
+    rows = [
+        _signin_row(userPrincipalName=f"u{i}@example.edu", ipAddress=_SPRAY_IP, status={"errorCode": code})
+        for i in range(5)
+    ] + [_ok("u1@example.edu", _SPRAY_IP)]
+    out, _ = _suspects(inject, rows)
+    assert len(out["spray_breaches"]) == 1
+
+
+def test_signin_failure_stats_still_counts_every_failure(inject):
+    rows = [_signin_row(userPrincipalName=f"u{i}@example.edu", status={"errorCode": 50074}) for i in range(5)]
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": (rows, False)}))
+    out = server.signin_failure_stats()
+    assert out["total_failures"] == 5 and len(out["spray_suspects"]) == 1
+
+
+def test_without_internal_ranges_spray_breaches_are_medium(inject, home_jp, monkeypatch):
+    monkeypatch.delenv("ENTRAADM_SITES_INI", raising=False)
+    rows = _spray() + [_ok("victim1@example.edu", _SPRAY_IP, country="US")]
+    out, _ = _suspects(inject, rows)
+    assert out["internal_ranges_known"] is False
+    (breach,) = out["spray_breaches"]
+    assert breach["severity"] == "medium" and "NAT egress" in breach["note"]
+    (foreign,) = out["foreign_successes"]
+    assert foreign["severity"] == "medium" and foreign["in_spray_breaches"] is True
+    assert out["counts"]["high"] == 0 and out["counts"]["medium"] == 1
+
+
+def test_an_unreadable_sites_file_counts_as_unknown_ranges(inject, home_jp, monkeypatch, tmp_path):
+    monkeypatch.setenv("ENTRAADM_SITES_INI", str(tmp_path / "missing.ini"))
+    out, _ = _suspects(inject, _spray() + [_ok("victim1@example.edu", _SPRAY_IP)])
+    assert out["internal_ranges_known"] is False and out["spray_breaches"][0]["severity"] == "medium"
+
+
+def test_home_success_is_unknown_in_a_capped_scan(inject, home_jp):
+    rows = [_ok("far@example.edu", "203.0.113.1", country="FR")]
+    out, _ = _suspects(inject, rows, capped=True)
+    assert out["foreign_successes"][0]["home_success_in_window"] is None
+    rows.append(_ok("far@example.edu", "203.0.113.2", country="JP"))
+    out, _ = _suspects(inject, rows, capped=True)
+    assert out["foreign_successes"][0]["home_success_in_window"] is True
+    out, _ = _suspects(inject, rows[:1], capped=False)
+    assert out["foreign_successes"][0]["home_success_in_window"] is False
+
+
+def test_foreign_ips_keep_the_most_used(inject, home_jp, monkeypatch):
+    monkeypatch.setattr(server, "_COMPROMISE_IPS_LIMIT", 2)
+    rows = [_ok("far@example.edu", "203.0.113.1", country="FR")]
+    rows += [_ok("far@example.edu", "203.0.113.9", country="FR") for _ in range(3)]
+    rows += [_ok("far@example.edu", "203.0.113.5", country="FR") for _ in range(2)]
+    out, _ = _suspects(inject, rows)
+    (row,) = out["foreign_successes"]
+    assert row["ips"] == [
+        {"ip_address": "203.0.113.9", "successes": 3},
+        {"ip_address": "203.0.113.5", "successes": 2},
+    ]
+    assert row["ips_capped"] is True and row["distinct_ips"] == 3
+
+
+def test_first_and_last_compare_times_not_text(inject, home_jp):
+    rows = [
+        _ok("far@example.edu", "203.0.113.1", country="FR", when="2026-08-21T02:00:00.5Z"),
+        _ok("far@example.edu", "203.0.113.1", country="FR", when="2026-08-21T02:00:00Z"),
+    ]
+    out, _ = _suspects(inject, rows)
+    row = out["foreign_successes"][0]
+    assert row["first_seen"] == "2026-08-21T02:00:00Z" and row["last_seen"] == "2026-08-21T02:00:00.5Z"
+
+
+@pytest.mark.parametrize("value", ["five", None, True, [5]])
+def test_a_bad_min_spray_users_is_an_error_dict(inject, value):
+    client = inject(FakeGraphClient())
+    out = server.compromise_suspects(min_spray_users=value)
+    assert "min_spray_users must be an integer" in out["error"] and client.calls == []
+
+
+def test_a_bad_min_distinct_users_is_an_error_dict(inject):
+    client = inject(FakeGraphClient())
+    out = server.signin_success_stats(min_distinct_users="two")
+    assert "min_distinct_users must be an integer" in out["error"] and client.calls == []
+
+
+def test_signin_success_stats_reads_through_the_shared_fetch(inject):
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": PERM_ERROR}))
+    assert server.signin_success_stats()["missing_permission"] == "AuditLog.Read.All"
+
+
+def test_daily_brief_reports_a_walk_error_once(inject):
+    inject(
+        FakeGraphClient(paged_responses={"/auditLogs/signIns": PERM_ERROR, "/auditLogs/directoryAudits": ([], False)})
+    )
+    out = server.daily_brief()
+    assert out["signin_failure_stats"]["missing_permission"] == "AuditLog.Read.All"
+    assert out["compromise_suspects"] == {"error": "sign-in log not read; see signin_failure_stats"}
+    assert out["summary"]["compromise_suspects"] == {"error": "see sign_in_failures"}
+
+
+def test_daily_brief_walk_selects_the_union_of_both_needs(inject):
+    client = inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": ([], False)}))
+    server.daily_brief()
+    (walk,) = [c for c in client.calls if c[0] == "get_paged" and c[1] == "/auditLogs/signIns"]
+    fields = set(walk[2]["$select"].split(","))
+    assert fields == set(server._STATS_SELECT.split(",")) | {"clientAppUsed", "location"}
+
+
+def test_daily_brief_summary_shows_an_unconfigured_setup(inject, monkeypatch):
+    monkeypatch.setenv("ENTRAADM_HOME_COUNTRIES", "JPN")
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": ([], False)}))
+    summary = server.daily_brief()["summary"]["compromise_suspects"]
+    assert summary["home_countries"]["configured"] is False and "JPN" in summary["home_countries"]["error"]
+    assert summary["internal_ranges_known"] is False

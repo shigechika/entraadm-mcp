@@ -154,8 +154,8 @@ export ENTRAADM_DEADLINE=45
 # Your own address ranges (NAT egress, offices, labs). Spray suspects inside them are
 # listed separately as internal_spray_suspects, labelled with the site.
 export ENTRAADM_SITES_INI=/path/to/sites.ini
-# The countries your users sign in from (ISO 3166-1 alpha-2). compromise_suspects reports
-# successes from elsewhere; unset, that list is skipped (never guessed).
+# The countries your users sign in from (assigned ISO 3166-1 alpha-2 codes). compromise_suspects
+# reports successes from elsewhere; unset or with an invalid code, that list is skipped.
 export ENTRAADM_HOME_COUNTRIES=JP
 # Register revoke_sign_in_sessions, the one state-changing tool (exactly "1"; anything
 # else leaves it off). Also needs the User.RevokeSessions.All permission.

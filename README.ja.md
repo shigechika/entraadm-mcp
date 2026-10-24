@@ -134,8 +134,8 @@ export ENTRAADM_DEADLINE=45
 # 自組織のアドレス範囲（NAT の出口・事業所・実習室など）。この範囲のスプレー疑いは
 # internal_spray_suspects に拠点名付きで分けて出す
 export ENTRAADM_SITES_INI=/path/to/sites.ini
-# 利用者がサインインする国（ISO 3166-1 alpha-2）。compromise_suspects はそれ以外からの成功を
-# 報告する。未設定ならその一覧は飛ばす（推測しない）
+# 利用者がサインインする国（実在の ISO 3166-1 alpha-2）。compromise_suspects はそれ以外からの
+# 成功を報告する。未設定か不正なコードがあればその一覧は飛ばす
 export ENTRAADM_HOME_COUNTRIES=JP
 # 状態を変える唯一のツール revoke_sign_in_sessions を登録する（ちょうど "1" のときだけ。
 # ほかの値では無効）。User.RevokeSessions.All の権限も要る

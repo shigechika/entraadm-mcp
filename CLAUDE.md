@@ -154,10 +154,16 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `Info:` line without changing the exit code.
 - **`compromise_suspects` reports, it never guesses.** Both findings come
   from EXTERNAL IPs only (outside `ENTRAADM_SITES_INI`). A spray breach
-  needs `min_spray_users` distinct failed accounts AND a success from the
-  same IP. A foreign success needs `ENTRAADM_HOME_COUNTRIES` (unset or
-  invalid: the list stays empty, `home_countries.configured: false`) and a
-  country on the row (no country is never foreign). `counts` are distinct
+  needs `min_spray_users` distinct accounts with CREDENTIAL failures
+  (`_CREDENTIAL_FAILURE_CODES`; MFA/interrupt/CA codes follow a correct
+  password and do not count -- `signin_failure_stats` still counts every
+  failure) AND a success from the same IP; without loaded internal ranges
+  (`internal_ranges_known: false`) it is medium, not high. A foreign success
+  needs `ENTRAADM_HOME_COUNTRIES` (assigned ISO codes from `iso3166.py`;
+  unset or one invalid code: the list stays empty,
+  `home_countries.configured: false`) and a country on the row (no country
+  is never foreign). `home_success_in_window` is null, not false, when a
+  capped scan did not see it. First/last compare parsed times. `counts` are distinct
   accounts, an account in both lists counted once as high. The aggregation
   lives in `_compromise()` over rows from `_fetch_signins()`, so
   `daily_brief` feeds it and `_failure_stats()` from ONE walk of the
