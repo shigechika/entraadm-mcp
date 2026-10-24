@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/shigechika/entraadm-mcp/compare/v1.5.0...v1.6.0) (2026-10-24)
+
+
+### Features
+
+* serve several Entra tenants from one process ([#25](https://github.com/shigechika/entraadm-mcp/issues/25)) ([5bcd8ba](https://github.com/shigechika/entraadm-mcp/commit/5bcd8baf7ac838d2382504015b21f20196a74ab8))
+
 ## [1.5.0](https://github.com/shigechika/entraadm-mcp/compare/v1.4.0...v1.5.0) (2026-10-24)
 
 
