@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/shigechika/entraadm-mcp/compare/v1.4.0...v1.5.0) (2026-10-24)
+
+
+### Features
+
+* add opt-in revoke_sign_in_sessions tool ([#23](https://github.com/shigechika/entraadm-mcp/issues/23)) ([7deb029](https://github.com/shigechika/entraadm-mcp/commit/7deb0298535de883dc3d4c7d7297c5b3ab396683))
+
 ## [1.4.0](https://github.com/shigechika/entraadm-mcp/compare/v1.3.0...v1.4.0) (2026-10-22)
 
 
