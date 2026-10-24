@@ -31,6 +31,7 @@ Microsoft は Entra ID データ向けに
 | `signin_logs` | このユーザのサインインイベント。各 AADSTS エラーコードに意味の注釈付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
 | `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
+| `compromise_suspects` | 乗っ取られた疑いのあるアカウント：多数のアカウントに試行した学外の IP が入れたもの（`spray_breaches`）と，本拠の国以外からの成功（`foreign_successes`。レガシー認証なら high） |
 | `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
@@ -39,7 +40,7 @@ Microsoft は Entra ID データ向けに
 | `vm_backup_policies` | Azure VM バックアップポリシーのスケジュールと保持期間（ARM） |
 | `vm_activity` | Azure VM を再起動したのは人か Azure か：指定した時間帯のアクティビティログとリソース正常性（ARM） |
 | `m365_service_health` | Microsoft 365 のサービス状態と開いているインシデント・アドバイザリ |
-| `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
+| `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits`・`compromise_suspects`（件数と上位 5 件）を1回でまとめたサマリ |
 
 上のツールはすべて読み取り専用。状態を変えるツールは `revoke_sign_in_sessions`（1 アカウントを
 すべての場所からサインアウト。Graph `revokeSignInSessions`）の 1 本だけで、

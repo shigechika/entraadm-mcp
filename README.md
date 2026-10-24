@@ -23,7 +23,7 @@ and is not a fit for an unattended triage bot:
   server exposes one tool that lets the model construct arbitrary
   `GET`/schema-discovery calls against Microsoft Graph. That is flexible for
   a human, and awkward to put behind an allow-list for an automated triage
-  profile. entraadm-mcp exposes fourteen fixed, read-only tools instead (plus one
+  profile. entraadm-mcp exposes fifteen fixed, read-only tools instead (plus one
   opt-in write, below).
 - **No AADSTS translation.** Sign-in failures come back as raw error codes;
   triage still needs a lookup table. entraadm-mcp annotates every sign-in
@@ -43,6 +43,7 @@ and is not a fit for an unattended triage bot:
 | `signin_logs` | Why did this user's sign-in fail (or succeed), with the AADSTS code translated? |
 | `signin_failure_stats` | Tenant-wide failure aggregation: top error codes, users, apps, source IPs, and password-spray suspects |
 | `signin_success_stats` | Tenant-wide success aggregation by source IP: IPs shared by several accounts, legacy-auth (SMTP/IMAP) successes — the view that finds a breach |
+| `compromise_suspects` | Which accounts were probably taken over: an outside IP that sprayed many accounts and got into some (`spray_breaches`), and successes from outside the home countries (`foreign_successes`, high when over a legacy protocol) |
 | `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when? |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
@@ -51,7 +52,7 @@ and is not a fit for an unattended triage bot:
 | `vm_backup_policies` | What schedule and retention do the Azure VM backup policies have? (ARM) |
 | `vm_activity` | Did someone restart this Azure VM, or did Azure (host failure, maintenance)? Activity log and Resource Health for a time window (ARM) |
 | `m365_service_health` | Is a Microsoft 365 service degraded, and which incidents and advisories are open? |
-| `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
+| `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats`, `directory_audits` and `compromise_suspects` (counts and top 5) |
 
 Every tool above is read-only. One state-changing tool exists and is off by
 default:
@@ -99,7 +100,7 @@ different auth mode than intended.
 | Tool(s) | Permission | Notes |
 |---|---|---|
 | `get_user` (base fields) | `User.Read.All` | |
-| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
+| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `compromise_suspects`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` | Under delegated auth the signed-in user also needs an Entra role that may read service health (for example Service Support Administrator or Global Reader) |
 | `revoke_sign_in_sessions` (opt-in) | `User.RevokeSessions.All` (app-only) or the **User Administrator** / **Helpdesk Administrator** directory role (delegated; **Privileged Authentication Administrator** for an administrator account) | Only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`. A write permission: grant it only to a deployment that needs the tool. The account lookup before it needs `User.Read.All`. Without the permission the tool answers `missing_permission` for the auth mode in use and nothing changes |
@@ -153,6 +154,9 @@ export ENTRAADM_DEADLINE=45
 # Your own address ranges (NAT egress, offices, labs). Spray suspects inside them are
 # listed separately as internal_spray_suspects, labelled with the site.
 export ENTRAADM_SITES_INI=/path/to/sites.ini
+# The countries your users sign in from (assigned ISO 3166-1 alpha-2 codes). compromise_suspects
+# reports successes from elsewhere; unset or with an invalid code, that list is skipped.
+export ENTRAADM_HOME_COUNTRIES=JP
 # Register revoke_sign_in_sessions, the one state-changing tool (exactly "1"; anything
 # else leaves it off). Also needs the User.RevokeSessions.All permission.
 export ENTRAADM_ENABLE_REVOKE_SESSIONS=1
@@ -227,7 +231,7 @@ Routing:
   or a B2B guest whose sign-ins are logged in the host tenant.
   `revoke_sign_in_sessions` has no such override on purpose: a write is only
   ever aimed at the tenant that owns the UPN's domain.
-- A tenant-wide tool (`signin_failure_stats`, `signin_success_stats`,
+- A tenant-wide tool (`signin_failure_stats`, `signin_success_stats`, `compromise_suspects`,
   `signin_by_ip`, `directory_audits`, `m365_service_health`) takes an optional
   `tenant`; default the default tenant. `directory_audits` with both `tenant`
   and a `user` whose domain another tenant claims is refused (it would search

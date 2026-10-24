@@ -152,6 +152,11 @@ PROBES: dict[str, Probe] = {
         require_keys=("window_hours", "capped", "total_failures", "top_error_codes", "spray_suspects"),
         allow_empty=True,
     ),
+    "compromise_suspects": Probe(
+        args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES},
+        require_keys=("window_hours", "capped", "home_countries", "counts", "spray_breaches", "foreign_successes"),
+        allow_empty=True,
+    ),
     "signin_by_ip": Probe(
         args={"hours": WINDOW_HOURS, "max_pages": MAX_PAGES, "top": 5},
         args_factory=_test_net_ip_arg,

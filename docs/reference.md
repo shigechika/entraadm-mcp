@@ -35,7 +35,7 @@ but the valid ranges are still used.
 | Tool(s) | Permission |
 |---|---|
 | `get_user` (base fields) | `User.Read.All` |
-| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
+| `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `compromise_suspects`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` (delegated auth also needs an Entra role that may read service health, e.g. Service Support Administrator or Global Reader) |
 | `revoke_sign_in_sessions` (opt-in, `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`) | `User.RevokeSessions.All` (app-only) or the User Administrator / Helpdesk Administrator directory role (delegated; Privileged Authentication Administrator for an administrator account). A write permission; grant it only where the tool is enabled. The lookup before it needs `User.Read.All` |
@@ -142,6 +142,36 @@ reading `shared_ips` as a breach. Same log walk and `capped` semantics as
 `signin_failure_stats`; like it, this scans interactive sign-ins only (every
 legacy-protocol authentication is logged as interactive; non-interactive
 token refreshes are not counted).
+
+### `compromise_suspects(hours=24, tenant=None, min_spray_users=5, max_pages=None)`
+
+Turns one walk of the interactive sign-in log into "this account was probably
+taken over" findings, both from EXTERNAL IPs (outside `ENTRAADM_SITES_INI`;
+without it every IP is external). `spray_breaches`: an IP with credential
+failures (wrong password, unknown, locked or disabled account; not MFA
+prompts, interrupts or Conditional Access blocks, which follow a correct
+password) for `min_spray_users` or more distinct accounts and a success as at
+least one, one row per account and IP with `failed_distinct_users`,
+first/last success, client apps, countries and `legacy_auth`. `high`, or
+`medium` with a `note` when the internal ranges are not loaded
+(`internal_ranges_known: false`: the tenant's own NAT egress could look like a
+spray source).
+`foreign_successes`: successes from a country outside
+`ENTRAADM_HOME_COUNTRIES` (assigned ISO 3166-1 alpha-2 codes, e.g. `JP`; one
+invalid code disables the list and sets `home_countries.error`), per account
+with countries, the 10 most used IPs with counts, client apps, first/last and
+`home_success_in_window` (null when not seen in a capped scan); `high` when a
+legacy protocol was used or the account is also a high spray breach, else
+`medium`; high first, then by countries and IPs. A
+success with no country is never foreign; unset home countries leave the
+list empty with `home_countries.configured: false`. `counts` are distinct
+accounts per severity (an account in both lists counts once). Lists cap at
+50 (`*_capped`); `capped` follows the walk; `how_to_read` says what to act on.
+`daily_brief` carries the counts and the top 5 of each list, from the same
+walk as its failure stats (its select adds `clientAppUsed` and `location`, so
+a deadline-bound walk can stop slightly earlier); its summary repeats
+`home_countries` configured/error and `internal_ranges_known`, and a walk
+error is reported once, in `signin_failure_stats`.
 
 ### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None, tenant=None)`
 

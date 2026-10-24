@@ -18,7 +18,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 - **固定ツールセットではなく汎用 Graph クエリツール。** 公式サーバは、モデルが任意の
   `GET`／スキーマ探索呼び出しを Microsoft Graph へ構成できる1本のツールを公開する。
   人間には柔軟だが、自動 triage プロファイル向けの許可リストには馴染みにくい。
-  entraadm-mcp は固定・読み取り専用の14ツールを公開する（ほかにオプトインの書き込みが 1 本。下記）
+  entraadm-mcp は固定・読み取り専用の15ツールを公開する（ほかにオプトインの書き込みが 1 本。下記）
 - **AADSTS の意味翻訳がない。** サインイン失敗は生のエラーコードのまま返ってきて、
   triage には結局ルックアップが必要になる。entraadm-mcp は全てのサインイン失敗に
   コードの意味を注釈する
@@ -36,6 +36,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `signin_logs` | このユーザのサインインがなぜ失敗（または成功）したか、AADSTS コードの意味付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
 | `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
+| `compromise_suspects` | 乗っ取られた疑いのあるアカウント：多数のアカウントに試行した学外の IP が入れたもの（`spray_breaches`）と，本拠の国以外からの成功（`foreign_successes`。レガシー認証なら high） |
 | `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
@@ -44,7 +45,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `vm_backup_policies` | Azure VM のバックアップポリシーのスケジュールと保持期間（ARM） |
 | `vm_activity` | この Azure VM を再起動したのは人か Azure（ホスト障害・メンテナンス）か。指定した時間帯のアクティビティログとリソース正常性（ARM） |
 | `m365_service_health` | Microsoft 365 のサービスが劣化していないか、どのインシデント・アドバイザリが開いているか |
-| `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
+| `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits`・`compromise_suspects`（件数と上位 5 件）を1回でまとめたサマリ |
 
 上のツールはすべて読み取り専用。状態を変えるツールが 1 本だけあり、既定では無効:
 
@@ -84,7 +85,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | ツール | 権限 | 備考 |
 |---|---|---|
 | `get_user`（基本フィールド） | `User.Read.All` | |
-| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
+| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`compromise_suspects`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All` | delegated 認証ではサインインしたユーザにサービス正常性を読める Entra ロール（Service Support Administrator や Global Reader 等）も必要 |
 | `revoke_sign_in_sessions`（オプトイン） | `User.RevokeSessions.All`（app-only）または **User Administrator**／**Helpdesk Administrator** ディレクトリロール（delegated。管理者アカウントが対象なら **Privileged Authentication Administrator**） | `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ。書き込みの権限なので、このツールが要る配備にだけ付与する。先に行うアカウントの照会には `User.Read.All` が要る。無ければ認証方式に応じた `missing_permission` を返し、何も変わらない |
@@ -133,6 +134,9 @@ export ENTRAADM_DEADLINE=45
 # 自組織のアドレス範囲（NAT の出口・事業所・実習室など）。この範囲のスプレー疑いは
 # internal_spray_suspects に拠点名付きで分けて出す
 export ENTRAADM_SITES_INI=/path/to/sites.ini
+# 利用者がサインインする国（実在の ISO 3166-1 alpha-2）。compromise_suspects はそれ以外からの
+# 成功を報告する。未設定か不正なコードがあればその一覧は飛ばす
+export ENTRAADM_HOME_COUNTRIES=JP
 # 状態を変える唯一のツール revoke_sign_in_sessions を登録する（ちょうど "1" のときだけ。
 # ほかの値では無効）。User.RevokeSessions.All の権限も要る
 export ENTRAADM_ENABLE_REVOKE_SESSIONS=1
@@ -199,7 +203,7 @@ https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
 - `get_user`・`get_user_auth_methods`・`signin_logs` は `tenant` も取り，UPN のドメインより優先する。
   `*.onmicrosoft.com` や `#EXT#` の UPN，ホストのテナントに記録される B2B ゲストのサインインに使う。
   `revoke_sign_in_sessions` には意図的にこの上書きが無い。書き込みは UPN のドメインを持つテナントにしか向かない。
-- テナント全体を見るツール（`signin_failure_stats`・`signin_success_stats`・`signin_by_ip`・
+- テナント全体を見るツール（`signin_failure_stats`・`signin_success_stats`・`compromise_suspects`・`signin_by_ip`・
   `directory_audits`・`m365_service_health`）は省略可の `tenant` を取る。省略すると既定のテナント。
   `directory_audits` で `tenant` と，ほかのテナントが持つドメインの `user` を両方指定すると拒否する
   （違うログを探して何も見つからないため）。どのテナントも持たないドメインの `user`（外部・パートナーの

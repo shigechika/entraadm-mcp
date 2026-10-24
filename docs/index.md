@@ -36,6 +36,7 @@ and not a fit for an unattended triage bot:
 | `signin_logs` | One user's sign-in events, each AADSTS error code annotated with what it means |
 | `signin_failure_stats` | Tenant-wide failure aggregation: top error codes, users, apps, source IPs, and password-spray suspects |
 | `signin_success_stats` | Tenant-wide success aggregation by source IP: IPs shared by several accounts, legacy-auth (SMTP/IMAP) successes — the view that finds a breach |
+| `compromise_suspects` | Which accounts were probably taken over: an outside IP that sprayed many accounts and got into some (`spray_breaches`), and successes from outside the home countries (`foreign_successes`, high when over a legacy protocol) |
 | `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
@@ -44,7 +45,7 @@ and not a fit for an unattended triage bot:
 | `vm_backup_policies` | Schedule and retention of the Azure VM backup policies (ARM) |
 | `vm_activity` | Who or what restarted an Azure VM: activity log and Resource Health for a time window (ARM) |
 | `m365_service_health` | Microsoft 365 service status and the open incidents and advisories |
-| `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
+| `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats`, `directory_audits` and `compromise_suspects` (counts and top 5) |
 
 All tools above are read-only. The one state-changing tool,
 `revoke_sign_in_sessions` (sign one account out everywhere: Graph

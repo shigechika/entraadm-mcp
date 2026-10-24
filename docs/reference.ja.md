@@ -31,7 +31,7 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 | ツール | 権限 |
 |---|---|
 | `get_user`（基本フィールド） | `User.Read.All` |
-| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
+| `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`compromise_suspects`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All`（delegated 認証ではサービス正常性を読める Entra ロール——Service Support Administrator や Global Reader 等——も必要） |
 | `revoke_sign_in_sessions`（オプトイン、`ENTRAADM_ENABLE_REVOKE_SESSIONS=1`） | `User.RevokeSessions.All`（app-only）または User Administrator／Helpdesk Administrator ディレクトリロール（delegated。管理者アカウントが対象なら Privileged Authentication Administrator）。書き込みの権限なので、このツールを有効にする配備にだけ付与する。先に行う照会には `User.Read.All` が要る |
@@ -125,6 +125,29 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 `shared_ips` を読むこと。ログ走査と `capped` の扱いは `signin_failure_stats` と同じで、
 対話型サインインだけを見る（レガシー認証はすべて対話型として記録されるので漏れない。
 非対話型のトークン更新は数えない）。
+
+### `compromise_suspects(hours=24, tenant=None, min_spray_users=5, max_pages=None)`
+
+対話型サインインのログを 1 回走査し，「乗っ取られた疑い」を出す。どちらも学外の IP
+（`ENTRAADM_SITES_INI` の範囲の外。ファイルが無ければすべて学外）が対象。
+`spray_breaches`: 資格情報の失敗（パスワード違い・存在しない・ロック・無効のアカウント。正しい
+パスワードの後に起きる MFA の要求・中断・条件付きアクセスの拒否は含めない）が `min_spray_users` 人
+以上の異なるアカウントであり，かつ 1 アカウント以上で成功した IP。`high`。ただし学内範囲が
+読めていなければ（`internal_ranges_known: false`）自組織の NAT の出口が試行元に見えうるので，
+`note` を付けて `medium`。アカウントと IP の組ごとに `failed_distinct_users`・
+最初と最後の成功・クライアントアプリ・国・`legacy_auth` を返す。`foreign_successes`:
+`ENTRAADM_HOME_COUNTRIES`（実在の ISO 3166-1 alpha-2，例 `JP`。不正なコードが 1 つでもあれば
+一覧を止めて `home_countries.error` を出す）以外の国からの成功をアカウントごとにまとめ，国・
+よく使われた IP 10 件と回数・クライアントアプリ・最初と最後・`home_success_in_window`
+（打ち切られた走査で見えなければ null）を返す。レガシー認証を使ったか high の spray breach にも
+あれば `high`，それ以外は `medium`。high を先に，
+次に国と IP の多い順。国の無い成功は国外と見なさない。本拠の国が未設定なら一覧は空で
+`home_countries.configured: false`。`counts` は重大度ごとのアカウント数（両方にあれば high で
+1 回）。一覧は 50 件まで（`*_capped`），`capped` は走査に従い，`how_to_read` に対処の目安を
+書く。`daily_brief` は件数と各一覧の上位 5 件を，失敗の集計と同じ走査から載せる（取得項目に
+`clientAppUsed` と `location` が加わるので，期限で止まる走査は少し早く止まりうる）。summary にも
+`home_countries` の configured／error と `internal_ranges_known` を載せ，走査のエラーは
+`signin_failure_stats` に 1 回だけ出す。
 
 ### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None, tenant=None)`
 
