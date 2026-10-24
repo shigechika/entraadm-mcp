@@ -168,6 +168,19 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   lives in `_compromise()` over rows from `_fetch_signins()`, so
   `daily_brief` feeds it and `_failure_stats()` from ONE walk of the
   sign-in log; keep it that way rather than adding a second walk.
+- **Identity Protection is probed, never assumed.** `_identity_protection_status()`
+  classifies `riskyUsers?$top=1` per tenant: `licensed` / `not_licensed`
+  (403 whose API message says "not licensed": no Entra ID P2) /
+  `no_permission` (any other 403) / `error`; definite answers are cached in
+  `_ip_cache` for `_IP_PROBE_TTL_SECONDS` (errors are not). It needs the raw
+  403 message, which `_parse` keeps on `ApiPermissionError.code` /
+  `.api_message` (the translated `str(e)` loses it). `/subscribedSkus` is not
+  used (needs a permission this server does not ask for). `not_licensed` is
+  reported (health_check, daily_brief summary, `microsoft_risky_users:
+  {available: false, reason}`) and never read as "no risky users"; it never
+  changes `status` or the existing counts. `_merge_microsoft_risk()` adds
+  the licensed path to compromise_suspects; tests' `FakeGraphClient`
+  answers riskyUsers with "not licensed" by default, like the real tenants.
 - `daily_brief` carries `m365_service_health` and not VM backup. Service
   health is two small reads and runs first; the ARM fan-out is the one scan
   that could exhaust the shared budget, so callers invoke `vm_backup_status`

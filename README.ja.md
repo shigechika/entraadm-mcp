@@ -36,7 +36,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `signin_logs` | このユーザのサインインがなぜ失敗（または成功）したか、AADSTS コードの意味付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
 | `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
-| `compromise_suspects` | 乗っ取られた疑いのあるアカウント：多数のアカウントに試行した学外の IP が入れたもの（`spray_breaches`）と，本拠の国以外からの成功（`foreign_successes`。レガシー認証なら high） |
+| `compromise_suspects` | 乗っ取られた疑いのあるアカウント：多数のアカウントに試行した学外の IP が入れたもの（`spray_breaches`），本拠の国以外からの成功（`foreign_successes`。レガシー認証なら high），Entra ID P2 があれば Microsoft の危険ユーザー |
 | `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
@@ -88,6 +88,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`compromise_suspects`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All` | delegated 認証ではサインインしたユーザにサービス正常性を読める Entra ロール（Service Support Administrator や Global Reader 等）も必要 |
+| `compromise_suspects` の `microsoft_risky_users`、`identity_protection` の確認（health_check・daily_brief） | `IdentityRiskyUser.Read.All` | 任意。Identity Protection には **Entra ID P2** が要る。無ければ Graph が 403「not licensed」を返し，確認は `not_licensed` を報告する。ほかは何も変わらない |
 | `revoke_sign_in_sessions`（オプトイン） | `User.RevokeSessions.All`（app-only）または **User Administrator**／**Helpdesk Administrator** ディレクトリロール（delegated。管理者アカウントが対象なら **Privileged Authentication Administrator**） | `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ。書き込みの権限なので、このツールが要る配備にだけ付与する。先に行うアカウントの照会には `User.Read.All` が要る。無ければ認証方式に応じた `missing_permission` を返し、何も変わらない |
 
 ### 必要な Azure RBAC
@@ -103,6 +104,18 @@ Azure RBAC は任意。`health_check` は ARM の到達性と見えるサブス�
 権限不足でツールがクラッシュすることはない。該当ツール（または該当フィールド）だけが
 `{"error": "...", "missing_permission": "..."}` に劣化し、必要なロール・権限を
 人間可読の文言で示す。フル権限が付与される前でも `health_check` を含む全ツールが使える。
+
+
+**Identity Protection（Entra ID P2）。** `compromise_suspects` は，テナントが使えれば Microsoft 自身の
+危険度の判定も加える。`riskyUsers?$top=1` の軽い確認で，テナントごとに `licensed`・`not_licensed`
+（403「not licensed」。Entra ID P2 が無い）・`no_permission`（ほかの 403。`IdentityRiskyUser.Read.All` が
+無い）・`error` に分け，1 時間覚えておく（`/subscribedSkus` は，このサーバが求めない権限が要るので使わない）。
+`health_check` はテナントごとに報告するが `status` は変えず，`daily_brief` の summary にもテナントごとに
+載せるので，P2 が入った日に気づける。使えるときは `microsoft_risky_users` に，危険が続いている
+（`atRisk`／`confirmedCompromised`）high のユーザーと，別に medium を並べ，`spray_breaches`／
+`foreign_successes` にもいるかを印す。Microsoft の high は `high` に数える（`counts.microsoft_high`／
+`microsoft_medium`）。使えなければ節は `{available: false, reason}` だけで，ほかは何も変わらない。
+「危険なユーザーはいない」と読まないこと。
 
 ## セットアップ
 

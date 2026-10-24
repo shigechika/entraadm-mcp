@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "entraadm-mcp",
   "displayName": "entraadm-mcp",
-  "description": "Microsoft Entra ID sign-in and audit-log triage MCP for Claude Code. Investigate why a sign-in failed (AADSTS-annotated), tenant-wide failure trends and password-spray suspects, who changed what in the directory, and whether MFA is registered for an account, plus a one-shot daily_brief. Read-only by default; the one write tool (revoke_sign_in_sessions) is registered only when ENTRAADM_ENABLE_REVOKE_SESSIONS=1. Needs either app-only credentials (ENTRAADM_TENANT_ID/_CLIENT_ID/_CLIENT_SECRET) or an existing `az login` session already present on the machine; the plugin cannot create or supply those for you.",
+  "description": "Microsoft Entra ID sign-in and audit-log triage MCP for Claude Code. Investigate why a sign-in failed (AADSTS-annotated), tenant-wide failure trends and password-spray suspects, accounts that were probably taken over (plus Microsoft's risky users when the tenant has Entra ID P2), who changed what in the directory, and whether MFA is registered for an account, plus a one-shot daily_brief. Read-only by default; the one write tool (revoke_sign_in_sessions) is registered only when ENTRAADM_ENABLE_REVOKE_SESSIONS=1. Needs either app-only credentials (ENTRAADM_TENANT_ID/_CLIENT_ID/_CLIENT_SECRET) or an existing `az login` session already present on the machine; the plugin cannot create or supply those for you.",
   "author": {
     "name": "AIKAWA Shigechika",
     "url": "https://github.com/shigechika"

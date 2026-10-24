@@ -58,6 +58,8 @@ class ApiError(Exception):
     def __init__(self, *args, may_have_applied: bool = False):
         super().__init__(*args)
         self.may_have_applied = may_have_applied
+        self.code = ""
+        self.api_message = ""
 
 
 class ApiDeadline(ApiError):
@@ -87,6 +89,8 @@ class ApiAuthError(ApiError):
 
 class ApiPermissionError(ApiError):
     """The API rejected the request because the caller lacks a required permission or role.
+
+    ``code`` and ``api_message`` keep the API's own error code and message (empty when absent).
 
     The message is a human-readable translation of the API's error code (see
     _translate_permission_error / _translate_arm_permission_error), not the
@@ -447,7 +451,13 @@ class _RestClient:
                 body = resp.json()
             except ValueError:
                 body = {}
-            raise ApiPermissionError(self._translate_403(body))
+            error = ApiPermissionError(self._translate_403(body))
+            # The API's own code and message, for callers that must tell one 403 from another
+            # (Identity Protection answers "not licensed" with a 403 too).
+            raw = _error_of(body)
+            error.code = str(raw.get("code") or "")
+            error.api_message = str(raw.get("message") or "")
+            raise error
         if resp.status_code >= 400:
             try:
                 body = resp.json()

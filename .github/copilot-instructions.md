@@ -40,6 +40,10 @@ must stay distinguishable (`revoked: null` in `revoke_sign_in_sessions`).
 
 ## What to flag
 
+- **Reading Identity Protection's `not_licensed` (no Entra ID P2) as "no
+  risky users", or letting it change `status` or the existing counts.**
+  `_identity_protection_status()` must keep classifying from the API's own
+  403 message (`ApiPermissionError.api_message`), not the translated text.
 - **`compromise_suspects` calling something foreign or breached on a
   guess.** Only external IPs (outside `ENTRAADM_SITES_INI`) count; a foreign
   success needs `ENTRAADM_HOME_COUNTRIES` and a country on the row; a spray

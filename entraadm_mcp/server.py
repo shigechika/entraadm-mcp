@@ -501,6 +501,12 @@ def health_check() -> dict:
     default tenant alone can make it ``error``). ``arm`` is the default
     tenant's only. Env-only results carry neither key.
 
+    ``identity_protection`` is the Identity Protection licence probe
+    (``licensed`` / ``not_licensed`` / ``no_permission`` / ``error``, cached
+    per tenant for an hour; see ``compromise_suspects``), per tenant in
+    ``tenants`` too. Informational: ``not_licensed`` (no Entra ID P2) and
+    the rest never change ``status``.
+
     ``home_countries`` reports ENTRAADM_HOME_COUNTRIES (``configured``,
     ``countries``, ``error``), which ``compromise_suspects`` needs for its
     foreign-success finding. Informational: unset or invalid never changes
@@ -534,6 +540,7 @@ def health_check() -> dict:
             "arm": {"auth": "error", "detail": detail, "subscriptions": None, "capped": None},
             "sites": site_status,
             "home_countries": _home_status(),
+            "identity_protection": {"status": "error", "detail": detail},
         }
 
     # Every tenant's two probes share one call budget, an even share each, so an
@@ -547,6 +554,8 @@ def health_check() -> dict:
     default_deadline = tenant_deadline()
     graph = client.check(deadline=default_deadline)
     signin_probe = client.probe_signin_access(deadline=default_deadline)
+    with _in_tenant(tenants.default.name):
+        identity_protection = _identity_protection_status(default_deadline)
     arm = _arm().check(deadline=time.monotonic() + _ARM_PROBE_SECONDS)
     status = _probe_status(graph, signin_probe)
     if status == "healthy" and site_status["error"] is not None:
@@ -562,6 +571,7 @@ def health_check() -> dict:
         "arm": arm,
         "sites": site_status,
         "home_countries": _home_status(),
+        "identity_protection": identity_protection,
     }
     if not tenants.from_file:
         return result
@@ -569,7 +579,7 @@ def health_check() -> dict:
     per_tenant = {}
     for t in tenants.tenants:
         if t.name == tenants.default.name:
-            mode, t_graph, t_signin = client.mode, graph, signin_probe
+            mode, t_graph, t_signin, t_ip = client.mode, graph, signin_probe, identity_protection
         else:
             with _in_tenant(t.name):
                 other = _client()
@@ -577,6 +587,7 @@ def health_check() -> dict:
                 own_deadline = tenant_deadline()
                 t_graph = other.check(deadline=own_deadline)
                 t_signin = other.probe_signin_access(deadline=own_deadline)
+                t_ip = _identity_protection_status(own_deadline)
         per_tenant[t.name] = {
             "default": t.default,
             "domains": list(t.domains),
@@ -584,6 +595,7 @@ def health_check() -> dict:
             "status": _probe_status(t_graph, t_signin),
             "graph": t_graph,
             "signin_probe": t_signin,
+            "identity_protection": t_ip,
         }
     others_ok = all(v["status"] == "healthy" for k, v in per_tenant.items() if k != tenants.default.name)
     if result["status"] == "healthy" and not others_ok:
@@ -1595,6 +1607,132 @@ def _int_arg(name: str, value: Any) -> int | dict:
         return {"error": f"{name} must be an integer (got {value!r})"}
 
 
+# ---------------------------------------------------------------------------
+# Identity Protection (Entra ID P2): licence probe and Microsoft's risky users
+# ---------------------------------------------------------------------------
+
+#: How long a definite probe answer (licensed / not_licensed / no_permission) is kept, per tenant.
+_IP_PROBE_TTL_SECONDS = 3600.0
+_IP_RISKY_LIMIT = 50
+#: tenant name -> (time.monotonic() of the probe, status dict)
+_ip_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _ip_tenant_key() -> str:
+    try:
+        return _current_tenant().name
+    except ConfigError:
+        return ""
+
+
+def _identity_protection_status(deadline: float | None) -> dict:
+    """Whether this tenant can use Identity Protection, by probing ``riskyUsers?$top=1``.
+
+    ``status``: ``licensed`` (200), ``not_licensed`` (403 saying the tenant is
+    not licensed: Entra ID P2 is missing), ``no_permission`` (any other 403:
+    the app lacks IdentityRiskyUser.Read.All), or ``error`` (anything else,
+    including the deadline). Licensing is probed here rather than read from
+    ``/subscribedSkus``, which needs a permission this server does not ask
+    for. Definite answers are cached per tenant for an hour; ``error`` is not.
+    """
+    key = _ip_tenant_key()
+    cached = _ip_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _IP_PROBE_TTL_SECONDS:
+        return cached[1]
+    try:
+        _client().get("/identityProtection/riskyUsers", params={"$top": 1}, deadline=deadline)
+        status = {"status": "licensed", "detail": None}
+    except GraphPermissionError as e:
+        if "not licensed" in (getattr(e, "api_message", "") or str(e)).lower():
+            status = {"status": "not_licensed", "detail": "Identity Protection needs Entra ID P2"}
+        else:
+            status = {"status": "no_permission", "detail": f"{e} (needs IdentityRiskyUser.Read.All)"}
+    except (ConfigError, GraphError) as e:
+        return {"status": "error", "detail": str(e)}
+    _ip_cache[key] = (time.monotonic(), status)
+    return status
+
+
+_RISKY_SELECT = "userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime"
+_RISKY_STATES = {"atRisk", "confirmedCompromised"}
+
+
+def _risky_users(level: str, deadline: float | None) -> tuple[list[dict], bool]:
+    """Risky users at ``level`` whose risk is still open (atRisk / confirmedCompromised), newest first."""
+    rows, capped = _client().get_paged(
+        "/identityProtection/riskyUsers",
+        params={"$filter": f"riskLevel eq microsoft.graph.riskLevel'{level}'", "$select": _RISKY_SELECT},
+        max_pages=_resolve_max_pages(None),
+        deadline=deadline,
+    )
+    open_rows = [
+        {
+            "user_principal_name": r.get("userPrincipalName"),
+            "risk_level": r.get("riskLevel"),
+            "risk_state": r.get("riskState"),
+            "risk_detail": r.get("riskDetail"),
+            "risk_last_updated": r.get("riskLastUpdatedDateTime"),
+        }
+        for r in rows
+        if r.get("riskState") in _RISKY_STATES
+    ]
+    open_rows.sort(key=lambda r: _ts(r["risk_last_updated"] or ""), reverse=True)
+    return open_rows, capped
+
+
+def _merge_microsoft_risk(result: dict) -> dict:
+    """Add ``microsoft_risky_users`` to a compromise_suspects result (in place) and return it.
+
+    Not licensed (or no permission, or the probe failed): the section is
+    ``{"available": false, "reason": ...}`` and nothing else changes -- that
+    is never read as "no risky users". Licensed: Microsoft's open high-risk
+    users (and, separately, medium) with whether each is also in
+    ``spray_breaches`` / ``foreign_successes``; Microsoft high-risk accounts
+    count as ``high`` in ``counts`` (``counts.microsoft_high`` /
+    ``microsoft_medium`` say how many).
+    """
+    deadline = _current_deadline()
+    probe = _identity_protection_status(deadline)
+    if probe["status"] != "licensed":
+        result["microsoft_risky_users"] = {"available": False, "reason": probe["status"], "detail": probe["detail"]}
+        return result
+    try:
+        high, high_capped = _risky_users("high", deadline)
+        medium, medium_capped = _risky_users("medium", deadline)
+    except GraphPermissionError as e:
+        result["microsoft_risky_users"] = {"available": False, "reason": "no_permission", "detail": str(e)}
+        return result
+    except GraphError as e:
+        result["microsoft_risky_users"] = {"available": True, "error": str(e)}
+        return result
+    breached = {b["user_principal_name"] for b in result["spray_breaches"]}
+    foreign = {f["user_principal_name"] for f in result["foreign_successes"]}
+    for row in high + medium:
+        row["in_spray_breaches"] = row["user_principal_name"] in breached
+        row["in_foreign_successes"] = row["user_principal_name"] in foreign
+    result["microsoft_risky_users"] = {
+        "available": True,
+        "high": high[:_IP_RISKY_LIMIT],
+        "high_capped": high_capped or len(high) > _IP_RISKY_LIMIT,
+        "medium": medium[:_IP_RISKY_LIMIT],
+        "medium_capped": medium_capped or len(medium) > _IP_RISKY_LIMIT,
+    }
+    counts = result["counts"]
+    high_upns = {r["user_principal_name"] for r in high if r["user_principal_name"]}
+    medium_upns = {r["user_principal_name"] for r in medium if r["user_principal_name"]} - high_upns
+    counts["microsoft_high"] = len(high_upns)
+    counts["microsoft_medium"] = len(medium_upns)
+    already_high = {b["user_principal_name"] for b in result["spray_breaches"] if b["severity"] == "high"}
+    already_high |= {f["user_principal_name"] for f in result["foreign_successes"] if f["severity"] == "high"}
+    new_high = high_upns - already_high
+    counts["high"] += len(new_high)
+    # an account Microsoft calls high that this tool had as medium moves to high
+    moved = {b["user_principal_name"] for b in result["spray_breaches"] if b["severity"] == "medium"}
+    moved |= {f["user_principal_name"] for f in result["foreign_successes"] if f["severity"] == "medium"}
+    counts["medium"] -= len(moved & new_high)
+    return result
+
+
 @mcp.tool()
 @_tenant_scoped()
 def compromise_suspects(
@@ -1654,7 +1792,7 @@ def compromise_suspects(
     fetched = _fetch_signins(hours, max_pages, _SUCCESS_SELECT)
     if isinstance(fetched, dict):
         return fetched
-    return _compromise(*fetched, hours, min_spray_users)
+    return _merge_microsoft_risk(_compromise(*fetched, hours, min_spray_users))
 
 
 # ---------------------------------------------------------------------------
@@ -3077,7 +3215,7 @@ def _brief(hours: int, max_pages: int | None) -> dict:
         stats, suspects = fetched, {"error": "sign-in log not read; see signin_failure_stats"}
     else:
         stats = _failure_stats(*fetched, hours)
-        suspects = _brief_suspects(_compromise(*fetched, hours, _SPRAY_MIN_DISTINCT_USERS))
+        suspects = _brief_suspects(_merge_microsoft_risk(_compromise(*fetched, hours, _SPRAY_MIN_DISTINCT_USERS)))
     try:
         from_file = _tenants().from_file
     except ConfigError:
@@ -3110,6 +3248,8 @@ def _brief(hours: int, max_pages: int | None) -> dict:
         if stats["sites"]["error"] is not None:
             summary["sites_error"] = stats["sites"]["error"]
 
+    # So that the day Entra ID P2 appears (or its permission goes missing) is noticed.
+    summary["identity_protection"] = _identity_protection_status(_current_deadline())["status"]
     if "error" in suspects:
         summary["compromise_suspects"] = {"error": "see sign_in_failures"}
     else:
@@ -3156,7 +3296,21 @@ def _brief_suspects(full: dict) -> dict:
         "foreign_successes_capped": (
             len(full["foreign_successes"]) > _BRIEF_SUSPECTS_TOP or full["foreign_successes_capped"]
         ),
+        "microsoft_risky_users": _brief_risky(full["microsoft_risky_users"]),
         "how_to_read": full["how_to_read"],
+    }
+
+
+def _brief_risky(section: dict) -> dict:
+    """microsoft_risky_users cut down for daily_brief: unavailable as is, else the top high entries."""
+    if not section.get("available") or "error" in section:
+        return section
+    return {
+        "available": True,
+        "high": section["high"][:_BRIEF_SUSPECTS_TOP],
+        "high_capped": len(section["high"]) > _BRIEF_SUSPECTS_TOP or section["high_capped"],
+        "medium_count": len(section["medium"]),
+        "medium_capped": section["medium_capped"],
     }
 
 
