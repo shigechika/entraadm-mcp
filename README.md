@@ -128,13 +128,18 @@ are granted.
 risk verdicts when the tenant has them: a cheap `riskyUsers?$top=1` probe
 classifies each tenant as `licensed`, `not_licensed` (403 "not licensed": no
 Entra ID P2), `no_permission` (other 403: no `IdentityRiskyUser.Read.All`) or
-`error`, cached for an hour (`/subscribedSkus` is not used: it needs a
-permission this server does not ask for). `health_check` reports it per tenant
+`error`; `licensed` and `not_licensed` are cached for an hour (a 200 whose rows
+say `riskLevel: hidden` also means no P2). The endpoint itself is probed:
+`/subscribedSkus` can be refused and a SKU list would still have to be mapped to
+P2. `health_check` reports it per tenant
 without changing `status`, and `daily_brief`'s summary per tenant, so the day
 P2 appears is noticed. Licensed: `microsoft_risky_users` lists open
 (`atRisk` / `confirmedCompromised`) high-risk users and, separately, medium,
-marking those also in `spray_breaches` / `foreign_successes`; Microsoft's high
-counts as `high` (`counts.microsoft_high` / `microsoft_medium`). Otherwise the
+marking those also in `spray_breaches` / `foreign_successes`. `counts` are then
+distinct accounts over every finding, before the lists are cut: `high` is any
+account high here or in Microsoft's high list, `medium` any medium here or in
+Microsoft's medium list that is not high (`counts.microsoft_high` /
+`microsoft_medium` say how many Microsoft lists). Otherwise the
 section is `{available: false, reason}` and nothing else changes -- never read
 it as "no risky users".
 

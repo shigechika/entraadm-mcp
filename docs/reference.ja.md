@@ -150,12 +150,15 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 **Identity Protection（Entra ID P2）。** `compromise_suspects` は，テナントが使えれば Microsoft 自身の
 危険度の判定も加える。`riskyUsers?$top=1` の軽い確認で，テナントごとに `licensed`・`not_licensed`
 （403「not licensed」。Entra ID P2 が無い）・`no_permission`（ほかの 403。`IdentityRiskyUser.Read.All` が
-無い）・`error` に分け，1 時間覚えておく（`/subscribedSkus` は，このサーバが求めない権限が要るので使わない）。
+無い）・`error` に分け，`licensed` と `not_licensed` だけを 1 時間覚えておく（200 でも行の `riskLevel` が `hidden`
+なら P2 が無い）。`/subscribedSkus` は拒まれることがあり，SKU の一覧から P2 を読み取る必要も残るので，
+エンドポイントそのものを確かめる。
 `health_check` はテナントごとに報告するが `status` は変えず，`daily_brief` の summary にもテナントごとに
 載せるので，P2 が入った日に気づける。使えるときは `microsoft_risky_users` に，危険が続いている
 （`atRisk`／`confirmedCompromised`）high のユーザーと，別に medium を並べ，`spray_breaches`／
-`foreign_successes` にもいるかを印す。Microsoft の high は `high` に数える（`counts.microsoft_high`／
-`microsoft_medium`）。使えなければ節は `{available: false, reason}` だけで，ほかは何も変わらない。
+`foreign_successes` にもいるかを印す。そのとき `counts` は，一覧を切る前の全アカウントを重複なしで数える。
+`high` はこのツールか Microsoft の high にいるアカウント，`medium` はこのツールか Microsoft の medium にいて
+high でないアカウント（`counts.microsoft_high`／`microsoft_medium` は Microsoft の一覧の人数）。使えなければ節は `{available: false, reason}` だけで，ほかは何も変わらない。
 「危険なユーザーはいない」と読まないこと。
 
 書く。`daily_brief` は件数と各一覧の上位 5 件を，失敗の集計と同じ走査から載せる（取得項目に
