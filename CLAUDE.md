@@ -4,7 +4,7 @@
 
 MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
 plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
-service health. Transport is stdio only. The 14 default tools are read-only;
+service health. Transport is stdio only. The 15 default tools are read-only;
 one state-changing tool, `revoke_sign_in_sessions`, is registered only when
 `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (see Conventions). Auth is env-var driven
 for one tenant; the optional `ENTRAADM_CONFIG` INI file (`[tenant.<name>]`
@@ -67,7 +67,7 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   stack trace. 429 retries once (respecting `Retry-After`); 5xx retries twice
   with exponential backoff. `credential`/`http_client` constructor params
   are `# injectable for tests` (respx-mocked httpx, a stub credential).
-- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 14 tools.
+- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 15 tools (16 with the opt-in revoke).
   `AADSTS_CODES` is a hand-maintained dict (not exhaustive) annotating
   sign-in failure codes; missing codes return `meaning: null`, never hidden.
   `_state = {"client": None, "arm": None}` holds the two test-injection
@@ -152,6 +152,16 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `status`: Azure RBAC is optional, and a deployment used only for Entra
   triage must not sit at `degraded` forever. `--check` prints the matching
   `Info:` line without changing the exit code.
+- **`compromise_suspects` reports, it never guesses.** Both findings come
+  from EXTERNAL IPs only (outside `ENTRAADM_SITES_INI`). A spray breach
+  needs `min_spray_users` distinct failed accounts AND a success from the
+  same IP. A foreign success needs `ENTRAADM_HOME_COUNTRIES` (unset or
+  invalid: the list stays empty, `home_countries.configured: false`) and a
+  country on the row (no country is never foreign). `counts` are distinct
+  accounts, an account in both lists counted once as high. The aggregation
+  lives in `_compromise()` over rows from `_fetch_signins()`, so
+  `daily_brief` feeds it and `_failure_stats()` from ONE walk of the
+  sign-in log; keep it that way rather than adding a second walk.
 - `daily_brief` carries `m365_service_health` and not VM backup. Service
   health is two small reads and runs first; the ARM fan-out is the one scan
   that could exhaust the shared budget, so callers invoke `vm_backup_status`

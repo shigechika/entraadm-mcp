@@ -7,6 +7,7 @@ Tools:
   licenses, sign-in activity
 - ``signin_logs``            — one user's sign-in events, AADSTS-annotated
 - ``signin_failure_stats``   — tenant-wide failure aggregation, incl. password-spray suspects
+- ``compromise_suspects``    — probably taken-over accounts: spray sources that got in, foreign successes
 - ``directory_audits``       — who did what (block/unblock/attribute changes), and to whom
 - ``get_user_auth_methods``  — MFA registration state for one user
 - ``list_subscriptions``     — the Azure subscriptions this credential can see (ARM)
@@ -76,6 +77,7 @@ from entraadm_mcp.config import (
     TenantConfig,
     Tenants,
     deadline_seconds,
+    home_countries,
     load_tenants,
     max_pages_default,
     revoke_sessions_enabled,
@@ -499,6 +501,11 @@ def health_check() -> dict:
     default tenant alone can make it ``error``). ``arm`` is the default
     tenant's only. Env-only results carry neither key.
 
+    ``home_countries`` reports ENTRAADM_HOME_COUNTRIES (``configured``,
+    ``countries``, ``error``), which ``compromise_suspects`` needs for its
+    foreign-success finding. Informational: unset or invalid never changes
+    ``status``.
+
     ``arm`` is a third, informational probe (Azure Resource Manager
     reachable, and how many subscriptions this credential can see). It
     never moves ``status``: Azure RBAC is optional for this server, and a
@@ -526,6 +533,7 @@ def health_check() -> dict:
             "signin_probe": {"auth": "error", "detail": detail},
             "arm": {"auth": "error", "detail": detail, "subscriptions": None, "capped": None},
             "sites": site_status,
+            "home_countries": _home_status(),
         }
 
     # Every tenant's two probes share one call budget, an even share each, so an
@@ -553,6 +561,7 @@ def health_check() -> dict:
         "signin_probe": signin_probe,
         "arm": arm,
         "sites": site_status,
+        "home_countries": _home_status(),
     }
     if not tenants.from_file:
         return result
@@ -1075,15 +1084,20 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None, tenant: 
         tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
     """
     hours = _clamp_hours(hours)
-    pages_budget = _resolve_max_pages(max_pages)
-    filter_expr = f"createdDateTime ge {_since(hours)}"
+    fetched = _fetch_signins(hours, max_pages, _STATS_SELECT)
+    if isinstance(fetched, dict):
+        return fetched
+    return _failure_stats(*fetched, hours)
 
+
+def _fetch_signins(hours: int, max_pages: int | None, select: str) -> tuple[list, bool] | dict:
+    """One walk of the interactive sign-in log for the window: ``(rows, capped)``, or an error dict."""
     try:
         client = _client()
-        rows, capped = client.get_paged(
+        return client.get_paged(
             "/auditLogs/signIns",
-            params={"$filter": filter_expr, "$select": _STATS_SELECT},
-            max_pages=pages_budget,
+            params={"$filter": f"createdDateTime ge {_since(hours)}", "$select": select},
+            max_pages=_resolve_max_pages(max_pages),
             deadline=_current_deadline(),
         )
     except GraphPermissionError as e:
@@ -1091,6 +1105,9 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None, tenant: 
     except (ConfigError, GraphError) as e:
         return {"error": str(e)}
 
+
+def _failure_stats(rows: list, capped: bool, hours: int) -> dict:
+    """signin_failure_stats' aggregation of already fetched sign-in rows."""
     error_counts: collections.Counter = collections.Counter()
     user_counts: collections.Counter = collections.Counter()
     app_counts: collections.Counter = collections.Counter()
@@ -1355,6 +1372,233 @@ def signin_success_stats(
         "shared_ips": shared_ips[:_SHARED_IPS_LIMIT],
         "shared_ips_capped": len(shared_ips) > _SHARED_IPS_LIMIT,
     }
+
+
+# ---------------------------------------------------------------------------
+# compromise_suspects
+# ---------------------------------------------------------------------------
+
+_COMPROMISE_LIST_LIMIT = 50
+_COMPROMISE_IPS_LIMIT = 10
+_COMPROMISE_HOW_TO_READ = (
+    "spray_breaches are the ones to act on: an outside address that failed for many accounts got into "
+    "these. A foreign_successes entry is a lead (travel, a VPN, a cloud proxy) unless it is high: a legacy "
+    "protocol (SMTP AUTH, IMAP, POP: password only, no MFA) or the same account in spray_breaches. For "
+    "those, contain the account in every system it signs in to (the identity provider, the mail and "
+    "collaboration suites), not only here. capped=true means the window was not fully read: the lists are "
+    "a lower bound."
+)
+
+
+def _home_status() -> dict:
+    codes, error = home_countries()
+    return {"configured": codes is not None, "countries": sorted(codes or ()), "error": error}
+
+
+def _widen(span: dict, when: str) -> None:
+    """Stretch ``span``'s first/last to include ``when`` (ISO text, so string order is time order)."""
+    if when:
+        span["first"] = when if span["first"] is None else min(span["first"], when)
+        span["last"] = when if span["last"] is None else max(span["last"], when)
+
+
+def _client_apps(counter: collections.Counter) -> list[dict]:
+    return [{"client_app": c, "count": n} for c, n in counter.most_common(3)]
+
+
+def _compromise(rows: list, capped: bool, hours: int, min_spray_users: int) -> dict:
+    """compromise_suspects' aggregation of already fetched sign-in rows."""
+    home, _ = home_countries()
+    site_table = sites.load()
+    internal: dict[str, bool] = {}
+
+    def is_internal(ip: str) -> bool:
+        if ip not in internal:
+            internal[ip] = site_table.classify(ip) is not None
+        return internal[ip]
+
+    failed_users: dict[str, set] = collections.defaultdict(set)
+    # (upn, ip) -> success details, for spray breaches
+    pair: dict[tuple[str, str], dict] = {}
+    # upn -> foreign success details
+    foreign: dict[str, dict] = {}
+    home_success: set[str] = set()
+
+    for row in rows:
+        code = _error_code_of(row)
+        upn = row.get("userPrincipalName") or ""
+        ip = row.get("ipAddress") or ""
+        if not upn or not ip:
+            continue
+        if code not in (0, None):
+            failed_users[ip].add(upn)
+            continue
+        if code is None:
+            continue
+        client_app = row.get("clientAppUsed") or ""
+        country = ((row.get("location") or {}).get("countryOrRegion") or "").upper()
+        when = row.get("createdDateTime") or ""
+        legacy = client_app in _LEGACY_AUTH_CLIENTS
+        if is_internal(ip):
+            home_success.add(upn)
+            continue
+        entry = pair.setdefault(
+            (upn, ip),
+            {"first": None, "last": None, "apps": collections.Counter(), "countries": set(), "legacy": False},
+        )
+        _widen(entry, when)
+        if client_app:
+            entry["apps"][client_app] += 1
+        if country:
+            entry["countries"].add(country)
+        entry["legacy"] = entry["legacy"] or legacy
+        if home is None or not country:
+            continue  # no home countries configured, or no country: never guessed foreign
+        if country in home:
+            home_success.add(upn)
+            continue
+        f = foreign.setdefault(
+            upn,
+            {
+                "successes": 0,
+                "countries": set(),
+                "ips": set(),
+                "apps": collections.Counter(),
+                "legacy": False,
+                "first": None,
+                "last": None,
+            },
+        )
+        f["successes"] += 1
+        f["countries"].add(country)
+        f["ips"].add(ip)
+        if client_app:
+            f["apps"][client_app] += 1
+        f["legacy"] = f["legacy"] or legacy
+        _widen(f, when)
+
+    spray_ips = {
+        ip
+        for ip, users in failed_users.items()
+        if len(users) >= min_spray_users and not is_internal(ip) and any(p[1] == ip for p in pair)
+    }
+    breaches = sorted(
+        (
+            {
+                "user_principal_name": upn,
+                "ip_address": ip,
+                "failed_distinct_users": len(failed_users[ip]),
+                "first_success": d["first"],
+                "last_success": d["last"],
+                "client_apps": _client_apps(d["apps"]),
+                "countries": sorted(d["countries"]),
+                "legacy_auth": d["legacy"],
+                "severity": "high",
+            }
+            for (upn, ip), d in pair.items()
+            if ip in spray_ips
+        ),
+        key=lambda b: (-b["failed_distinct_users"], b["user_principal_name"], b["ip_address"]),
+    )
+    breached = {b["user_principal_name"] for b in breaches}
+
+    foreign_rows = []
+    for upn, f in foreign.items():
+        ips = sorted(f["ips"])
+        severity = "high" if f["legacy"] or upn in breached else "medium"
+        foreign_rows.append(
+            {
+                "user_principal_name": upn,
+                "severity": severity,
+                "countries": sorted(f["countries"]),
+                "distinct_ips": len(ips),
+                "ips": ips[:_COMPROMISE_IPS_LIMIT],
+                "ips_capped": len(ips) > _COMPROMISE_IPS_LIMIT,
+                "successes": f["successes"],
+                "client_apps": _client_apps(f["apps"]),
+                "legacy_auth": f["legacy"],
+                "first_seen": f["first"],
+                "last_seen": f["last"],
+                "home_success_in_window": upn in home_success,
+                "in_spray_breaches": upn in breached,
+            }
+        )
+    foreign_rows.sort(
+        key=lambda r: (r["severity"] != "high", -len(r["countries"]), -r["distinct_ips"], r["user_principal_name"])
+    )
+    high = breached | {r["user_principal_name"] for r in foreign_rows if r["severity"] == "high"}
+    medium = {r["user_principal_name"] for r in foreign_rows if r["severity"] == "medium"} - high
+
+    return {
+        "window_hours": hours,
+        "capped": capped,
+        "min_spray_users": min_spray_users,
+        "home_countries": _home_status(),
+        "counts": {
+            "high": len(high),
+            "medium": len(medium),
+            "spray_breach_accounts": len(breached),
+            "spray_breach_ips": len(spray_ips),
+            "foreign_accounts": len(foreign_rows),
+        },
+        "spray_breaches": breaches[:_COMPROMISE_LIST_LIMIT],
+        "spray_breaches_capped": len(breaches) > _COMPROMISE_LIST_LIMIT,
+        "foreign_successes": foreign_rows[:_COMPROMISE_LIST_LIMIT],
+        "foreign_successes_capped": len(foreign_rows) > _COMPROMISE_LIST_LIMIT,
+        "sites": site_table.status(),
+        "how_to_read": _COMPROMISE_HOW_TO_READ,
+    }
+
+
+@mcp.tool()
+@_tenant_scoped()
+def compromise_suspects(
+    hours: int = 24, tenant: str | None = None, min_spray_users: int = 5, max_pages: int | None = None
+) -> dict:
+    """Accounts that were probably taken over, from one walk of the sign-in log.
+
+    The success-side counterpart of ``signin_failure_stats``' spray suspects.
+    Two findings, both from EXTERNAL source IPs (outside the address ranges
+    in ENTRAADM_SITES_INI; without that file every IP counts as external):
+
+    - ``spray_breaches`` (severity ``high``): an IP that failed for
+      ``min_spray_users`` or more distinct accounts in the window AND signed
+      in successfully as at least one account. One row per account and IP:
+      ``failed_distinct_users`` from that IP, first/last success, client
+      apps, countries, ``legacy_auth``. The strongest signal: a spray that
+      found a working password.
+    - ``foreign_successes``: successes from a country outside
+      ENTRAADM_HOME_COUNTRIES (ISO 3166-1 alpha-2, e.g. "JP"), grouped per
+      account with countries, IPs, client apps, first/last, and
+      ``home_success_in_window`` (the account also signed in from a home
+      country or an internal IP in the window). ``high`` when a legacy
+      protocol was used (password only, no MFA) or the account is also in
+      ``spray_breaches``; ``medium`` otherwise. Unset home countries:
+      ``home_countries.configured`` is false and this list stays empty --
+      nothing is guessed. A success with no country is never called foreign.
+
+    ``counts`` gives distinct accounts per severity (an account in both
+    lists counts once, as high). Lists are capped at 50 (``*_capped``).
+    ``how_to_read`` says what to act on. Like ``signin_failure_stats`` this
+    walks the interactive sign-in log for the window (every legacy-protocol
+    authentication is interactive) under ENTRAADM_DEADLINE; ``capped=true``
+    means the window was not fully read and the findings are a lower bound.
+
+    Read-only (AuditLog.Read.All application permission, or -- for azure-cli
+    auth -- the Reports Reader directory role).
+
+    Args:
+        hours: How far back to look, clamped to [1, 720] (30 days).
+        tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
+        min_spray_users: Distinct failed accounts that make an IP a spray source (default 5, clamped to >= 2).
+        max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+    """
+    hours = _clamp_hours(hours)
+    min_spray_users = max(2, int(min_spray_users))
+    fetched = _fetch_signins(hours, max_pages, _SUCCESS_SELECT)
+    if isinstance(fetched, dict):
+        return fetched
+    return _compromise(*fetched, hours, min_spray_users)
 
 
 # ---------------------------------------------------------------------------
@@ -2689,9 +2933,12 @@ def m365_service_health(max_pages: int | None = None, tenant: str | None = None)
 def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10) -> dict:
     """One-call morning-patrol summary: M365 service health, sign-in failures, spray suspects, admin actions.
 
-    Combines ``m365_service_health``, ``signin_failure_stats`` and
-    ``directory_audits`` into one result with a compact ``summary`` on top,
-    matching the shape of this fleet's other ``daily_brief`` tools. A
+    Combines ``m365_service_health``, ``signin_failure_stats``,
+    ``directory_audits`` and ``compromise_suspects`` (its counts and the top
+    5 of each list; ``summary.compromise_suspects`` has the high/medium
+    counts) into one result with a compact ``summary`` on top. The failure
+    stats and the compromise suspects come from one walk of the sign-in log.
+    The shape matches this fleet's other ``daily_brief`` tools. A
     permission failure in one section degrades only that section's
     contribution to ``summary`` -- the other sections still return in full.
     Azure VM backup is deliberately not a section here: its ARM fan-out is
@@ -2767,7 +3014,20 @@ def _brief(hours: int, max_pages: int | None) -> dict:
     # reporting an empty list.
     health = m365_service_health(max_pages=max_pages)
     audits = directory_audits(hours=hours, max_pages=max_pages)
-    stats = signin_failure_stats(hours=hours, max_pages=max_pages)
+    # One walk of the sign-in log feeds both the failure stats and the compromise suspects.
+    fetched = _fetch_signins(hours, max_pages, _SUCCESS_SELECT)
+    if isinstance(fetched, dict):
+        stats, suspects = fetched, dict(fetched)
+    else:
+        stats = _failure_stats(*fetched, hours)
+        suspects = _brief_suspects(_compromise(*fetched, hours, _SPRAY_MIN_DISTINCT_USERS))
+    try:
+        from_file = _tenants().from_file
+    except ConfigError:
+        from_file = False  # every section already reports the ConfigError
+    if from_file:
+        stats = {**stats, "tenant": _current_tenant().name}
+        suspects = {**suspects, "tenant": _current_tenant().name}
 
     if "error" in health:
         summary: dict = {"service_health": health}
@@ -2793,6 +3053,11 @@ def _brief(hours: int, max_pages: int | None) -> dict:
         if stats["sites"]["error"] is not None:
             summary["sites_error"] = stats["sites"]["error"]
 
+    if "error" in suspects:
+        summary["compromise_suspects"] = suspects
+    else:
+        summary["compromise_suspects"] = {k: suspects["counts"][k] for k in ("high", "medium")}
+
     if "error" in audits:
         summary["admin_actions"] = audits
     else:
@@ -2807,6 +3072,27 @@ def _brief(hours: int, max_pages: int | None) -> dict:
         "m365_service_health": health,
         "signin_failure_stats": stats,
         "directory_audits": audits,
+        "compromise_suspects": suspects,
+    }
+
+
+_BRIEF_SUSPECTS_TOP = 5
+
+
+def _brief_suspects(full: dict) -> dict:
+    """compromise_suspects cut down for daily_brief: counts and the top entries of each list."""
+    return {
+        "window_hours": full["window_hours"],
+        "capped": full["capped"],
+        "home_countries": full["home_countries"],
+        "counts": full["counts"],
+        "spray_breaches": full["spray_breaches"][:_BRIEF_SUSPECTS_TOP],
+        "spray_breaches_capped": len(full["spray_breaches"]) > _BRIEF_SUSPECTS_TOP or full["spray_breaches_capped"],
+        "foreign_successes": full["foreign_successes"][:_BRIEF_SUSPECTS_TOP],
+        "foreign_successes_capped": (
+            len(full["foreign_successes"]) > _BRIEF_SUSPECTS_TOP or full["foreign_successes_capped"]
+        ),
+        "how_to_read": full["how_to_read"],
     }
 
 

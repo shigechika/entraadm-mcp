@@ -40,6 +40,13 @@ must stay distinguishable (`revoked: null` in `revoke_sign_in_sessions`).
 
 ## What to flag
 
+- **`compromise_suspects` calling something foreign or breached on a
+  guess.** Only external IPs (outside `ENTRAADM_SITES_INI`) count; a foreign
+  success needs `ENTRAADM_HOME_COUNTRIES` and a country on the row; a spray
+  breach needs both the distinct-failure threshold and a success from the same
+  IP. Flag a change that treats an empty country as foreign, falls back to a
+  built-in country list, or adds a second sign-in walk to `daily_brief`
+  instead of reusing `_fetch_signins()` rows.
 - **A `$filter` string built with plain f-string interpolation instead of
   `odata_quote()`.** Every OData filter in `entraadm_mcp/server.py` that
   embeds tool-caller input (a userPrincipalName, a search term) wraps that
