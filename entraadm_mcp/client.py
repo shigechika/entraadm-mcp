@@ -131,7 +131,7 @@ def _build_credential(config: AuthConfig):
             client_id=config.client_id,
             client_secret=config.client_secret,
         )
-    return AzureCliCredential()
+    return AzureCliCredential(tenant_id=config.tenant_id or "")
 
 
 #: Graph error codes that mean "wrong role/permission", mapped to actionable
@@ -476,7 +476,7 @@ class GraphClient(_RestClient):
     scope = GRAPH_SCOPE
     next_link_key = "@odata.nextLink"
 
-    def check(self) -> dict:
+    def check(self, deadline: float | None = None) -> dict:
         """Cheapest possible Graph round-trip, for health_check's `graph` probe.
 
         Deliberately ``GET /users`` (not ``/organization``): every deployment
@@ -489,12 +489,12 @@ class GraphClient(_RestClient):
         ``status: "error"`` even though every tool actually works.
         """
         try:
-            self.get("/users", params={"$top": 1, "$select": "id"})
+            self.get("/users", params={"$top": 1, "$select": "id"}, deadline=deadline)
         except ApiError as e:
             return {"auth": "error", "detail": str(e)}
         return {"auth": "ok", "detail": None}
 
-    def probe_signin_access(self) -> dict:
+    def probe_signin_access(self, deadline: float | None = None) -> dict:
         """Check whether the current credential can read sign-in logs at all.
 
         Used by health_check's `signin_probe` to distinguish "Graph reachable"
@@ -502,7 +502,7 @@ class GraphClient(_RestClient):
         fail" (status: degraded).
         """
         try:
-            self.get("/auditLogs/signIns", params={"$top": 1})
+            self.get("/auditLogs/signIns", params={"$top": 1}, deadline=deadline)
         except ApiError as e:
             return {"auth": "error", "detail": str(e)}
         return {"auth": "ok", "detail": None}

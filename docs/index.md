@@ -59,6 +59,13 @@ account and resetting a password stay out of scope.
 
 ## Design notes
 
+**One process, several tenants (optional).** Unset `ENTRAADM_CONFIG` is one
+tenant from the env vars. Set, it names an INI file of `[tenant.<name>]`
+sections, the counterpart of gwsadm-mcp's `[domain.*]`: UPN-taking tools route
+by the UPN's domain, tenant-wide tools take `tenant`, `health_check` and
+`daily_brief` cover every tenant, and the ARM tools stay on the default tenant.
+See the README's "Several tenants".
+
 **Two auth modes, chosen by which env vars are set.** All three of
 `ENTRAADM_TENANT_ID`/`_CLIENT_ID`/`_CLIENT_SECRET` selects app-only
 (`ClientSecretCredential`) — the production path for a headless deployment.

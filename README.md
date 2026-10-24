@@ -156,6 +156,8 @@ export ENTRAADM_SITES_INI=/path/to/sites.ini
 # Register revoke_sign_in_sessions, the one state-changing tool (exactly "1"; anything
 # else leaves it off). Also needs the User.RevokeSessions.All permission.
 export ENTRAADM_ENABLE_REVOKE_SESSIONS=1
+# Serve several tenants from one process (see "Several tenants" below).
+export ENTRAADM_CONFIG=/path/to/tenants.ini
 ```
 
 `ENTRAADM_SITES_INI` uses the same format as keycloak-mcp's `KEYCLOAK_SITES_INI`,
@@ -163,6 +165,92 @@ so one file can serve both (see [`sites.ini.example`](sites.ini.example)). Looku
 longest-prefix. A file that is set but cannot be read makes `health_check` report
 `degraded`, and every IP is then treated as external. An invalid CIDR is reported the
 same way, but the valid ranges are still used.
+
+### Several tenants
+
+One process can serve several Entra tenants, the way gwsadm-mcp serves several
+Workspace domains. Point `ENTRAADM_CONFIG` at an INI file with one
+`[tenant.<name>]` section per tenant:
+
+```ini
+[tenant.staff]
+tenant_id = 00000000-0000-0000-0000-000000000001
+domains = example.edu
+default = true
+
+[tenant.students]
+tenant_id = 00000000-0000-0000-0000-000000000002
+domains = students.example.edu
+; optional: an app registration of its own instead of the shared one
+; client_id = 00000000-0000-0000-0000-000000000003
+; client_secret_env = ENTRAADM_STUDENTS_CLIENT_SECRET
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `tenant_id` | yes | The tenant's id (GUID) or a domain name of it (with a dot, e.g. `contoso.onmicrosoft.com`); `common`, `organizations` and `consumers` are refused |
+| `domains` | yes | Comma-separated UPN domains routed to this tenant (exact match, any case) |
+| `default` | on one section when there are several | The tenant used when a call names none; a single section is the default anyway |
+| `client_id` + `client_secret_env` | no, both or neither | An app of its own; `client_secret_env` names the env var holding its secret. Never put a secret in the file |
+
+A section without `client_id` reuses the env app (`ENTRAADM_CLIENT_ID` /
+`ENTRAADM_CLIENT_SECRET`), with the token requested from that section's
+tenant; with no env app it uses `az login` in that tenant. `ENTRAADM_TENANT_ID`
+is not used when `ENTRAADM_CONFIG` is set. Unset `ENTRAADM_CONFIG` keeps the
+single-tenant setup above unchanged.
+
+To share one app across tenants, make the app registration multi-tenant
+(*Supported account types*: accounts in any organizational directory), add the
+same Graph application permissions, then have an administrator of each other
+tenant grant admin consent:
+
+```
+https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
+```
+
+The server refuses to start, and `--check` fails, when the file is unreadable,
+has a section that is not `[tenant.*]` or an unknown key, misses `tenant_id` or
+`domains`, has a `tenant_id` that is neither a GUID nor a dotted domain, gives one domain to two tenants, or has no default (or two) among
+several tenants. `--check` probes every tenant.
+
+Routing:
+
+- A tool that takes a UPN (`get_user`, `get_user_auth_methods`, `signin_logs`,
+  `revoke_sign_in_sessions`, and `directory_audits` when `user` is given) works
+  in the tenant whose `domains` holds the UPN's domain (exact match). A domain
+  no tenant claims is a refusal, not an exception: `tenant_configured: false`,
+  `found: null` (no lookup ran) and the `configured_domains`. For
+  `revoke_sign_in_sessions`: `revoked: false`, `found: null`, nothing is sent.
+  List `<tenant>.onmicrosoft.com` in `domains` if such UPNs are looked up often.
+- `get_user`, `get_user_auth_methods` and `signin_logs` also take `tenant`,
+  which wins over the UPN's domain: for a `*.onmicrosoft.com` or `#EXT#` UPN,
+  or a B2B guest whose sign-ins are logged in the host tenant.
+  `revoke_sign_in_sessions` has no such override on purpose: a write is only
+  ever aimed at the tenant that owns the UPN's domain.
+- A tenant-wide tool (`signin_failure_stats`, `signin_success_stats`,
+  `signin_by_ip`, `directory_audits`, `m365_service_health`) takes an optional
+  `tenant`; default the default tenant. `directory_audits` with both `tenant`
+  and a `user` whose domain another tenant claims is refused (it would search
+  the wrong log and find nothing); a `user` whose domain no tenant claims (an
+  external or partner admin, a guest) is searched in the given or default
+  tenant, and the result says `user_domain_claimed: false`.
+- `tenant` is a section name, one of its domains, or its tenant id. Without a
+  tenant file it may be `default` or the env tenant id; anything else is
+  refused (`tenant_configured: false`).
+- `health_check` and `daily_brief` cover every tenant. Their top-level keys stay
+  the default tenant's, as before; `tenant` names it and `tenants` holds the
+  per-tenant results. The call budget (`ENTRAADM_DEADLINE`) is split evenly
+  among the tenants (default first, each taking a share of what is left), so a
+  slow tenant cannot stall the others; a tenant that does not answer is an
+  `error` in its own entry, and makes `health_check`'s `status` at most
+  `degraded`. With `ENTRAADM_DEADLINE=0` there is no budget: every tenant is
+  scanned in full, one after another, which can outlast a client's ~60 s cutoff.
+- The Azure Resource Manager tools (`list_subscriptions`, `vm_backup_status`,
+  `vm_backup_policies`, `vm_activity`) serve the default tenant only.
+- With a tenant file, every result names its `tenant` (the ARM tools: the
+  default tenant; a refusal that picked none: `null`). Env-only results are
+  unchanged, except that `revoke_sign_in_sessions` always carries `tenant`,
+  `tenant_configured` and `configured_domains` (its keys never vary).
 
 ## Usage
 

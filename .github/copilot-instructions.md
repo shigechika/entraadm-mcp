@@ -9,6 +9,22 @@ default tools are read-only. The one state-changing tool,
 inside the function; the approval step lives in the caller that enables it,
 not in this server. There is no account unblock or password reset.
 
+One process may serve several Entra tenants: `ENTRAADM_CONFIG` names an INI
+file of `[tenant.<name>]` sections (`config.load_tenants()`). UPN-taking tools
+route by the UPN's domain through `@_tenant_scoped`; tenant-wide tools take a
+`tenant` argument; an unclaimed domain or unknown tenant is a
+`tenant_configured: false` refusal with `found: null` (never `found: false`,
+which means "no such account"), never an exception or a silent fallback to
+the default tenant (flag any change that falls back -- it would act on the
+wrong tenant). The only deliberate fallback is `directory_audits` with a
+`user` no tenant claims (an external admin), which says
+`user_domain_claimed: false`. `revoke_sign_in_sessions` must keep having no
+`tenant` override. Per-tenant work in `health_check` / `daily_brief` must stay
+under a share of the call budget. The ARM tools serve the default tenant only. Without the file,
+output must stay unchanged (no `tenant` key), except
+`revoke_sign_in_sessions`, whose fixed key set always includes `tenant`,
+`tenant_configured` and `configured_domains`.
+
 Two clients share one `_RestClient` base in `entraadm_mcp/client.py`:
 `GraphClient` (Graph v1.0, `@odata.nextLink`) and `ArmClient`
 (`https://management.azure.com`, bare `nextLink`, `api-version` on every
@@ -112,10 +128,12 @@ must stay distinguishable (`revoked: null` in `revoke_sign_in_sessions`).
 
 ## Not a concern here
 
-- No config file — auth is entirely env-var driven
+- Auth is env-var driven for one tenant
   (`ENTRAADM_TENANT_ID`/`_CLIENT_ID`/`_CLIENT_SECRET` for app-only, or none
-  of the three for `az login`-based delegated auth). `config.py`'s
-  `AuthConfig.from_env()` is the only place that reads these.
+  of the three for `az login`-based delegated auth); `config.py`'s
+  `AuthConfig.from_env()` / `load_tenants()` are the only places that read
+  them. The optional `ENTRAADM_CONFIG` file holds tenant ids, domains and the
+  NAME of an env var for a per-tenant secret, never a secret itself.
 - Any new state-changing tool must be opt-in the same way (absent from
   `tools/list` unless its switch is set), look the target up by exact
   identifier before acting, and be listed in `STATE_CHANGING` with a

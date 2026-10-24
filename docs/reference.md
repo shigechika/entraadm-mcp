@@ -49,6 +49,26 @@ but the valid ranges are still used.
 
 Azure RBAC is optional; `health_check`'s `arm` probe is informational.
 
+### Several tenants
+
+`ENTRAADM_CONFIG` names an INI file with one `[tenant.<name>]` section per
+tenant (`tenant_id`, `domains`, optional `default`, optional `client_id` +
+`client_secret_env`); see the README's "Several tenants" for the format, the
+multi-tenant app and admin consent
+(`https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>`).
+A UPN-taking tool works in the tenant claiming the UPN's domain (an unclaimed
+domain: `tenant_configured: false`, `found: null`, `configured_domains`);
+`get_user`, `get_user_auth_methods` and `signin_logs` take a `tenant` override,
+`revoke_sign_in_sessions` deliberately none. The tenant-wide tools take
+`tenant` (section name, domain or tenant id; env-only: `default` or the env
+tenant id), default the default tenant; `directory_audits` refuses a `tenant`
+that another tenant's `user` contradicts and searches an unclaimed `user` in
+the given or default tenant (`user_domain_claimed: false`). `health_check` /
+`daily_brief` keep the default tenant's keys on top, add `tenant` and
+`tenants`, and split the call budget evenly among the tenants
+(`ENTRAADM_DEADLINE=0`: unbounded). The ARM tools serve the default tenant
+only. With a tenant file every result names its `tenant`.
+
 ## Tools
 
 ### `health_check()`
@@ -68,7 +88,7 @@ pages existed) and is informational: it never changes `status`,
 because Azure RBAC is optional for this server. It runs under its own
 10-second budget so an unresponsive ARM cannot stall the whole call.
 
-### `get_user(upn)`
+### `get_user(upn, tenant=None)`
 
 Account lifecycle state: `accountEnabled`, `userType`, creation/last
 password-change timestamps, on-premises sync status, resolved license
@@ -80,7 +100,7 @@ short before resolving one of this account's own licenses -- when
 present, one or more `licenses` entries is a raw skuId rather than a
 friendly name.
 
-### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None)`
+### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None, tenant=None)`
 
 One user's sign-in events. `result`: `"failure"` (default, the common
 case), `"success"`, or `"all"` — filtered client-side, since Graph cannot
@@ -92,7 +112,7 @@ credentials (wrong password)") from a hand-maintained AADSTS code table.
 the whole window was scanned — a low match count alongside `capped=true`
 means "not found within the budget," not "doesn't exist."
 
-### `signin_failure_stats(hours=24, max_pages=None)`
+### `signin_failure_stats(hours=24, max_pages=None, tenant=None)`
 
 Tenant-wide failure aggregation: top AADSTS error codes (annotated), top
 failing users, top applications, and top source IPs. `spray_suspects` lists
@@ -107,7 +127,7 @@ bury an outside source. `sites` reports whether the file loaded; when it cannot
 be read, every suspect stays in `spray_suspects`. `daily_brief`'s summary carries
 the internal suspects too, and `sites_error` when the file has an error.
 
-### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
+### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2, tenant=None)`
 
 Tenant-wide *successful* sign-in aggregation by source IP — the companion
 to `signin_failure_stats`: that one shows who is being attacked, this one
@@ -123,7 +143,7 @@ reading `shared_ips` as a breach. Same log walk and `capped` semantics as
 legacy-protocol authentication is logged as interactive; non-interactive
 token refreshes are not counted).
 
-### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None)`
+### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None, tenant=None)`
 
 Every sign-in from one source IP — the follow-up to a `spray_suspects` or
 `shared_ips` hit. Graph filters on `ipAddress` server-side, so this is one
@@ -134,7 +154,7 @@ the account name and the same AADSTS annotation as `signin_logs`.
 `events_truncated` means more matching rows were read than `top` returns
 (`users` still counts them). `ip` must parse as an IPv4/IPv6 address.
 
-### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
+### `directory_audits(user=None, hours=24, top=25, max_pages=None, category=None, tenant=None)`
 
 Directory audit trail: who did what (block/unblock, attribute edits), and
 when. `user`, when given, matches audits where that account is either the
@@ -143,7 +163,7 @@ on the initiator, so this fetches the window and matches both sides
 client-side (a busy window may need a larger `max_pages` to find one
 person's audits).
 
-### `get_user_auth_methods(upn)`
+### `get_user_auth_methods(upn, tenant=None)`
 
 Registered authentication methods for one account. `mfa_registered` is
 `true` iff at least one non-password method is registered (Authenticator
@@ -258,7 +278,7 @@ and within the 90 days the activity log keeps. The result has `vm`, `window`
   failed — `subscription_read_error` then says why): an empty section is then
   not proof that nothing happened.
 
-### `m365_service_health(max_pages=None)`
+### `m365_service_health(max_pages=None, tenant=None)`
 
 `services`: one row per Microsoft 365 service with its current status
 (`healthOverviews`); `issues`: the unresolved incidents and advisories,

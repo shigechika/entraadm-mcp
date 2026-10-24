@@ -275,3 +275,23 @@ def test_in_process_result_decodes_to_plain_data_on_the_installed_sdk(monkeypatc
 
 def test_opt_in_tools_have_probe_specs():
     assert OPT_IN <= set(smoke_probes.PROBES)
+
+
+def test_probe_upns_use_a_configured_domain_under_a_tenant_file(tmp_path, monkeypatch):
+    path = tmp_path / "tenants.ini"
+    domain = ".".join(("students", "example", "edu"))
+    path.write_text(
+        "[tenant.a]\ntenant_id = 00000000-0000-0000-0000-000000000001\ndomains = " + domain + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ENTRAADM_CONFIG", str(path))
+    args = asyncio.run(smoke_probes._fake_upn_arg(None))
+    assert args["upn"].endswith("@" + domain)
+    user = asyncio.run(smoke_probes._fake_user_arg(None))
+    assert user["user"].endswith("@" + domain)
+
+
+def test_probe_upns_use_the_reserved_domain_env_only(monkeypatch):
+    monkeypatch.delenv("ENTRAADM_CONFIG", raising=False)
+    args = asyncio.run(smoke_probes._fake_upn_arg(None))
+    assert args["upn"].endswith("@" + ".".join(["example", "invalid"]))

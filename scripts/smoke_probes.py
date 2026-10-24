@@ -22,6 +22,11 @@ tenant membership, so this exercises the full request path (auth, the
 $filter query, the not-found projection) without naming, or reading the
 state of, anybody's actual account. A "found: true" result would be the
 surprise.
+
+Under a tenant file (``ENTRAADM_CONFIG``) the domain is the default tenant's
+first configured domain instead, read at run time: a UPN in a domain no tenant
+claims is refused before Graph is called. The random local part keeps the
+account nonexistent.
 """
 
 import json
@@ -49,16 +54,34 @@ def _fake_local_part() -> str:
     return f"smoke-test-{secrets.token_hex(8)}"
 
 
+def _probe_domain() -> str:
+    """The domain of the probe UPNs.
+
+    Env-only: the reserved domain. Under a tenant file (``ENTRAADM_CONFIG``)
+    a UPN in an unclaimed domain is refused before Graph is called, so the
+    probe would exercise nothing; it uses the default tenant's first
+    configured domain instead (read at run time, never written here). The
+    random local part keeps the account nonexistent either way.
+    """
+    try:
+        from entraadm_mcp.config import ConfigError, load_tenants
+
+        tenants = load_tenants()
+    except (ImportError, ConfigError):
+        return _reserved_domain()
+    return tenants.default.domains[0] if tenants.from_file else _reserved_domain()
+
+
 async def _fake_user_arg(call: Caller) -> dict[str, Any]:
     """A guaranteed-nonexistent account, under the ``user`` parameter name (signin_logs)."""
     del call  # no discovery needed -- see module docstring
-    return {"user": f"{_fake_local_part()}@{_reserved_domain()}"}
+    return {"user": f"{_fake_local_part()}@{_probe_domain()}"}
 
 
 async def _fake_upn_arg(call: Caller) -> dict[str, Any]:
     """Same as ``_fake_user_arg``, under the ``upn`` parameter name (get_user*)."""
     del call
-    return {"upn": f"{_fake_local_part()}@{_reserved_domain()}"}
+    return {"upn": f"{_fake_local_part()}@{_probe_domain()}"}
 
 
 async def _test_net_ip_arg(call: Caller) -> dict[str, Any]:
