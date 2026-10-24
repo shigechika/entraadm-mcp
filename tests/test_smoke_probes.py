@@ -57,7 +57,7 @@ STATE_CHANGING: set[str] = {"revoke_sign_in_sessions"}
 
 #: Tools registered only behind an opt-in environment switch, so absent from
 #: the registry these tests read; their probe specs must still exist.
-OPT_IN: set[str] = {"revoke_sign_in_sessions"}
+OPT_IN: set[str] = set(smoke_probes.OPT_IN_TOOLS)
 
 
 def _registered_tool_names() -> set[str]:
@@ -271,3 +271,7 @@ def test_in_process_result_decodes_to_plain_data_on_the_installed_sdk(monkeypatc
     decoded = smoke_test._decode(raw)
     assert isinstance(decoded, dict)
     assert decoded["service"] == "entraadm-mcp"
+
+
+def test_opt_in_tools_have_probe_specs():
+    assert OPT_IN <= set(smoke_probes.PROBES)

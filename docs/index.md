@@ -49,9 +49,11 @@ and not a fit for an unattended triage bot:
 All tools above are read-only. The one state-changing tool,
 `revoke_sign_in_sessions` (sign one account out everywhere: Graph
 `revokeSignInSessions`), is registered only when
-`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` and needs `User.RevokeSessions.All`. It
-refuses guests and returns `not_covered` (no account disable, no password
-reset, no MFA removal; issued access tokens live until they expire). Leave the
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` and needs `User.RevokeSessions.All`
+(app-only) or the User Administrator / Helpdesk Administrator role (delegated).
+It refuses guests and returns `not_covered` (no account disable, no password
+reset, no MFA removal; issued access tokens live until they expire);
+`revoked: null` means the outcome is unknown and calling again is safe. Leave the
 switch unset on any deployment without its own approval step. Unblocking an
 account and resetting a password stay out of scope.
 

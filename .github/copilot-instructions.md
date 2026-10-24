@@ -14,7 +14,13 @@ Two clients share one `_RestClient` base in `entraadm_mcp/client.py`:
 (`https://management.azure.com`, bare `nextLink`, `api-version` on every
 call). They share one credential object and each caches its own scope's
 token. The exception hierarchy is `ApiError` / `ApiDeadline` /
-`ApiAuthError` / `ApiPermissionError`; `GraphError` and friends are aliases.
+`ApiAuthError` / `ApiPermissionError` / `ApiTransportError` /
+`ApiServerError` / `ApiResponseError`; `GraphError` and friends are aliases.
+Every `ApiError` carries `may_have_applied`: True when an attempt may have
+been acted on (a lost response, a 5xx, a deadline after sending, an
+unreadable success body). For a state-changing tool, flag any change that
+collapses these into a plain `GraphError` "not done" -- the unknown outcome
+must stay distinguishable (`revoked: null` in `revoke_sign_in_sessions`).
 
 ## What to flag
 

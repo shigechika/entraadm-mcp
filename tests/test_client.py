@@ -6,6 +6,7 @@ GraphClient's real ``httpx.Client(base_url=GRAPH_BASE)`` (built when no
 a custom client through the constructor for these tests.
 """
 
+import time
 from collections import namedtuple
 
 import httpx
@@ -18,9 +19,11 @@ from entraadm_mcp.client import (
     ARM_SCOPE,
     GRAPH_BASE,
     GRAPH_SCOPE,
+    ApiDeadline,
     ApiError,
     ApiPermissionError,
     ApiResponseError,
+    ApiServerError,
     ApiTransportError,
     ArmClient,
     GraphAuthError,
@@ -755,18 +758,23 @@ def test_arm_check_reports_an_expired_deadline_as_an_error_not_as_zero_subscript
 
 
 # ---------------------------------------------------------------------------
-# post (body-less action)
+# post (body-less action) and may_have_applied
 # ---------------------------------------------------------------------------
 
-_REVOKE_URL = f"{GRAPH_BASE}/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions"
+_REVOKE_PATH = "/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions"
+_REVOKE_URL = f"{GRAPH_BASE}{_REVOKE_PATH}"
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda _s: None)
 
 
 @respx.mock
 def test_post_sends_an_empty_body_and_parses_the_answer(monkeypatch):
     route = respx.post(_REVOKE_URL).mock(return_value=httpx.Response(200, json={"value": True}))
     client, _cred = _client(monkeypatch=monkeypatch)
-    body = client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
-    assert body == {"value": True}
+    assert client.post(_REVOKE_PATH) == {"value": True}
     request = route.calls.last.request
     assert request.method == "POST"
     assert request.headers["Authorization"] == "Bearer tok"
@@ -775,45 +783,114 @@ def test_post_sends_an_empty_body_and_parses_the_answer(monkeypatch):
 
 
 @respx.mock
-def test_post_403_is_a_permission_error(monkeypatch):
+def test_post_403_is_a_permission_error_that_was_not_applied(monkeypatch):
     respx.post(_REVOKE_URL).mock(
         return_value=httpx.Response(
-            403,
-            json={"error": {"code": "Authorization_RequestDenied", "message": "Insufficient privileges"}},
+            403, json={"error": {"code": "Authorization_RequestDenied", "message": "Insufficient privileges"}}
         )
     )
     client, _cred = _client(monkeypatch=monkeypatch)
-    with pytest.raises(ApiPermissionError, match="Authorization_RequestDenied"):
-        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+    with pytest.raises(ApiPermissionError, match="Authorization_RequestDenied") as info:
+        client.post(_REVOKE_PATH)
+    assert info.value.may_have_applied is False
 
 
 @respx.mock
-def test_post_transport_error_after_retries_is_a_transport_error(monkeypatch):
-    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda _s: None)
+def test_post_400_is_a_definite_no(monkeypatch):
+    respx.post(_REVOKE_URL).mock(return_value=httpx.Response(400, json={"error": {"message": "bad"}}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiError) as info:
+        client.post(_REVOKE_PATH)
+    assert type(info.value) is ApiError and info.value.may_have_applied is False and "400" in str(info.value)
+
+
+@respx.mock
+def test_post_exhausted_5xx_may_have_applied(monkeypatch, no_sleep):
+    route = respx.post(_REVOKE_URL).mock(return_value=httpx.Response(504, json={"error": {"message": "timeout"}}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiServerError) as info:
+        client.post(_REVOKE_PATH)
+    assert info.value.may_have_applied is True and route.call_count == 3
+
+
+@respx.mock
+def test_post_transport_error_after_retries_may_have_applied(monkeypatch, no_sleep):
     route = respx.post(_REVOKE_URL).mock(side_effect=httpx.ReadError("connection reset"))
     client, _cred = _client(monkeypatch=monkeypatch)
-    with pytest.raises(ApiTransportError):
-        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
-    assert route.call_count == 3
+    with pytest.raises(ApiTransportError) as info:
+        client.post(_REVOKE_PATH)
+    assert info.value.may_have_applied is True and route.call_count == 3
 
 
 @respx.mock
-def test_post_malformed_success_body_is_a_response_error(monkeypatch):
+def test_post_that_never_connected_was_not_applied(monkeypatch, no_sleep):
+    respx.post(_REVOKE_URL).mock(side_effect=httpx.ConnectError("refused"))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiTransportError) as info:
+        client.post(_REVOKE_PATH)
+    assert info.value.may_have_applied is False
+
+
+@respx.mock
+def test_post_malformed_success_body_may_have_applied(monkeypatch):
     respx.post(_REVOKE_URL).mock(return_value=httpx.Response(200, content=b"<html>ok</html>"))
     client, _cred = _client(monkeypatch=monkeypatch)
-    with pytest.raises(ApiResponseError):
-        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+    with pytest.raises(ApiResponseError) as info:
+        client.post(_REVOKE_PATH)
+    assert info.value.may_have_applied is True
 
 
-@pytest.mark.parametrize("status", [400, 500])
 @respx.mock
-def test_post_http_error_with_a_body_is_a_plain_api_error(monkeypatch, status):
-    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda _s: None)
+def test_post_lost_response_then_4xx_keeps_the_uncertainty(monkeypatch, no_sleep):
     respx.post(_REVOKE_URL).mock(
-        return_value=httpx.Response(status, json={"error": {"code": "x", "message": "rejected"}})
+        side_effect=[
+            httpx.ReadError("response lost"),
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(429, headers={"Retry-After": "0"}),
+        ]
     )
     client, _cred = _client(monkeypatch=monkeypatch)
     with pytest.raises(ApiError) as info:
-        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
-    assert not isinstance(info.value, (ApiTransportError, ApiResponseError))
-    assert str(status) in str(info.value)
+        client.post(_REVOKE_PATH)
+    assert "429" in str(info.value) and info.value.may_have_applied is True
+
+
+@respx.mock
+def test_post_deadline_before_sending_was_not_applied(monkeypatch):
+    route = respx.post(_REVOKE_URL).mock(return_value=httpx.Response(200, json={"value": True}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiDeadline) as info:
+        client.post(_REVOKE_PATH, deadline=time.monotonic() - 1)
+    assert info.value.may_have_applied is False and route.call_count == 0
+
+
+@respx.mock
+def test_post_deadline_waiting_to_retry_a_429_was_not_applied(monkeypatch):
+    respx.post(_REVOKE_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "120"}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiDeadline) as info:
+        client.post(_REVOKE_PATH, deadline=time.monotonic() + 5)
+    assert info.value.may_have_applied is False
+
+
+@respx.mock
+def test_post_deadline_after_a_lost_attempt_may_have_applied(monkeypatch, no_sleep):
+    respx.post(_REVOKE_URL).mock(
+        side_effect=[httpx.ReadError("response lost"), httpx.Response(429, headers={"Retry-After": "120"})]
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiDeadline) as info:
+        client.post(_REVOKE_PATH, deadline=time.monotonic() + 5)
+    assert info.value.may_have_applied is True
+
+
+def test_bounded_request_deadline_while_reading_may_have_applied(monkeypatch):
+    client, _cred = _client(monkeypatch=monkeypatch)
+
+    def reading_past_the_deadline(*_args, **_kwargs):
+        raise ApiDeadline("deadline passed while reading the response")
+
+    monkeypatch.setattr(client, "_bounded_request", reading_past_the_deadline)
+    with pytest.raises(ApiDeadline) as info:
+        client.post(_REVOKE_PATH, deadline=time.monotonic() + 5)
+    assert info.value.may_have_applied is True

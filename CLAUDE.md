@@ -42,7 +42,13 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   token. `get_paged` refuses to follow a continuation link whose
   scheme/host/port differ from the client's base URL (it would hand the
   bearer token to that host) — `ApiError`, not followed. The exception
-  hierarchy is `ApiError`/`ApiDeadline`/`ApiAuthError`/`ApiPermissionError`;
+  hierarchy is `ApiError`/`ApiDeadline`/`ApiAuthError`/`ApiPermissionError`,
+  plus `ApiTransportError` (network failure after the retries),
+  `ApiServerError` (5xx after the retries) and `ApiResponseError` (a success
+  status with a non-JSON body). Every `ApiError` carries `may_have_applied`
+  (set by `_request_tracked`, and by `post()` from all attempts): False only
+  when no attempt can have been acted on. A write tool must branch on it --
+  never collapse an unknown outcome into a plain `GraphError` "not done";
   `GraphError` etc. are aliases kept for the older imports. `odata_quote()`/`validate_upn()` are the injection defenses —
   every `$filter` built from tool input goes through one or both; MCP tool
   input is treated as adversarial. HTTP 403 is translated via
@@ -149,10 +155,13 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `config.revoke_sessions_enabled()` (`ENTRAADM_ENABLE_REVOKE_SESSIONS` is
   exactly `"1"`), and re-checks the switch inside the function. A deployment
   that never set it (a shared gateway) cannot list or call it. It resolves the
-  account through `_find_user` ($filter, never path) and interpolates only the
-  GUID-checked id; a guest is refused. `GraphClient.post()` retries like
-  `get()`, so it is for idempotent, body-less actions only. A
-  `GraphDeadline` after the POST is `revoked: null` (unknown), not `false`.
+  account through `_find_user_checked` ($filter, never path; the one place the
+  id is checked to be a GUID) and interpolates only that id; a guest is
+  refused. `GraphClient.post()` retries like `get()`, so it is for idempotent,
+  body-less actions only. Every return has the same keys; `revoked` is `null`
+  exactly when the raised error has `may_have_applied` (or the success body
+  had no boolean), `false` for every path that sent nothing or got a 4xx. A
+  403 names the permission for the auth mode (`client.mode`).
   The smoke test skips it by name (`STATE_CHANGING` / `OPT_IN` in
   `tests/test_smoke_probes.py`).
 

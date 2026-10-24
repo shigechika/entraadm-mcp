@@ -45,27 +45,40 @@ _UPN_LIKE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 class ApiError(Exception):
-    """Base error for anything that goes wrong talking to a Microsoft API (Graph or ARM)."""
+    """Base error for anything that goes wrong talking to a Microsoft API (Graph or ARM).
+
+    ``may_have_applied`` is True when some attempt of the failed request may have
+    reached the API and been acted on -- a response lost to a network error, a
+    5xx, a deadline hit while reading, a success body that could not be read --
+    even if a later retry ended in a definite error. For a read it does not
+    matter; for a state-changing call it separates "not done" (False) from
+    "outcome unknown" (True). Do not collapse the two for a write tool.
+    """
+
+    def __init__(self, *args, may_have_applied: bool = False):
+        super().__init__(*args)
+        self.may_have_applied = may_have_applied
 
 
 class ApiDeadline(ApiError):
-    """The caller's wall-clock budget ran out before a request could finish."""
+    """The caller's wall-clock budget ran out before a request could finish.
+
+    ``may_have_applied`` is False when nothing was sent (token acquisition,
+    before the first attempt, waiting to retry a 429), True when it ran out
+    while a response was being read or after an attempt with an unknown outcome.
+    """
 
 
 class ApiTransportError(ApiError):
-    """The request could not complete at the network level (after the retries).
+    """The request could not complete at the network level (after the retries)."""
 
-    The request may have reached the API before the connection failed, so for
-    a state-changing call the outcome is unknown, not "rejected".
-    """
+
+class ApiServerError(ApiError):
+    """The API kept answering 5xx (after the retries); the request may still have been applied."""
 
 
 class ApiResponseError(ApiError):
-    """A success status (2xx/3xx) came back with a body that is not JSON.
-
-    The API accepted the request, so for a state-changing call the outcome is
-    unknown, not "rejected".
-    """
+    """A success status (2xx/3xx) came back with a body that is not JSON; the request was accepted."""
 
 
 class ApiAuthError(ApiError):
@@ -172,6 +185,10 @@ def _translate_arm_permission_error(body: dict) -> str:
     return f"{code or 'permission denied'}: {message}"
 
 
+#: Network errors raised before the request left this host: nothing can have been applied.
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
 def _parse_retry_after(value: str | None) -> float:
     """Parse a Retry-After header value into a delay in seconds.
 
@@ -246,11 +263,23 @@ class _RestClient:
     def _request(
         self, method: str, url: str, params: dict | None = None, deadline: float | None = None
     ) -> httpx.Response:
+        return self._request_tracked(method, url, params=params, deadline=deadline)[0]
+
+    def _request_tracked(
+        self, method: str, url: str, params: dict | None = None, deadline: float | None = None
+    ) -> tuple[httpx.Response, bool]:
+        """The final response, and whether any earlier attempt may have been applied.
+
+        An attempt "may have been applied" when it could have reached the API and
+        its outcome is unknown: a network error other than a failed connect, or a
+        5xx. A 429 or another 4xx is a definite "not done" for that attempt. Every
+        ApiError raised from here carries the flag (see ApiError.may_have_applied).
+        """
         headers = {"Authorization": f"Bearer {self._access_token()}"}
         # Token acquisition (azure-identity, synchronous) cannot itself be bounded: a
         # cold token that blocks past the deadline is noticed here, before any request.
         if deadline is not None and deadline - time.monotonic() <= 0:
-            raise ApiDeadline("deadline passed while obtaining the access token")
+            raise ApiDeadline("deadline passed while obtaining the access token; nothing was sent")
         # Independent budgets per failure kind, not one shared attempt
         # counter: a network error (or a 5xx) consuming an early "attempt"
         # must not leave a *later* 429 unretried -- each kind gets its own
@@ -261,12 +290,13 @@ class _RestClient:
         network_retries_left = 2
         server_retries_left = 2
         retried_429 = False
+        maybe_applied = False
         while True:
             timeout: float | None = None
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise ApiDeadline("deadline passed before the request could start")
+                    raise ApiDeadline("deadline passed before the request could start", may_have_applied=maybe_applied)
                 timeout = min(30.0, max(remaining, 0.05))  # httpx needs a positive value
             try:
                 if timeout is None:
@@ -278,20 +308,29 @@ class _RestClient:
                 # without this it would propagate as a bare httpx exception --
                 # none of the ApiError family a tool's except clause
                 # catches, crashing the tool call instead of degrading it.
+                if not isinstance(e, _NOT_SENT_ERRORS):
+                    maybe_applied = True
                 if network_retries_left > 0:
-                    self._sleep_within(2 ** (2 - network_retries_left), deadline)
+                    self._sleep_within(2 ** (2 - network_retries_left), deadline, maybe_applied)
                     network_retries_left -= 1
                     continue
-                raise ApiTransportError(f"{self.api_name} request failed: network error ({type(e).__name__})") from e
+                raise ApiTransportError(
+                    f"{self.api_name} request failed: network error ({type(e).__name__})",
+                    may_have_applied=maybe_applied,
+                ) from e
+            except ApiDeadline as e:
+                raise ApiDeadline(str(e), may_have_applied=True) from e
             if resp.status_code == 429 and not retried_429:
                 retried_429 = True
-                self._sleep_within(_parse_retry_after(resp.headers.get("Retry-After")), deadline)
+                self._sleep_within(_parse_retry_after(resp.headers.get("Retry-After")), deadline, maybe_applied)
                 continue
-            if resp.status_code >= 500 and server_retries_left > 0:
-                self._sleep_within(2 ** (2 - server_retries_left), deadline)
-                server_retries_left -= 1
-                continue
-            return resp
+            if resp.status_code >= 500:
+                maybe_applied = True
+                if server_retries_left > 0:
+                    self._sleep_within(2 ** (2 - server_retries_left), deadline, maybe_applied)
+                    server_retries_left -= 1
+                    continue
+            return resp, maybe_applied
 
     def _bounded_request(self, method, url, params, headers, timeout, deadline) -> httpx.Response:
         """One request whose *total* time (connect, headers and body) stops at ``deadline``.
@@ -313,10 +352,10 @@ class _RestClient:
             )
 
     @staticmethod
-    def _sleep_within(seconds: float, deadline: float | None) -> None:
+    def _sleep_within(seconds: float, deadline: float | None, may_have_applied: bool = False) -> None:
         """Sleep, or raise ApiDeadline when the wait would end past ``deadline``."""
         if deadline is not None and time.monotonic() + seconds >= deadline:
-            raise ApiDeadline("deadline reached while waiting to retry")
+            raise ApiDeadline("deadline reached while waiting to retry", may_have_applied=may_have_applied)
         time.sleep(seconds)
 
     def get(self, path: str, params: dict | None = None, deadline: float | None = None) -> dict:
@@ -328,10 +367,15 @@ class _RestClient:
         """POST to an action with no request body (e.g. ``/users/{id}/revokeSignInSessions``).
 
         Retried like ``get`` (429 once, 5xx and network errors twice), so only
-        idempotent actions may use it.
+        idempotent actions may use it. Every ApiError raised carries
+        ``may_have_applied``: False only when no attempt can have been acted on.
         """
-        resp = self._request("POST", path, deadline=deadline)
-        return self._parse(resp)
+        resp, maybe_applied = self._request_tracked("POST", path, deadline=deadline)
+        try:
+            return self._parse(resp)
+        except ApiError as e:
+            e.may_have_applied = e.may_have_applied or maybe_applied
+            raise
 
     def _same_origin(self, url: str) -> bool:
         """Whether a continuation URL stays on this client's own API host.
@@ -410,11 +454,17 @@ class _RestClient:
                 message = _error_of(body).get("message", resp.text[:200])
             except ValueError:
                 message = resp.text[:200]
+            if resp.status_code >= 500:
+                raise ApiServerError(
+                    f"{self.api_name} request failed ({resp.status_code}): {message}", may_have_applied=True
+                )
             raise ApiError(f"{self.api_name} request failed ({resp.status_code}): {message}")
         try:
             body = resp.json()
         except ValueError:
-            raise ApiResponseError(f"{self.api_name} returned a non-JSON body ({resp.status_code})") from None
+            raise ApiResponseError(
+                f"{self.api_name} returned a non-JSON body ({resp.status_code})", may_have_applied=True
+            ) from None
         return body if isinstance(body, dict) else {"value": body}
 
 

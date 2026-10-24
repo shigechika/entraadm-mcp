@@ -61,10 +61,14 @@ default:
 | `revoke_sign_in_sessions` | Signs one account out everywhere (Graph `revokeSignInSessions`: refresh tokens and session cookies are invalidated). For a confirmed compromise. Registered only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` |
 
 It looks the account up by exact userPrincipalName first and refuses a guest.
-Every result carries `not_covered`: it does not disable the account, reset the
-password or remove MFA methods, and access tokens already issued keep working
-until they expire (typically about an hour). A call cut off after the request
-was sent answers `revoked: null` (unknown); calling again is safe. Leave the
+Every result has the same keys, including `revoked` and `not_covered`: it does
+not disable the account, reset the password or remove MFA methods, and access
+tokens already issued keep working until they expire (typically about an
+hour). `revoked` is `true` when Graph confirmed it, `false` when nothing was
+done (a refusal, a deadline before the request was sent, a 4xx from Graph), and
+`null` when the outcome is unknown (a response lost to a network error, a 5xx
+after the retries, a deadline after the request was sent, an unreadable success
+answer); calling again is then safe, revocation is idempotent. Leave the
 switch unset on any deployment that is not behind its own approval step (a
 shared gateway, for instance) -- the tool is then absent from `tools/list`.
 Unblocking an account and resetting a password stay out of scope.
@@ -98,7 +102,7 @@ different auth mode than intended.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` | Under delegated auth the signed-in user also needs an Entra role that may read service health (for example Service Support Administrator or Global Reader) |
-| `revoke_sign_in_sessions` (opt-in) | `User.RevokeSessions.All` | Only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`. A write permission: grant it only to the app registration of a deployment that needs the tool. Without it the tool answers `missing_permission` and nothing changes |
+| `revoke_sign_in_sessions` (opt-in) | `User.RevokeSessions.All` (app-only) or the **User Administrator** / **Helpdesk Administrator** directory role (delegated; **Privileged Authentication Administrator** for an administrator account) | Only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`. A write permission: grant it only to a deployment that needs the tool. The account lookup before it needs `User.Read.All`. Without the permission the tool answers `missing_permission` for the auth mode in use and nothing changes |
 
 ### Required Azure RBAC
 

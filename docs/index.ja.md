@@ -43,9 +43,10 @@ Microsoft は Entra ID データ向けに
 
 上のツールはすべて読み取り専用。状態を変えるツールは `revoke_sign_in_sessions`（1 アカウントを
 すべての場所からサインアウト。Graph `revokeSignInSessions`）の 1 本だけで、
-`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ登録され、`User.RevokeSessions.All` が要る。
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ登録され、`User.RevokeSessions.All`（app-only）
+または User Administrator／Helpdesk Administrator ロール（delegated）が要る。
 ゲストは断り、`not_covered`（アカウントの無効化・パスワードのリセット・MFA の削除はしない。
-発行済みのアクセストークンは期限まで使える）を返す。独自の承認の段を持たない配備では
+発行済みのアクセストークンは期限まで使える）を返す。`revoked: null` は結果不明で、呼び直してよい。独自の承認の段を持たない配備では
 スイッチを設定しないこと。アカウントのブロック解除とパスワードのリセットは引き続きスコープ外。
 
 ## 設計上の要点

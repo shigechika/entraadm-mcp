@@ -14,6 +14,7 @@ import pytest
 import entraadm_mcp.server as server
 from entraadm_mcp.client import (
     ApiResponseError,
+    ApiServerError,
     ApiTransportError,
     GraphDeadline,
     GraphError,
@@ -2290,6 +2291,16 @@ def test_vm_activity_search_reports_permission_errors_and_skips_junk_items(injec
 
 _REVOKE_ID = "11111111-2222-3333-4444-555555555555"
 _REVOKE_PATH = f"/users/{_REVOKE_ID}/revokeSignInSessions"
+_REVOKE_KEYS = {
+    "found",
+    "user_principal_name",
+    "account_enabled",
+    "revoked",
+    "at",
+    "error",
+    "missing_permission",
+    "not_covered",
+}
 
 
 def _tool_names(srv) -> set[str]:
@@ -2297,6 +2308,12 @@ def _tool_names(srv) -> set[str]:
         return {t.name for t in await srv.list_tools()}
 
     return asyncio.run(_names())
+
+
+def _fresh_registry() -> set[str]:
+    fresh = server._Server("t")
+    server._register_opt_in_tools(fresh)
+    return _tool_names(fresh)
 
 
 @pytest.fixture
@@ -2310,116 +2327,149 @@ def _revoke_user(**overrides):
     return {"value": [row]}
 
 
+def _revoke(client, inject):
+    inject(client)
+    out = server.revoke_sign_in_sessions("user@example.edu")
+    assert set(out) == _REVOKE_KEYS
+    return out
+
+
+def _posts(client):
+    return [c for c in client.calls if c[0] == "post"]
+
+
 def test_revoke_is_not_registered_without_the_flag(monkeypatch):
     monkeypatch.delenv("ENTRAADM_ENABLE_REVOKE_SESSIONS", raising=False)
-    assert "revoke_sign_in_sessions" not in _tool_names(server.mcp)
-    fresh = server._Server("t")
-    server._register_opt_in_tools(fresh)
-    assert "revoke_sign_in_sessions" not in _tool_names(fresh)
+    assert "revoke_sign_in_sessions" not in _fresh_registry()
 
 
 @pytest.mark.parametrize("value", ["true", "yes", " 1", "0", ""])
 def test_revoke_flag_must_be_exactly_one(monkeypatch, value):
     monkeypatch.setenv("ENTRAADM_ENABLE_REVOKE_SESSIONS", value)
-    fresh = server._Server("t")
-    server._register_opt_in_tools(fresh)
-    assert "revoke_sign_in_sessions" not in _tool_names(fresh)
+    assert "revoke_sign_in_sessions" not in _fresh_registry()
 
 
 def test_revoke_is_registered_with_the_flag(revoke_on):
-    fresh = server._Server("t")
-    server._register_opt_in_tools(fresh)
-    assert "revoke_sign_in_sessions" in _tool_names(fresh)
+    assert "revoke_sign_in_sessions" in _fresh_registry()
 
 
 def test_revoke_refuses_when_the_flag_is_off_even_if_called(inject, monkeypatch):
     monkeypatch.delenv("ENTRAADM_ENABLE_REVOKE_SESSIONS", raising=False)
-    client = inject(FakeGraphClient(get_responses={"/users": _revoke_user()}))
-    out = server.revoke_sign_in_sessions("user@example.edu")
-    assert "disabled" in out["error"]
+    client = FakeGraphClient(get_responses={"/users": _revoke_user()})
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and "disabled" in out["error"]
     assert client.calls == []
 
 
 def test_revoke_posts_to_the_resolved_id(inject, revoke_on):
-    client = inject(FakeGraphClient(get_responses={"/users": _revoke_user()}))
-    out = server.revoke_sign_in_sessions("user@example.edu")
-    assert out["revoked"] is True and out["found"] is True
+    client = FakeGraphClient(get_responses={"/users": _revoke_user()})
+    out = _revoke(client, inject)
+    assert out["revoked"] is True and out["found"] is True and out["error"] is None
     assert out["account_enabled"] is True and out["at"].endswith("Z")
     assert any("password" in item for item in out["not_covered"])
-    assert ("post", _REVOKE_PATH, None) in client.calls
+    assert _posts(client) == [("post", _REVOKE_PATH, None)]
     lookup = client.calls[0]
     assert lookup[0] == "get" and "userPrincipalName eq 'user@example.edu'" in lookup[2]["$filter"]
+    assert lookup[2]["$select"].split(",")[0] == "id"
 
 
 def test_revoke_not_found_does_not_post(inject, revoke_on):
-    client = inject(FakeGraphClient(get_responses={"/users": {"value": []}}))
-    out = server.revoke_sign_in_sessions("nobody@example.edu")
-    assert out == {"found": False, "user_principal_name": "nobody@example.edu", "revoked": False}
-    assert not [c for c in client.calls if c[0] == "post"]
+    client = FakeGraphClient(get_responses={"/users": {"value": []}})
+    out = _revoke(client, inject)
+    assert out["found"] is False and out["revoked"] is False and out["error"] is None
+    assert not _posts(client)
 
 
 def test_revoke_refuses_a_guest(inject, revoke_on):
-    client = inject(FakeGraphClient(get_responses={"/users": _revoke_user(userType="Guest")}))
-    out = server.revoke_sign_in_sessions("user@example.edu")
+    client = FakeGraphClient(get_responses={"/users": _revoke_user(userType="Guest")})
+    out = _revoke(client, inject)
     assert out["revoked"] is False and "guest" in out["error"]
-    assert not [c for c in client.calls if c[0] == "post"]
+    assert not _posts(client)
 
 
 def test_revoke_rejects_a_malformed_upn(inject, revoke_on):
-    client = inject(FakeGraphClient())
+    inject(FakeGraphClient())
     out = server.revoke_sign_in_sessions("not-an-upn")
-    assert "error" in out
-    assert client.calls == []
+    assert set(out) == _REVOKE_KEYS and out["revoked"] is False and "nothing was sent" in out["error"]
 
 
-def test_revoke_403_names_the_permission(inject, revoke_on):
-    inject(
-        FakeGraphClient(
-            get_responses={"/users": _revoke_user()},
-            post_responses={_REVOKE_PATH: GraphPermissionError("Authorization_RequestDenied: denied")},
-        )
+def test_revoke_refuses_a_non_guid_id(inject, revoke_on):
+    client = FakeGraphClient(get_responses={"/users": _revoke_user(id="../../x")})
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and "id shape" in out["error"]
+    assert not _posts(client)
+
+
+@pytest.mark.parametrize(
+    ("mode", "needle"),
+    [("app-only", "User.Read.All"), ("azure-cli", "Directory Readers")],
+)
+def test_revoke_lookup_403_names_the_read_permission(inject, revoke_on, mode, needle):
+    client = FakeGraphClient(get_responses={"/users": GraphPermissionError("Authorization_RequestDenied")}, mode=mode)
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and needle in out["missing_permission"]
+    assert not _posts(client)
+
+
+@pytest.mark.parametrize(
+    ("mode", "needle"),
+    [("app-only", "User.RevokeSessions.All"), ("azure-cli", "Helpdesk Administrator")],
+)
+def test_revoke_403_names_the_permission_for_the_auth_mode(inject, revoke_on, mode, needle):
+    client = FakeGraphClient(
+        get_responses={"/users": _revoke_user()},
+        post_responses={_REVOKE_PATH: GraphPermissionError("Authorization_RequestDenied: denied")},
+        mode=mode,
     )
-    out = server.revoke_sign_in_sessions("user@example.edu")
-    assert out["revoked"] is False and out["missing_permission"] == "User.RevokeSessions.All"
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and needle in out["missing_permission"]
 
 
-def test_revoke_deadline_is_unknown_not_failed(inject, revoke_on):
-    inject(
-        FakeGraphClient(
-            get_responses={"/users": _revoke_user()},
-            post_responses={_REVOKE_PATH: GraphDeadline("deadline passed while reading the response")},
-        )
+def test_revoke_deadline_before_sending_is_a_definite_no(inject, revoke_on):
+    client = FakeGraphClient(
+        get_responses={"/users": _revoke_user()},
+        post_responses={_REVOKE_PATH: GraphDeadline("deadline passed before the request could start")},
     )
-    out = server.revoke_sign_in_sessions("user@example.edu")
-    assert out["revoked"] is None and "calling again is safe" in out["error"]
-
-
-@pytest.mark.parametrize("status", [400, 500])
-def test_revoke_http_error_status_is_a_definite_no(inject, revoke_on, status):
-    inject(
-        FakeGraphClient(
-            get_responses={"/users": _revoke_user()},
-            post_responses={_REVOKE_PATH: GraphError(f"Graph request failed ({status}): bad")},
-        )
-    )
-    out = server.revoke_sign_in_sessions("user@example.edu")
-    assert out["revoked"] is False and str(status) in out["error"]
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and "nothing was sent" in out["error"]
 
 
 @pytest.mark.parametrize(
     "error",
     [
-        ApiTransportError("Graph request failed: network error (ReadError)"),
-        ApiResponseError("Graph returned a non-JSON body (200)"),
+        GraphDeadline("deadline passed while reading the response", may_have_applied=True),
+        ApiTransportError("Graph request failed: network error (ReadError)", may_have_applied=True),
+        ApiServerError("Graph request failed (504): timeout", may_have_applied=True),
+        ApiResponseError("Graph returned a non-JSON body (200)", may_have_applied=True),
+        GraphError("Graph request failed (429): too many", may_have_applied=True),
     ],
 )
-def test_revoke_indeterminate_failures_are_unknown(inject, revoke_on, error):
-    inject(FakeGraphClient(get_responses={"/users": _revoke_user()}, post_responses={_REVOKE_PATH: error}))
-    out = server.revoke_sign_in_sessions("user@example.edu")
+def test_revoke_unknown_outcomes_are_null(inject, revoke_on, error):
+    client = FakeGraphClient(get_responses={"/users": _revoke_user()}, post_responses={_REVOKE_PATH: error})
+    out = _revoke(client, inject)
     assert out["revoked"] is None and "idempotent" in out["error"]
 
 
+def test_revoke_transport_error_that_never_connected_is_a_no(inject, revoke_on):
+    client = FakeGraphClient(
+        get_responses={"/users": _revoke_user()},
+        post_responses={_REVOKE_PATH: ApiTransportError("Graph request failed: network error (ConnectError)")},
+    )
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and "not revoked" in out["error"]
+
+
+@pytest.mark.parametrize("status", [400, 404])
+def test_revoke_4xx_is_a_definite_no(inject, revoke_on, status):
+    client = FakeGraphClient(
+        get_responses={"/users": _revoke_user()},
+        post_responses={_REVOKE_PATH: GraphError(f"Graph request failed ({status}): bad")},
+    )
+    out = _revoke(client, inject)
+    assert out["revoked"] is False and str(status) in out["error"]
+
+
 def test_revoke_success_without_a_boolean_is_unknown(inject, revoke_on):
-    inject(FakeGraphClient(get_responses={"/users": _revoke_user()}, post_responses={_REVOKE_PATH: {}}))
-    out = server.revoke_sign_in_sessions("user@example.edu")
+    client = FakeGraphClient(get_responses={"/users": _revoke_user()}, post_responses={_REVOKE_PATH: {}})
+    out = _revoke(client, inject)
     assert out["revoked"] is None and "idempotent" in out["error"]

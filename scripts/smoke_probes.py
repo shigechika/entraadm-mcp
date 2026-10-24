@@ -95,6 +95,11 @@ async def _missing_vm_in_one_subscription(call: Caller) -> dict[str, Any]:
     return {**args, "vm": f"smoke-test-{secrets.token_hex(8)}"}
 
 
+#: Tools registered only behind an opt-in environment switch. Their specs stay
+#: here, and a run without the switch must not report them as stale.
+OPT_IN_TOOLS = frozenset({"revoke_sign_in_sessions"})
+
+
 PROBES: dict[str, Probe] = {
     "health_check": Probe(
         require_keys=("service", "version", "status", "auth_mode", "graph", "signin_probe", "arm"),
