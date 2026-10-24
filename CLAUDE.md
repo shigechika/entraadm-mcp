@@ -6,8 +6,10 @@ MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
 plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
 service health. Transport is stdio only. The 14 default tools are read-only;
 one state-changing tool, `revoke_sign_in_sessions`, is registered only when
-`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (see Conventions). Auth is env-var driven (see below); no config file. The
-one optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (see Conventions). Auth is env-var driven
+for one tenant; the optional `ENTRAADM_CONFIG` INI file (`[tenant.<name>]`
+sections) makes one process serve several tenants (see Conventions). The
+other optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
 ranges, same format as keycloak-mcp's `KEYCLOAK_SITES_INI`), loaded by
 `entraadm_mcp/sites.py` with longest-prefix lookup.
 
@@ -31,6 +33,14 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   silent fallback to the wrong mode). `max_pages_default()` reads
   `ENTRAADM_MAX_PAGES_DEFAULT`, clamped to `[MIN_MAX_PAGES, MAX_MAX_PAGES]`
   = `[1, 50]`, falling back to `DEFAULT_MAX_PAGES` = 5 on anything unparsable.
+  `load_tenants()` returns `Tenants`: env-only (`ENTRAADM_CONFIG` unset) is
+  one tenant named `default` that every UPN routes to; with the file, one
+  `TenantConfig` per `[tenant.<name>]` (`tenant_id`, `domains`, `default`,
+  optional `client_id` + `client_secret_env`; no secret in the file). A
+  section without `client_id` reuses the env app with its own `tenant_id`
+  (or `az login` in that tenant). Unknown section/key, missing
+  `tenant_id`/`domains`, a domain in two tenants, two defaults, or no
+  default among several -> `ConfigError`; `__main__` refuses to start then.
 - `entraadm_mcp/client.py` — `_RestClient` is the shared bearer-token
   client (token acquisition/caching with `_TOKEN_REFRESH_MARGIN_SECONDS` =
   300, retry budgets, the deadline-bounded request, `get()`/`get_paged()`
@@ -71,6 +81,23 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   tools). Every paged result carries `capped: bool`.
 
 ## Conventions
+
+- **Tenants.** `_state["client"]` stays the default tenant's GraphClient
+  (the historical test-injection point); other tenants' clients live in
+  `_state["clients"]` by name, created lazily; `_state["tenants"]` is the
+  loaded `Tenants` (inject one to test routing). `_client()` returns the
+  client of the tenant in effect (`_CURRENT_TENANT` contextvar).
+  `@_tenant_scoped(user_arg=..., refusal=...)` (innermost decorator) picks
+  it: explicit `tenant` argument (name or domain) > the UPN argument's
+  domain > the tenant already in effect (so `daily_brief`'s sections run in
+  the tenant it set) > default. An unknown tenant / unclaimed domain returns
+  `tenant_configured: false` (`configured_domains`), never raises; a
+  non-UPN is left to the tool's own validation. With a file, every dict
+  result gets `tenant`; env-only output is unchanged, except that
+  `revoke_sign_in_sessions` always carries `tenant`, `tenant_configured` and
+  `configured_domains` (its key set is fixed).
+  `health_check`/`daily_brief` keep the default tenant's keys on top and add
+  `tenant` + `tenants`. `_arm()` is always the default tenant's.
 
 - **`found: false`, not `error`, for "no such account".** `get_user` and
   `get_user_auth_methods` answer a nonexistent userPrincipalName with

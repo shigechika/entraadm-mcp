@@ -20,6 +20,14 @@ Tools:
 
 Every tool except ``revoke_sign_in_sessions`` is read-only.
 
+Tenants: one Entra tenant from the env vars, or several from the INI file named
+by ``ENTRAADM_CONFIG`` (``[tenant.<name>]`` sections, see config.py). A tool that
+takes a UPN works in the tenant claiming the UPN's domain (an unclaimed domain is
+a refusal with ``tenant_configured: false``); a tenant-wide tool takes an
+optional ``tenant`` (section name or domain, default: the default tenant);
+health_check and daily_brief cover every tenant; the ARM tools serve the default
+tenant only.
+
 Coverage contract: every result section that walks a paged Graph or ARM collection
 carries a ``capped`` boolean when its window was not fully scanned, so
 partial coverage is never mistaken for "nothing more to find". A permission
@@ -30,6 +38,7 @@ failure degrades only the section that hit it (``{"error": ...,
 from __future__ import annotations
 
 import collections
+import contextlib
 import contextvars
 import datetime
 import functools
@@ -61,9 +70,11 @@ from entraadm_mcp.config import (
     MAX_MAX_PAGES,
     MIN_MAX_PAGES,
     REVOKE_SESSIONS_ENV,
-    AuthConfig,
     ConfigError,
+    TenantConfig,
+    Tenants,
     deadline_seconds,
+    load_tenants,
     max_pages_default,
     revoke_sessions_enabled,
 )
@@ -117,7 +128,10 @@ mcp = _Server("entraadm-mcp", version=__version__)
 
 #: Injection points for tests: monkeypatch.setitem(server._state, "client", FakeGraphClient(...))
 #: and, for the ARM-backed tools, monkeypatch.setitem(server._state, "arm", FakeArmClient(...)).
-_state: dict[str, Any] = {"client": None, "arm": None}
+#: ``client`` is the default tenant's GraphClient (the historical single-tenant
+#: injection point); ``clients`` holds the other tenants' clients by tenant name;
+#: ``tenants`` is the loaded tenant set (inject a ``config.Tenants`` to test routing).
+_state: dict[str, Any] = {"client": None, "arm": None, "tenants": None, "clients": {}}
 
 _MIN_HOURS = 1
 #: Entra ID P1 sign-in/audit log retention is 30 days; a longer window returns nothing, not an error.
@@ -207,17 +221,133 @@ def _since(hours: int) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# The tenant a tool call works in, by name. Set by _tenant_scoped (and by
+# health_check/daily_brief per tenant); unset means the default tenant.
+_CURRENT_TENANT: contextvars.ContextVar[str | None] = contextvars.ContextVar("entraadm_tenant", default=None)
+
+
+def _tenants() -> Tenants:
+    """The configured tenants, loaded once (ConfigError on a bad ENTRAADM_CONFIG or env)."""
+    if _state["tenants"] is None:
+        _state["tenants"] = load_tenants()
+    return _state["tenants"]
+
+
+def _current_tenant() -> TenantConfig:
+    tenants = _tenants()
+    name = _CURRENT_TENANT.get()
+    return tenants.default if name is None else tenants.get(name)
+
+
 def _client() -> GraphClient:
-    if _state["client"] is None:
-        _state["client"] = GraphClient(AuthConfig.from_env())
-    return _state["client"]
+    """The GraphClient of the tenant this call works in, created on first use and kept."""
+    tenants = _tenants()
+    tenant = _current_tenant()
+    if tenant.name == tenants.default.name:
+        if _state["client"] is None:
+            _state["client"] = GraphClient(tenant.auth)
+        return _state["client"]
+    clients = _state["clients"]
+    if tenant.name not in clients:
+        clients[tenant.name] = GraphClient(tenant.auth)
+    return clients[tenant.name]
+
+
+@contextlib.contextmanager
+def _in_tenant(name: str):
+    token = _CURRENT_TENANT.set(name)
+    try:
+        yield
+    finally:
+        _CURRENT_TENANT.reset(token)
 
 
 def _arm() -> ArmClient:
-    """The ARM client, sharing the Graph client's credential (each caches its own scope's token)."""
+    """The ARM client of the DEFAULT tenant, sharing its Graph client's credential.
+
+    The Azure Resource Manager tools serve the default tenant only.
+    """
     if _state["arm"] is None:
-        _state["arm"] = ArmClient(AuthConfig.from_env(), credential=getattr(_client(), "credential", None))
+        with _in_tenant(_tenants().default.name):
+            graph = _client()
+        _state["arm"] = ArmClient(_tenants().default.auth, credential=getattr(graph, "credential", None))
     return _state["arm"]
+
+
+def _unknown_tenant(tenants: Tenants, ref: str) -> dict:
+    return {
+        "error": f"no configured tenant is named {ref!r} or claims that domain",
+        "tenant_configured": False,
+        "configured_tenants": tenants.names,
+        "configured_domains": tenants.domains,
+    }
+
+
+def _unknown_domain(tenants: Tenants, upn: str) -> dict:
+    return {
+        "error": f"no configured tenant claims the domain of {upn!r}",
+        "found": False,
+        "user_principal_name": upn,
+        "tenant_configured": False,
+        "configured_domains": tenants.domains,
+    }
+
+
+def _tenant_scoped(*, user_arg: str | None = None, refusal=None):
+    """Run a tool in the right tenant.
+
+    Precedence: a ``tenant`` argument (section name or one of its domains);
+    else the tenant claiming the domain of the ``user_arg`` argument (a UPN);
+    else the tenant already in effect (``daily_brief`` sets it per tenant);
+    else the default tenant. An unknown tenant or an unclaimed domain is a
+    normal refusal with ``tenant_configured: false`` (``refusal(arguments,
+    base)`` may reshape it), never an exception. A UPN that is not UPN-shaped
+    is left to the tool's own validation. With a tenant file, every dict
+    result names its ``tenant``; env-only results are unchanged.
+    """
+
+    def decorator(fn):
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                tenants = _tenants()
+            except ConfigError:
+                return fn(*args, **kwargs)  # the tool reports the ConfigError in its own shape
+            arguments = sig.bind_partial(*args, **kwargs).arguments
+            ref = arguments.get("tenant")
+            user = arguments.get(user_arg) if user_arg else None
+            tenant: TenantConfig | None
+            if isinstance(ref, str) and ref.strip():
+                tenant = tenants.resolve(ref)
+                if tenant is None:
+                    base = _unknown_tenant(tenants, ref)
+                    return refusal(arguments, base) if refusal else base
+            elif isinstance(user, str) and _is_upn(user):
+                tenant = tenants.for_upn(user)
+                if tenant is None:
+                    base = _unknown_domain(tenants, user)
+                    return refusal(arguments, base) if refusal else base
+            else:
+                tenant = _current_tenant()
+            with _in_tenant(tenant.name):
+                out = fn(*args, **kwargs)
+            if tenants.from_file and isinstance(out, dict) and "tenant" not in out:
+                out = {**out, "tenant": tenant.name}
+            return out
+
+        return wrapper
+
+    return decorator
+
+
+def _is_upn(value: str) -> bool:
+    try:
+        validate_upn(value)
+    except GraphError:
+        return False
+    return True
 
 
 def _find_user(client: GraphClient, upn: str, select: str) -> dict | None:
@@ -301,6 +431,15 @@ def health_check() -> dict:
     ``degraded``: without it every internal IP would be reported as an
     external spray suspect.
 
+    With a tenant file (``ENTRAADM_CONFIG``) every tenant is probed. The
+    top-level keys stay the DEFAULT tenant's, as in a single-tenant
+    deployment, plus ``tenant`` (the default's name) and ``tenants``:
+    ``{name: {default, domains, auth_mode, status, graph, signin_probe}}``
+    for every tenant, the default included. Another tenant that is not
+    ``healthy`` makes the top-level ``status`` at most ``degraded`` (the
+    default tenant alone can make it ``error``). ``arm`` is the default
+    tenant's only. Env-only results carry neither key.
+
     ``arm`` is a third, informational probe (Azure Resource Manager
     reachable, and how many subscriptions this credential can see). It
     never moves ``status``: Azure RBAC is optional for this server, and a
@@ -314,7 +453,9 @@ def health_check() -> dict:
     """
     site_status = sites.load().status()
     try:
-        client = _client()
+        tenants = _tenants()
+        with _in_tenant(tenants.default.name):
+            client = _client()
     except ConfigError as e:
         detail = str(e)
         return {
@@ -331,12 +472,11 @@ def health_check() -> dict:
     graph = client.check()
     signin_probe = client.probe_signin_access()
     arm = _arm().check(deadline=time.monotonic() + _ARM_PROBE_SECONDS)
-    ok_count = sum(1 for probe in (graph, signin_probe) if probe["auth"] == "ok")
-    status = "healthy" if ok_count == 2 else "degraded" if ok_count == 1 else "error"
+    status = _probe_status(graph, signin_probe)
     if status == "healthy" and site_status["error"] is not None:
         status = "degraded"
 
-    return {
+    result = {
         "service": "entraadm-mcp",
         "version": __version__,
         "status": status,
@@ -346,6 +486,36 @@ def health_check() -> dict:
         "arm": arm,
         "sites": site_status,
     }
+    if not tenants.from_file:
+        return result
+
+    per_tenant = {}
+    for t in tenants.tenants:
+        if t.name == tenants.default.name:
+            mode, t_graph, t_signin = client.mode, graph, signin_probe
+        else:
+            with _in_tenant(t.name):
+                other = _client()
+                mode, t_graph, t_signin = other.mode, other.check(), other.probe_signin_access()
+        per_tenant[t.name] = {
+            "default": t.default,
+            "domains": list(t.domains),
+            "auth_mode": mode,
+            "status": _probe_status(t_graph, t_signin),
+            "graph": t_graph,
+            "signin_probe": t_signin,
+        }
+    others_ok = all(v["status"] == "healthy" for k, v in per_tenant.items() if k != tenants.default.name)
+    if result["status"] == "healthy" and not others_ok:
+        result["status"] = "degraded"
+    result["tenant"] = tenants.default.name
+    result["tenants"] = per_tenant
+    return result
+
+
+def _probe_status(graph: dict, signin_probe: dict) -> str:
+    ok_count = sum(1 for probe in (graph, signin_probe) if probe["auth"] == "ok")
+    return "healthy" if ok_count == 2 else "degraded" if ok_count == 1 else "error"
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +599,7 @@ def _user_entry(u: dict, license_names: list[str], licenses_capped: bool) -> dic
 
 @mcp.tool()
 @_with_call_deadline
+@_tenant_scoped(user_arg="upn")
 def get_user(upn: str) -> dict:
     """One account's identity/lifecycle state -- the first thing to check on any triage report.
 
@@ -544,6 +715,7 @@ def _signin_entry(s: dict) -> dict:
 
 
 @mcp.tool()
+@_tenant_scoped(user_arg="user")
 def signin_logs(
     user: str,
     hours: int = 24,
@@ -654,7 +826,15 @@ _BY_IP_USERS_LIMIT = 50
 
 
 @mcp.tool()
-def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, max_pages: int | None = None) -> dict:
+@_tenant_scoped()
+def signin_by_ip(
+    ip: str,
+    hours: int = 24,
+    result: str = "all",
+    top: int = 50,
+    max_pages: int | None = None,
+    tenant: str | None = None,
+) -> dict:
     """Every sign-in from one source IP: who got in from it, who was tried, and when.
 
     The follow-up to a ``spray_suspects`` or ``shared_ips`` hit: Graph can
@@ -678,6 +858,7 @@ def signin_by_ip(ip: str, hours: int = 24, result: str = "all", top: int = 50, m
         result: "all" (default), "success", or "failure" -- which events to list.
         top: Maximum events to return, clamped to [1, 500].
         max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
     """
     # validate only: keep the caller's spelling, because Graph compares the
     # ipAddress string literally and an expanded IPv6 form from the log would
@@ -774,7 +955,8 @@ _STATS_SELECT = ",".join(["createdDateTime", "userPrincipalName", "appDisplayNam
 
 
 @mcp.tool()
-def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
+@_tenant_scoped()
+def signin_failure_stats(hours: int = 24, max_pages: int | None = None, tenant: str | None = None) -> dict:
     """Tenant-wide sign-in failure aggregation -- the Entra ID counterpart to the RADIUS failure patrol.
 
     Time-bounded (ENTRAADM_DEADLINE, default 45 s): on a wide window or a busy day the scan
@@ -814,6 +996,7 @@ def signin_failure_stats(hours: int = 24, max_pages: int | None = None) -> dict:
     Args:
         hours: How far back to look, clamped to [1, 720] (30 days).
         max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
     """
     hours = _clamp_hours(hours)
     pages_budget = _resolve_max_pages(max_pages)
@@ -943,7 +1126,10 @@ _SHARED_IPS_LIMIT = 50
 
 
 @mcp.tool()
-def signin_success_stats(hours: int = 24, max_pages: int | None = None, min_distinct_users: int = 2) -> dict:
+@_tenant_scoped()
+def signin_success_stats(
+    hours: int = 24, max_pages: int | None = None, min_distinct_users: int = 2, tenant: str | None = None
+) -> dict:
     """Tenant-wide *successful* sign-in aggregation by source IP -- the view that finds a breach.
 
     ``signin_failure_stats`` shows who is being attacked; this shows whether
@@ -978,6 +1164,7 @@ def signin_success_stats(hours: int = 24, max_pages: int | None = None, min_dist
         max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
         min_distinct_users: Distinct accounts an IP needs to appear in
             ``shared_ips`` (default 2, clamped to >= 2).
+        tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
     """
     hours = _clamp_hours(hours)
     pages_budget = _resolve_max_pages(max_pages)
@@ -1145,12 +1332,14 @@ def _matches_user(a: dict, user: str) -> bool:
 
 
 @mcp.tool()
+@_tenant_scoped(user_arg="user")
 def directory_audits(
     user: str | None = None,
     hours: int = 24,
     top: int = 25,
     max_pages: int | None = None,
     category: str | None = None,
+    tenant: str | None = None,
 ) -> dict:
     """Who did what to the directory, and when -- the operator-side counterpart to signin_logs.
 
@@ -1189,6 +1378,7 @@ def directory_audits(
         hours: How far back to look, clamped to [1, 720] (30 days).
         top: Maximum records to return, clamped to [1, 500].
         max_pages: Page budget (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
     """
     if user is not None:
         try:
@@ -1250,6 +1440,7 @@ def _method_entry(m: dict) -> dict:
 
 @mcp.tool()
 @_with_call_deadline
+@_tenant_scoped(user_arg="upn")
 def get_user_auth_methods(upn: str) -> dict:
     """Registered authentication methods for one account -- is MFA actually set up?
 
@@ -1444,6 +1635,9 @@ def _resolve_subscriptions(
 def list_subscriptions(max_pages: int | None = None) -> dict:
     """The Azure subscriptions this credential can see, as ARM lists them.
 
+    Azure Resource Manager in the DEFAULT tenant only, also when several tenants are
+    configured (``ENTRAADM_CONFIG``).
+
     Read-only (``GET /subscriptions``; needs no RBAC beyond being able to see a
     subscription at all). The discovery anchor for ``vm_backup_status`` and
     ``vm_backup_policies``: both accept a subscription id or display name from
@@ -1593,6 +1787,9 @@ def vm_backup_status(
     subscription: str | None = None, stale_hours: int = _DEFAULT_STALE_HOURS, max_pages: int | None = None
 ) -> dict:
     """Which Azure VMs are backed up by Azure Backup, and whether the last backup succeeded.
+
+    Azure Resource Manager in the DEFAULT tenant only, also when several tenants are
+    configured (``ENTRAADM_CONFIG``).
 
     Joins every VM of a subscription (``Microsoft.Compute/virtualMachines``)
     with the Azure-VM protected items of its Recovery Services vaults, on the
@@ -1866,6 +2063,9 @@ def _policy_entry(policy: dict, vault: dict) -> dict:
 def vm_backup_policies(subscription: str | None = None, max_pages: int | None = None) -> dict:
     """Schedule and retention of the Azure VM backup policies in each Recovery Services vault.
 
+    Azure Resource Manager in the DEFAULT tenant only, also when several tenants are
+    configured (``ENTRAADM_CONFIG``).
+
     Read-only; needs the Reader role on the subscription. Per policy:
     ``policy_type`` (``V1`` = ``SimpleSchedulePolicy``, ``V2`` =
     ``SimpleSchedulePolicyV2`` with an hourly / daily / weekly schedule),
@@ -2116,6 +2316,9 @@ def vm_activity(
 ) -> dict:
     """What happened to an Azure VM in a time window: operations people ran, and events Azure raised.
 
+    Azure Resource Manager in the DEFAULT tenant only, also when several tenants are
+    configured (``ENTRAADM_CONFIG``).
+
     Answers "did someone restart this VM, or did Azure?" from the Azure activity
     log of the VM's subscription. Read-only; needs the Reader role on the
     subscription. Two reads: the VM's resource group (server-side filter, so a
@@ -2330,7 +2533,8 @@ def _issue_entry(issue: dict) -> dict:
 
 @mcp.tool()
 @_with_call_deadline
-def m365_service_health(max_pages: int | None = None) -> dict:
+@_tenant_scoped()
+def m365_service_health(max_pages: int | None = None, tenant: str | None = None) -> dict:
     """Microsoft 365 service status per service, and the open incidents and advisories.
 
     Two Graph reads (``ServiceHealth.Read.All``): ``healthOverviews`` (one row
@@ -2342,6 +2546,10 @@ def m365_service_health(max_pages: int | None = None) -> dict:
     whatever came back. ``capped`` means either collection was cut short by
     the page budget, so the counts are lower bounds. The message center
     (``messages``) needs a different permission and is not read.
+
+    Args:
+        max_pages: Page budget for each collection (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        tenant: Tenant to read: a [tenant.<name>] section name or one of its domains (default: the default tenant).
     """
     pages = _resolve_max_pages(max_pages)
     try:
@@ -2408,6 +2616,13 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
     the one scan that could exhaust the shared budget, so call
     ``vm_backup_status`` separately.
 
+    With a tenant file (``ENTRAADM_CONFIG``) it covers every tenant: the
+    top-level keys stay the DEFAULT tenant's brief, exactly as in a
+    single-tenant deployment, plus ``tenant`` (the default's name) and
+    ``tenants`` (``{name: the same brief}`` for each other tenant). All
+    tenants share one call budget, run default first, so a slow default can
+    leave the others ``capped``. Env-only results carry neither key.
+
     Runs both sections synchronously in one tool call, unlike the sibling
     gwsadm-mcp's job+poll ``daily_brief``. If this proves too slow for a
     tenant's sign-in volume against the client's tool-call timeout, port
@@ -2423,15 +2638,33 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
 
     token = _CALL_DEADLINE.set(_new_deadline())
     try:
-        # Cheapest first: service health is two small reads, the audit log is the small, fast
-        # scan and the sign-in scan is the one that can use the whole budget. A slow sign-in
-        # scan therefore cannot leave the earlier sections starting with an expired budget and
-        # reporting an empty list.
-        health = m365_service_health(max_pages=max_pages)
-        audits = directory_audits(hours=hours, max_pages=max_pages)
-        stats = signin_failure_stats(hours=hours, max_pages=max_pages)
+        try:
+            tenants = _tenants()
+        except ConfigError:
+            return _brief(hours, max_pages)  # each section reports the ConfigError itself
+        with _in_tenant(tenants.default.name):
+            out = _brief(hours, max_pages)
+        if tenants.from_file:
+            out["tenant"] = tenants.default.name
+            out["tenants"] = {}
+            for t in tenants.tenants:
+                if t.name != tenants.default.name:
+                    with _in_tenant(t.name):
+                        out["tenants"][t.name] = _brief(hours, max_pages)
+        return out
     finally:
         _CALL_DEADLINE.reset(token)
+
+
+def _brief(hours: int, max_pages: int | None) -> dict:
+    """daily_brief's sections and summary for the tenant in effect."""
+    # Cheapest first: service health is two small reads, the audit log is the small, fast
+    # scan and the sign-in scan is the one that can use the whole budget. A slow sign-in
+    # scan therefore cannot leave the earlier sections starting with an expired budget and
+    # reporting an empty list.
+    health = m365_service_health(max_pages=max_pages)
+    audits = directory_audits(hours=hours, max_pages=max_pages)
+    stats = signin_failure_stats(hours=hours, max_pages=max_pages)
 
     if "error" in health:
         summary: dict = {"service_health": health}
@@ -2506,7 +2739,36 @@ _LOOKUP_PERMISSION = {
 }
 
 
+def _revoke_base(upn: str) -> dict:
+    return {
+        "found": None,
+        "user_principal_name": upn,
+        "account_enabled": None,
+        "revoked": False,
+        "at": None,
+        "error": None,
+        "missing_permission": None,
+        "tenant": None,
+        "tenant_configured": True,
+        "configured_domains": None,
+        "not_covered": list(REVOKE_NOT_COVERED),
+    }
+
+
+def _revoke_refusal(arguments: dict, refusal: dict) -> dict:
+    """An unclaimed UPN domain in revoke_sign_in_sessions' own result shape: nothing was sent."""
+    upn = arguments.get("upn", "")
+    return {
+        **_revoke_base(upn),
+        "found": False,
+        "tenant_configured": False,
+        "error": f"{refusal['error']}; nothing was sent",
+        "configured_domains": refusal["configured_domains"],
+    }
+
+
 @_with_call_deadline
+@_tenant_scoped(user_arg="upn", refusal=_revoke_refusal)
 def revoke_sign_in_sessions(upn: str) -> dict:
     """Sign one account out everywhere: invalidate its refresh tokens and session cookies.
 
@@ -2539,16 +2801,11 @@ def revoke_sign_in_sessions(upn: str) -> dict:
     Args:
         upn: The account's exact userPrincipalName, e.g. "user@example.edu".
     """
-    result: dict[str, Any] = {
-        "found": None,
-        "user_principal_name": upn,
-        "account_enabled": None,
-        "revoked": False,
-        "at": None,
-        "error": None,
-        "missing_permission": None,
-        "not_covered": list(REVOKE_NOT_COVERED),
-    }
+    result = _revoke_base(upn)
+    try:
+        result["tenant"] = _current_tenant().name
+    except ConfigError:
+        pass  # reported by the lookup below
     if not revoke_sessions_enabled():
         return {**result, "error": f"revoke_sign_in_sessions is disabled; set {REVOKE_SESSIONS_ENV}=1 to enable it"}
     client = None

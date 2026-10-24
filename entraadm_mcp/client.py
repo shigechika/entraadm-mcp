@@ -131,7 +131,7 @@ def _build_credential(config: AuthConfig):
             client_id=config.client_id,
             client_secret=config.client_secret,
         )
-    return AzureCliCredential()
+    return AzureCliCredential(tenant_id=config.tenant_id or "")
 
 
 #: Graph error codes that mean "wrong role/permission", mapped to actionable

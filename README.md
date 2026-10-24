@@ -156,6 +156,8 @@ export ENTRAADM_SITES_INI=/path/to/sites.ini
 # Register revoke_sign_in_sessions, the one state-changing tool (exactly "1"; anything
 # else leaves it off). Also needs the User.RevokeSessions.All permission.
 export ENTRAADM_ENABLE_REVOKE_SESSIONS=1
+# Serve several tenants from one process (see "Several tenants" below).
+export ENTRAADM_CONFIG=/path/to/tenants.ini
 ```
 
 `ENTRAADM_SITES_INI` uses the same format as keycloak-mcp's `KEYCLOAK_SITES_INI`,
@@ -163,6 +165,75 @@ so one file can serve both (see [`sites.ini.example`](sites.ini.example)). Looku
 longest-prefix. A file that is set but cannot be read makes `health_check` report
 `degraded`, and every IP is then treated as external. An invalid CIDR is reported the
 same way, but the valid ranges are still used.
+
+### Several tenants
+
+One process can serve several Entra tenants, the way gwsadm-mcp serves several
+Workspace domains. Point `ENTRAADM_CONFIG` at an INI file with one
+`[tenant.<name>]` section per tenant:
+
+```ini
+[tenant.staff]
+tenant_id = 00000000-0000-0000-0000-000000000001
+domains = example.edu
+default = true
+
+[tenant.students]
+tenant_id = 00000000-0000-0000-0000-000000000002
+domains = students.example.edu
+; optional: an app registration of its own instead of the shared one
+; client_id = 00000000-0000-0000-0000-000000000003
+; client_secret_env = ENTRAADM_STUDENTS_CLIENT_SECRET
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `tenant_id` | yes | The tenant's id (GUID) or its domain name |
+| `domains` | yes | Comma-separated UPN domains routed to this tenant (exact match, any case) |
+| `default` | on one section when there are several | The tenant used when a call names none; a single section is the default anyway |
+| `client_id` + `client_secret_env` | no, both or neither | An app of its own; `client_secret_env` names the env var holding its secret. Never put a secret in the file |
+
+A section without `client_id` reuses the env app (`ENTRAADM_CLIENT_ID` /
+`ENTRAADM_CLIENT_SECRET`), with the token requested from that section's
+tenant; with no env app it uses `az login` in that tenant. `ENTRAADM_TENANT_ID`
+is not used when `ENTRAADM_CONFIG` is set. Unset `ENTRAADM_CONFIG` keeps the
+single-tenant setup above unchanged.
+
+To share one app across tenants, make the app registration multi-tenant
+(*Supported account types*: accounts in any organizational directory), add the
+same Graph application permissions, then have an administrator of each other
+tenant grant admin consent:
+
+```
+https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
+```
+
+The server refuses to start, and `--check` fails, when the file is unreadable,
+has a section that is not `[tenant.*]` or an unknown key, misses `tenant_id` or
+`domains`, gives one domain to two tenants, or has no default (or two) among
+several tenants. `--check` probes every tenant.
+
+Routing:
+
+- A tool that takes a UPN (`get_user`, `get_user_auth_methods`, `signin_logs`,
+  `revoke_sign_in_sessions`, and `directory_audits` when `user` is given) works
+  in the tenant whose `domains` holds the UPN's domain. A domain no tenant
+  claims is a refusal, not an exception: `tenant_configured: false` with the
+  `configured_domains` (for `revoke_sign_in_sessions`: `revoked: false`,
+  `found: false`; nothing is sent).
+- A tenant-wide tool (`signin_failure_stats`, `signin_success_stats`,
+  `signin_by_ip`, `directory_audits`, `m365_service_health`) takes an optional
+  `tenant`: a section name or one of its domains; default the default tenant.
+  An explicit `tenant` wins over `directory_audits`' `user`.
+- `health_check` and `daily_brief` cover every tenant. Their top-level keys stay
+  the default tenant's, as before; `tenant` names it and `tenants` holds the
+  per-tenant results. Another unhealthy tenant makes `health_check`'s `status`
+  at most `degraded`.
+- The Azure Resource Manager tools (`list_subscriptions`, `vm_backup_status`,
+  `vm_backup_policies`, `vm_activity`) serve the default tenant only.
+- With a tenant file, every result names its `tenant`. Env-only results are
+  unchanged, except that `revoke_sign_in_sessions` always carries `tenant`,
+  `tenant_configured` and `configured_domains` (its keys never vary).
 
 ## Usage
 

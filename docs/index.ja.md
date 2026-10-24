@@ -51,6 +51,12 @@ Microsoft は Entra ID データ向けに
 
 ## 設計上の要点
 
+**1 つのプロセスで複数のテナント（任意）。** `ENTRAADM_CONFIG` が無ければ env の 1 テナント。
+あれば `[tenant.<名前>]` の節を持つ INI ファイル（gwsadm-mcp の `[domain.*]` に当たる）で，
+UPN を取るツールは UPN のドメインで振り分け，テナント全体のツールは `tenant` を取り，
+`health_check` と `daily_brief` はすべてのテナントを見て，ARM のツールは既定のテナントだけを見る。
+README の「複数のテナント」を参照。
+
 **環境変数の組み合わせで2つの認証モードを切り替える。** `ENTRAADM_TENANT_ID`／
 `_CLIENT_ID`／`_CLIENT_SECRET` の3つとも設定すると app-only
 （`ClientSecretCredential`）——無人デプロイの本番経路。3つとも未設定なら現在の

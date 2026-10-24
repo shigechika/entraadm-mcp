@@ -45,6 +45,17 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 
 Azure RBAC は任意。`health_check` の `arm` プローブは情報扱い。
 
+### 複数のテナント
+
+`ENTRAADM_CONFIG` に，テナントごとに `[tenant.<名前>]` の節（`tenant_id`・`domains`・省略可の `default`・
+省略可の `client_id` と `client_secret_env`）を持つ INI ファイルを指定する。形式・マルチテナントのアプリ・
+管理者の同意（`https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>`）は
+README の「複数のテナント」を参照。UPN を取るツールは UPN のドメインを持つテナントで動く（どこも
+持たなければ `tenant_configured: false` と `configured_domains`）。テナント全体を見るツールは `tenant`
+（節の名前かドメイン。省略で既定のテナント）を取る。`health_check`／`daily_brief` は最上位に既定の
+テナントのキーを残し，`tenant` と `tenants` を足す。ARM のツールは既定のテナントだけ。テナントの
+ファイルを使うと結果には必ず `tenant` が付く。
+
 ## ツール
 
 ### `health_check()`
@@ -84,7 +95,7 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 窓全体を走査しきれなかったことを意味する——一致件数が少なく `capped=true` の
 場合は「予算内で見つからなかった」のであって「存在しない」ではない。
 
-### `signin_failure_stats(hours=24, max_pages=None)`
+### `signin_failure_stats(hours=24, max_pages=None, tenant=None)`
 
 テナント全体の失敗集計：AADSTS エラーコード（注釈付き）・失敗ユーザ・アプリ・
 送信元IPの上位。`spray_suspects` は、5人以上の異なるユーザに対して失敗している
@@ -97,7 +108,7 @@ NAT の出口や共用端末に外部の送信元が埋もれないようにす�
 読めないときはすべて `spray_suspects` に残す。`daily_brief` の要約には
 内部の疑いの一覧と，ファイルにエラーがあるときの `sites_error` が入る。
 
-### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2)`
+### `signin_success_stats(hours=24, max_pages=None, min_distinct_users=2, tenant=None)`
 
 テナント全体の*成功した*サインインを送信元IPで集計する——`signin_failure_stats`
 の対：あちらは誰が攻撃されているかを、こちらは誰かが入られたかを示す。
@@ -111,7 +122,7 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 対話型サインインだけを見る（レガシー認証はすべて対話型として記録されるので漏れない。
 非対話型のトークン更新は数えない）。
 
-### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None)`
+### `signin_by_ip(ip, hours=24, result="all", top=50, max_pages=None, tenant=None)`
 
 1 つの送信元IPからの全サインイン——`spray_suspects` や `shared_ips` に出た IP の
 追跡用。Graph は `ipAddress` でサーバ側フィルタできるので、ログ走査でなく 1 回の
@@ -121,7 +132,7 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 `events_truncated` は `top` より多くの該当行を読んだ印（`users` はそれも数えている）。
 `ip` は IPv4/IPv6 アドレスとして解釈できる文字列に限る。
 
-### `directory_audits(user=None, hours=24, top=25, max_pages=None)`
+### `directory_audits(user=None, hours=24, top=25, max_pages=None, category=None, tenant=None)`
 
 ディレクトリ監査証跡：誰が何を（ブロック／解除・属性編集）、いつ行ったか。
 `user` を指定すると、そのアカウントが実行者またはターゲットのいずれかである
@@ -216,7 +227,7 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
   ページか時間の予算に達したか、サブスクリプションの読み取りが失敗した。失敗の理由は
   `subscription_read_error`）。そのときは空の項目が「何も無かった」証拠にならない
 
-### `m365_service_health(max_pages=None)`
+### `m365_service_health(max_pages=None, tenant=None)`
 
 `services`：Microsoft 365 の各サービスと現在の状態（`healthOverviews`）。`issues`：未解決の
 インシデント・アドバイザリを新しい順に（`id`、`title`、`service`、`feature`、`classification`、

@@ -8,38 +8,43 @@ from entraadm_mcp import __version__
 
 
 def _check() -> int:
-    """Config + auth + Graph smoke test (plus an informational ARM line). Exit 0 = Graph reachable."""
-    from entraadm_mcp.client import GraphClient
-    from entraadm_mcp.config import AuthConfig, ConfigError
+    """Config + auth + Graph smoke test per tenant (plus an informational ARM line). Exit 0 = every Graph reachable."""
+    import time
+
+    from entraadm_mcp.client import ArmClient, GraphClient
+    from entraadm_mcp.config import ConfigError, load_tenants
 
     try:
-        config = AuthConfig.from_env()
+        tenants = load_tenants()
     except ConfigError as e:
         print(f"Error: {e}")
         return 2
-    print(f"OK: auth mode = {config.mode}")
-    client = GraphClient(config)
-    graph = client.check()
-    if graph.get("auth") != "ok":
-        print(f"Error: Graph unreachable — {graph.get('detail')}")
-        return 1
-    print("OK: Graph reachable")
-    signin = client.probe_signin_access()
-    if signin.get("auth") == "ok":
-        print("OK: sign-in log access confirmed")
-    else:
-        print(f"Degraded: sign-in log access unavailable — {signin.get('detail')}")
-    # Informational, like health_check's ``arm`` probe: Azure RBAC is optional.
-    import time
-
-    from entraadm_mcp.client import ArmClient
-
-    arm = ArmClient(config, credential=client.credential).check(deadline=time.monotonic() + 10.0)
+    rc = 0
+    default_client = None
+    for tenant in tenants.tenants:
+        label = f"[{tenant.name}{', default' if tenant.default else ''}] " if tenants.from_file else ""
+        print(f"OK: {label}auth mode = {tenant.auth.mode}")
+        client = GraphClient(tenant.auth)
+        if tenant.default:
+            default_client = client
+        graph = client.check()
+        if graph.get("auth") != "ok":
+            print(f"Error: {label}Graph unreachable — {graph.get('detail')}")
+            rc = 1
+            continue
+        print(f"OK: {label}Graph reachable")
+        signin = client.probe_signin_access()
+        if signin.get("auth") == "ok":
+            print(f"OK: {label}sign-in log access confirmed")
+        else:
+            print(f"Degraded: {label}sign-in log access unavailable — {signin.get('detail')}")
+    # Informational, like health_check's ``arm`` probe: Azure RBAC is optional. Default tenant only.
+    arm = ArmClient(tenants.default.auth, credential=default_client.credential).check(deadline=time.monotonic() + 10.0)
     if arm.get("auth") == "ok":
         print(f"Info: ARM reachable, {arm.get('subscriptions')} subscription(s) visible")
     else:
         print(f"Info: ARM not usable — {arm.get('detail')}")
-    return 0
+    return rc
 
 
 def main() -> None:
@@ -49,6 +54,16 @@ def main() -> None:
         return
     if "--check" in argv:
         sys.exit(_check())
+    if os.environ.get("ENTRAADM_CONFIG", "").strip():
+        # A tenant file is validated before serving: a duplicate domain or a missing
+        # default would otherwise surface only as an error on every tool call.
+        from entraadm_mcp.config import ConfigError, load_tenants
+
+        try:
+            load_tenants()
+        except ConfigError as e:
+            print(f"entraadm-mcp: {e}", file=sys.stderr)
+            sys.exit(2)
     try:
         # Import lazily so --version / --check work without the MCP runtime.
         # The import sits inside the try so a ^C during the (slow) import chain
