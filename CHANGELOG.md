@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.0](https://github.com/shigechika/entraadm-mcp/compare/v1.6.0...v1.7.0) (2026-10-24)
+
+
+### Features
+
+* add compromise_suspects, accounts that were probably taken over ([#27](https://github.com/shigechika/entraadm-mcp/issues/27)) ([273f30f](https://github.com/shigechika/entraadm-mcp/commit/273f30f902d4209121fae6b783730d2bc6294370))
+
 ## [1.6.0](https://github.com/shigechika/entraadm-mcp/compare/v1.5.0...v1.6.0) (2026-10-24)
 
 
