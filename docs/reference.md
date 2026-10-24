@@ -38,6 +38,7 @@ but the valid ranges are still used.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `compromise_suspects`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` (delegated auth also needs an Entra role that may read service health, e.g. Service Support Administrator or Global Reader) |
+| `compromise_suspects`' `microsoft_risky_users`, the `identity_protection` probe | `IdentityRiskyUser.Read.All` (optional; Identity Protection needs Entra ID P2, without it the probe says `not_licensed`) |
 | `revoke_sign_in_sessions` (opt-in, `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`) | `User.RevokeSessions.All` (app-only) or the User Administrator / Helpdesk Administrator directory role (delegated; Privileged Authentication Administrator for an administrator account). A write permission; grant it only where the tool is enabled. The lookup before it needs `User.Read.All` |
 
 ### Required Azure RBAC
@@ -74,7 +75,10 @@ only. With a tenant file every result names its `tenant`.
 ### `health_check()`
 
 No parameters. Returns `{service, version, status, auth_mode, graph,
-signin_probe, arm, sites}`. `graph` probes basic Graph reachability
+signin_probe, arm, sites, home_countries, identity_protection}`
+(`identity_protection`: `{status, detail}`, the Identity Protection licence
+probe, informational -- `not_licensed` never changes `status`; per tenant in
+`tenants` too). `graph` probes basic Graph reachability
 (`GET /users` with `$top=1` -- needs only `User.Read.All`); `signin_probe` additionally checks sign-in log
 access. `status` is `"healthy"` when both succeed, `"degraded"` when Graph
 is reachable but sign-in log access is not, `"error"` when Graph itself is
@@ -167,6 +171,25 @@ success with no country is never foreign; unset home countries leave the
 list empty with `home_countries.configured: false`. `counts` are distinct
 accounts per severity (an account in both lists counts once). Lists cap at
 50 (`*_capped`); `capped` follows the walk; `how_to_read` says what to act on.
+**Identity Protection (Entra ID P2).** `compromise_suspects` adds Microsoft's own
+risk verdicts when the tenant has them: a cheap `riskyUsers?$top=1` probe
+classifies each tenant as `licensed`, `not_licensed` (403 "not licensed": no
+Entra ID P2), `no_permission` (other 403: no `IdentityRiskyUser.Read.All`) or
+`error`; `licensed` and `not_licensed` are cached for an hour (a 200 whose rows
+say `riskLevel: hidden` also means no P2). The endpoint itself is probed:
+`/subscribedSkus` can be refused and a SKU list would still have to be mapped to
+P2. `health_check` reports it per tenant
+without changing `status`, and `daily_brief`'s summary per tenant, so the day
+P2 appears is noticed. Licensed: `microsoft_risky_users` lists open
+(`atRisk` / `confirmedCompromised`) high-risk users and, separately, medium,
+marking those also in `spray_breaches` / `foreign_successes`. `counts` are then
+distinct accounts over every finding, before the lists are cut: `high` is any
+account high here or in Microsoft's high list, `medium` any medium here or in
+Microsoft's medium list that is not high (`counts.microsoft_high` /
+`microsoft_medium` say how many Microsoft lists). Otherwise the
+section is `{available: false, reason}` and nothing else changes -- never read
+it as "no risky users".
+
 `daily_brief` carries the counts and the top 5 of each list, from the same
 walk as its failure stats (its select adds `clientAppUsed` and `location`, so
 a deadline-bound walk can stop slightly earlier); its summary repeats

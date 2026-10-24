@@ -25,6 +25,14 @@ from entraadm_mcp.config import AuthConfig, TenantConfig, Tenants
 
 ENV_ONLY = Tenants((TenantConfig(name="default", auth=AuthConfig(mode="azure-cli"), default=True),))
 
+
+def not_licensed():
+    error = GraphPermissionError("forbidden: the signed-in identity or app registration lacks the Graph permission")
+    error.code = "Forbidden"
+    error.api_message = "Your tenant is not licensed for this feature."
+    return error
+
+
 PERM_ERROR = GraphPermissionError(
     "insufficient privileges: this endpoint needs the Reports Reader directory role "
     "(delegated, azure-cli auth) or an application permission such as AuditLog.Read.All (app-only auth)"
@@ -53,7 +61,9 @@ class FakeGraphClient:
         # post_responses: dict[path] -> dict | Exception (default {"value": True})
         self._post_responses = post_responses if post_responses is not None else {}
         # get_responses: dict[path] -> dict | Exception, or a single dict/Exception used for all paths
-        self._get_responses = get_responses if get_responses is not None else {}
+        self._get_responses = dict(get_responses) if get_responses is not None else {}
+        # Like the real tenants: Identity Protection answers "not licensed" unless a test says otherwise.
+        self._get_responses.setdefault("/identityProtection/riskyUsers", not_licensed())
         # paged_responses: dict[path] -> (items, capped) | Exception
         self._paged_responses = paged_responses if paged_responses is not None else {}
         self._check_result = check_result if check_result is not None else {"auth": "ok", "detail": None}
@@ -142,6 +152,7 @@ def inject(monkeypatch):
     # A developer shell may point at a real sites file; tests opt in explicitly.
     monkeypatch.delenv("ENTRAADM_SITES_INI", raising=False)
     monkeypatch.delenv("ENTRAADM_HOME_COUNTRIES", raising=False)
+    monkeypatch.setattr(server, "_ip_cache", {})
 
     # health_check also probes ARM; without a double here it would build a real
     # ArmClient (and AzureCliCredential would shell out to `az`).
@@ -293,7 +304,9 @@ def test_health_check_shape_is_identical_across_all_statuses(inject):
             "arm",
             "sites",
             "home_countries",
+            "identity_protection",
         }
+        assert set(result["identity_protection"].keys()) == {"status", "detail"}
         assert set(result["sites"].keys()) == {"configured", "ranges", "error"}
         assert set(result["home_countries"].keys()) == {"configured", "countries", "error"}
         assert set(result["graph"].keys()) == {"auth", "detail"}
@@ -2824,8 +2837,8 @@ def test_a_spray_source_that_got_in_is_a_breach(inject, home_jp, sites_ini):
     assert breach["failed_distinct_users"] == 5 and breach["legacy_auth"] is True
     assert breach["first_success"] == "2026-08-21T02:00:00Z" and breach["last_success"] == "2026-08-21T03:00:00Z"
     assert breach["countries"] == ["US"] and breach["severity"] == "high"
-    lookup = client.calls[0]
-    assert lookup[1] == "/auditLogs/signIns" and "clientAppUsed" in lookup[2]["$select"]
+    (lookup,) = [c for c in client.calls if c[1] == "/auditLogs/signIns"]
+    assert "clientAppUsed" in lookup[2]["$select"]
 
 
 def test_a_spray_below_the_threshold_is_not_a_breach(inject, home_jp):
@@ -3113,3 +3126,300 @@ def test_daily_brief_summary_shows_an_unconfigured_setup(inject, monkeypatch):
     summary = server.daily_brief()["summary"]["compromise_suspects"]
     assert summary["home_countries"]["configured"] is False and "JPN" in summary["home_countries"]["error"]
     assert summary["internal_ranges_known"] is False
+
+
+# ---------------------------------------------------------------------------
+# Identity Protection (Entra ID P2)
+# ---------------------------------------------------------------------------
+
+
+def _no_permission():
+    error = GraphPermissionError("Authorization_RequestDenied: Insufficient privileges")
+    error.code = "Authorization_RequestDenied"
+    error.api_message = "Insufficient privileges to complete the operation."
+    return error
+
+
+def _risky(upn, level="high", state="atRisk", when="2026-08-21T03:00:00Z"):
+    return {
+        "userPrincipalName": upn,
+        "riskLevel": level,
+        "riskState": state,
+        "riskDetail": "none",
+        "riskLastUpdatedDateTime": when,
+    }
+
+
+class RiskyClient(FakeGraphClient):
+    """A licensed tenant: riskyUsers answers, filtered by riskLevel (and riskState when asked) like Graph.
+
+    ``reject_combined`` answers 400 to a riskLevel-and-riskState filter; ``risky_capped`` marks
+    every riskyUsers listing as cut short by the page budget.
+    """
+
+    def __init__(self, risky=(), reject_combined=False, risky_capped=False, **kwargs):
+        super().__init__(**kwargs)
+        self._get_responses["/identityProtection/riskyUsers"] = {"value": []}
+        self.risky = list(risky)
+        self.reject_combined = reject_combined
+        self.risky_capped = risky_capped
+
+    def get_paged(self, path, params=None, max_pages=5, deadline=None):
+        if path == "/identityProtection/riskyUsers":
+            self.calls.append(("get_paged", path, params, max_pages))
+            flt = params["$filter"]
+            combined = " and (" in flt
+            if combined and self.reject_combined:
+                raise GraphError("Graph request failed (400): Invalid filter clause")
+            level = flt.split("'")[1]
+            rows = [r for r in self.risky if r["riskLevel"] == level]
+            if combined:
+                rows = [r for r in rows if f"riskState'{r['riskState']}'" in flt]
+            return rows, self.risky_capped
+        return super().get_paged(path, params, max_pages, deadline)
+
+
+@pytest.mark.parametrize(
+    ("response", "status"),
+    [
+        ({"value": []}, "licensed"),
+        (not_licensed(), "not_licensed"),
+        (_no_permission(), "no_permission"),
+        (GraphError("Graph request failed (500): oops"), "error"),
+    ],
+)
+def test_the_licence_probe_classifies_each_answer(inject, response, status):
+    client = inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": response}))
+    assert server._identity_protection_status(None)["status"] == status
+    probe = [c for c in client.calls if c[1] == "/identityProtection/riskyUsers"]
+    assert probe and probe[0][2] == {"$top": 1}
+
+
+def test_a_not_licensed_message_is_found_even_without_api_message(inject):
+    error = GraphPermissionError("Forbidden: Your tenant is not licensed for this feature.")
+    inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": error}))
+    assert server._identity_protection_status(None)["status"] == "not_licensed"
+
+
+def test_definite_probe_answers_are_cached_errors_are_not(inject, monkeypatch):
+    client = inject(FakeGraphClient())
+    server._identity_protection_status(None)
+    server._identity_protection_status(None)
+    assert sum(1 for c in client.calls if c[1] == "/identityProtection/riskyUsers") == 1
+    clock = [time.monotonic() + server._IP_PROBE_TTL_SECONDS + 1]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    server._identity_protection_status(None)
+    assert sum(1 for c in client.calls if c[1] == "/identityProtection/riskyUsers") == 2
+
+    flaky = inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": GraphError("boom")}))
+    monkeypatch.setattr(server, "_ip_cache", {})
+    server._identity_protection_status(None)
+    server._identity_protection_status(None)
+    assert sum(1 for c in flaky.calls if c[1] == "/identityProtection/riskyUsers") == 2
+
+
+def test_not_licensed_leaves_compromise_suspects_unchanged(inject, home_jp, sites_ini):
+    rows = _spray() + [_ok("victim1@example.edu", _SPRAY_IP)]
+    out, client = _suspects(inject, rows)
+    assert out["microsoft_risky_users"] == {
+        "available": False,
+        "reason": "not_licensed",
+        "detail": "Identity Protection needs Entra ID P2",
+    }
+    assert "microsoft_high" not in out["counts"] and out["counts"]["high"] == 1
+    assert not [c for c in client.calls if c[0] == "get_paged" and "riskyUsers" in c[1]]
+
+
+def test_licensed_merges_microsoft_risky_users(inject, home_jp, sites_ini):
+    risky = [
+        _risky("victim1@example.edu"),  # also a spray breach: already high
+        _risky("quiet@example.edu", when="2026-08-21T05:00:00Z"),  # only Microsoft: new high
+        _risky("far@example.edu"),  # a medium foreign success: moves to high
+        _risky("done@example.edu", state="remediated"),  # closed: dropped
+        _risky("mild@example.edu", level="medium"),
+    ]
+    rows = _spray() + [_ok("victim1@example.edu", _SPRAY_IP), _ok("far@example.edu", "203.0.113.1", country="FR")]
+    client = inject(RiskyClient(risky=risky, paged_responses={"/auditLogs/signIns": (rows, False)}))
+    out = server.compromise_suspects()
+    section = out["microsoft_risky_users"]
+    assert section["available"] is True
+    assert [r["user_principal_name"] for r in section["high"]] == [
+        "quiet@example.edu",
+        "victim1@example.edu",
+        "far@example.edu",
+    ]
+    by_upn = {r["user_principal_name"]: r for r in section["high"]}
+    assert by_upn["victim1@example.edu"]["in_spray_breaches"] is True
+    assert by_upn["far@example.edu"]["in_foreign_successes"] is True
+    assert [r["user_principal_name"] for r in section["medium"]] == ["mild@example.edu"]
+    counts = out["counts"]
+    assert counts["microsoft_high"] == 3 and counts["microsoft_medium"] == 1
+    assert counts["high"] == 3 and counts["medium"] == 1  # victim1, quiet, far / mild (Microsoft's medium)
+    filters = [c[2]["$filter"] for c in client.calls if c[0] == "get_paged" and "riskyUsers" in c[1]]
+    states = (
+        "riskState eq microsoft.graph.riskState'atRisk' or riskState eq microsoft.graph.riskState'confirmedCompromised'"
+    )
+    assert filters == [
+        f"riskLevel eq microsoft.graph.riskLevel'high' and ({states})",
+        f"riskLevel eq microsoft.graph.riskLevel'medium' and ({states})",
+    ]
+
+
+def test_a_risky_read_error_is_reported_not_counted(inject, home_jp):
+    class Broken(RiskyClient):
+        def get_paged(self, path, params=None, max_pages=5, deadline=None):
+            if "riskyUsers" in path:
+                raise GraphError("deadline passed while reading the response")
+            return super().get_paged(path, params, max_pages, deadline)
+
+    inject(Broken(paged_responses={"/auditLogs/signIns": ([], False)}))
+    out = server.compromise_suspects()
+    assert out["microsoft_risky_users"]["available"] is True and "deadline" in out["microsoft_risky_users"]["error"]
+    assert "microsoft_high" not in out["counts"]
+
+
+def test_one_tenant_licensed_the_other_not(two_tenants, monkeypatch):
+    staff, _ = two_tenants
+    licensed = RiskyClient(risky=[_risky("s@students.example.edu")])
+    monkeypatch.setitem(server._state, "clients", {"students": licensed})
+    assert server.compromise_suspects()["microsoft_risky_users"]["reason"] == "not_licensed"
+    other = server.compromise_suspects(tenant="students")["microsoft_risky_users"]
+    assert other["available"] is True and other["high"][0]["user_principal_name"] == "s@students.example.edu"
+    health = server.health_check()
+    assert health["identity_protection"]["status"] == "not_licensed"
+    assert health["tenants"]["staff"]["identity_protection"]["status"] == "not_licensed"
+    assert health["tenants"]["students"]["identity_protection"]["status"] == "licensed"
+    assert health["status"] == "healthy"
+    brief = server.daily_brief()
+    assert brief["summary"]["identity_protection"] == "not_licensed"
+    assert brief["tenants"]["students"]["summary"]["identity_protection"] == "licensed"
+    assert brief["tenants"]["students"]["compromise_suspects"]["microsoft_risky_users"]["available"] is True
+
+
+def test_not_licensed_does_not_degrade_health(inject):
+    inject(FakeGraphClient())
+    out = server.health_check()
+    assert out["identity_protection"]["status"] == "not_licensed" and out["status"] == "healthy"
+
+
+def test_daily_brief_shows_unavailable_identity_protection(inject):
+    inject(FakeGraphClient(paged_responses={"/auditLogs/signIns": ([], False)}))
+    out = server.daily_brief()
+    assert out["summary"]["identity_protection"] == "not_licensed"
+    assert out["compromise_suspects"]["microsoft_risky_users"]["available"] is False
+
+
+def test_counts_use_every_account_not_the_cut_lists(inject, home_jp, monkeypatch):
+    monkeypatch.setattr(server, "_COMPROMISE_LIST_LIMIT", 50)
+    rows = [_ok(f"u{i:02d}@example.edu", f"203.0.113.{i}", country="FR", client="IMAP4") for i in range(51)]
+    last = sorted(f"u{i:02d}@example.edu" for i in range(51))[-1]
+    client = inject(RiskyClient(risky=[_risky(last.upper())], paged_responses={"/auditLogs/signIns": (rows, False)}))
+    out = server.compromise_suspects()
+    assert out["foreign_successes_capped"] is True and len(out["foreign_successes"]) == 50
+    assert out["counts"]["high"] == 51 and out["counts"]["microsoft_high"] == 1
+    (row,) = out["microsoft_risky_users"]["high"]
+    assert row["in_foreign_successes"] is True  # found although the list was cut, and case-insensitively
+    assert "_accounts" not in out
+    assert client.calls
+
+
+def test_a_medium_account_microsoft_calls_high_moves_to_high(inject, home_jp):
+    rows = [_ok("far@example.edu", "203.0.113.1", country="FR")]
+    inject(RiskyClient(risky=[_risky("Far@Example.EDU")], paged_responses={"/auditLogs/signIns": (rows, False)}))
+    out = server.compromise_suspects()
+    assert out["foreign_successes"][0]["severity"] == "medium"
+    assert out["counts"]["high"] == 1 and out["counts"]["medium"] == 0
+
+
+def test_a_microsoft_medium_already_counted_is_not_counted_twice(inject, home_jp):
+    rows = [_ok("far@example.edu", "203.0.113.1", country="FR")]
+    risky = [_risky("far@example.edu", level="medium"), _risky("other@example.edu", level="medium")]
+    inject(RiskyClient(risky=risky, paged_responses={"/auditLogs/signIns": (rows, False)}))
+    out = server.compromise_suspects()
+    assert out["counts"]["medium"] == 2 and out["counts"]["microsoft_medium"] == 2
+
+
+def test_max_pages_reaches_the_risky_reads(inject):
+    client = inject(RiskyClient(paged_responses={"/auditLogs/signIns": ([], False)}))
+    server.compromise_suspects(max_pages=3)
+    pages = [c[3] for c in client.calls if c[0] == "get_paged" and "riskyUsers" in c[1]]
+    assert pages == [3, 3]
+    client.calls.clear()
+    server.daily_brief(max_pages=2)
+    assert [c[3] for c in client.calls if c[0] == "get_paged" and "riskyUsers" in c[1]] == [2, 2]
+
+
+def test_a_refused_combined_filter_falls_back_to_the_level_filter(inject):
+    risky = [_risky("a@example.edu"), _risky("b@example.edu", state="remediated")]
+    client = inject(
+        RiskyClient(
+            risky=risky, reject_combined=True, risky_capped=True, paged_responses={"/auditLogs/signIns": ([], False)}
+        )
+    )
+    out = server.compromise_suspects()["microsoft_risky_users"]
+    assert [r["user_principal_name"] for r in out["high"]] == ["a@example.edu"]
+    assert out["high_capped"] is True and out["medium_capped"] is True
+    filters = [c[2]["$filter"] for c in client.calls if c[0] == "get_paged" and "riskyUsers" in c[1]]
+    assert filters[1] == "riskLevel eq microsoft.graph.riskLevel'high'"
+
+
+def test_a_hidden_risk_level_in_the_probe_is_not_licensed_and_cached(inject):
+    hidden = {"value": [{"userPrincipalName": "x@example.edu", "riskLevel": "hidden", "riskState": "atRisk"}]}
+    client = inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": hidden}))
+    first = server._identity_protection_status(None)
+    assert first["status"] == "not_licensed" and "hidden" in first["detail"]
+    server._identity_protection_status(None)
+    assert sum(1 for c in client.calls if c[1] == "/identityProtection/riskyUsers") == 1
+
+
+def test_an_empty_200_probe_is_licensed(inject):
+    inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": {"value": []}}))
+    assert server._identity_protection_status(None)["status"] == "licensed"
+
+
+def test_a_hidden_risk_level_in_the_read_makes_the_section_unavailable(inject, home_jp):
+    risky = [{**_risky("x@example.edu"), "riskLevel": "hidden"}]
+
+    class HiddenRows(RiskyClient):
+        def get_paged(self, path, params=None, max_pages=5, deadline=None):
+            if "riskyUsers" in path:
+                self.calls.append(("get_paged", path, params, max_pages))
+                return risky, False
+            return super().get_paged(path, params, max_pages, deadline)
+
+    inject(HiddenRows(paged_responses={"/auditLogs/signIns": ([], False)}))
+    out = server.compromise_suspects()
+    assert out["microsoft_risky_users"]["available"] is False and out["microsoft_risky_users"]["reason"] == "hidden"
+    assert "microsoft_high" not in out["counts"]
+
+
+def test_no_permission_is_not_cached(inject):
+    client = inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": _no_permission()}))
+    server._identity_protection_status(None)
+    server._identity_protection_status(None)
+    assert sum(1 for c in client.calls if c[1] == "/identityProtection/riskyUsers") == 2
+
+
+@pytest.mark.parametrize(("mode", "needle"), [("app-only", "application permission"), ("azure-cli", "delegated")])
+def test_the_no_permission_hint_follows_the_auth_mode(inject, mode, needle):
+    inject(FakeGraphClient(get_responses={"/identityProtection/riskyUsers": _no_permission()}, mode=mode))
+    assert needle in server._identity_protection_status(None)["detail"]
+
+
+def test_daily_brief_probes_once_and_before_the_walk(inject):
+    order = []
+
+    class Recording(FakeGraphClient):
+        def get(self, path, params=None, deadline=None):
+            order.append(path)
+            return super().get(path, params, deadline)
+
+        def get_paged(self, path, params=None, max_pages=5, deadline=None):
+            order.append(path)
+            return super().get_paged(path, params, max_pages, deadline)
+
+    inject(Recording(get_responses={"/identityProtection/riskyUsers": GraphError("deadline passed")}))
+    out = server.daily_brief()
+    assert order.count("/identityProtection/riskyUsers") == 1  # an error is not cached, yet probed once
+    assert order.index("/identityProtection/riskyUsers") < order.index("/auditLogs/signIns")
+    assert out["summary"]["identity_protection"] == "error"

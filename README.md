@@ -43,7 +43,7 @@ and is not a fit for an unattended triage bot:
 | `signin_logs` | Why did this user's sign-in fail (or succeed), with the AADSTS code translated? |
 | `signin_failure_stats` | Tenant-wide failure aggregation: top error codes, users, apps, source IPs, and password-spray suspects |
 | `signin_success_stats` | Tenant-wide success aggregation by source IP: IPs shared by several accounts, legacy-auth (SMTP/IMAP) successes — the view that finds a breach |
-| `compromise_suspects` | Which accounts were probably taken over: an outside IP that sprayed many accounts and got into some (`spray_breaches`), and successes from outside the home countries (`foreign_successes`, high when over a legacy protocol) |
+| `compromise_suspects` | Which accounts were probably taken over: an outside IP that sprayed many accounts and got into some (`spray_breaches`), successes from outside the home countries (`foreign_successes`, high when over a legacy protocol), and Microsoft's own risky users when the tenant has Entra ID P2 |
 | `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when? |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |
@@ -103,6 +103,7 @@ different auth mode than intended.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `compromise_suspects`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` | Under delegated auth the signed-in user also needs an Entra role that may read service health (for example Service Support Administrator or Global Reader) |
+| `compromise_suspects`' `microsoft_risky_users`, the `identity_protection` probe (health_check, daily_brief) | `IdentityRiskyUser.Read.All` | Optional. Identity Protection needs **Entra ID P2**: without it Graph answers 403 "not licensed" and the probe reports `not_licensed`; nothing else changes |
 | `revoke_sign_in_sessions` (opt-in) | `User.RevokeSessions.All` (app-only) or the **User Administrator** / **Helpdesk Administrator** directory role (delegated; **Privileged Authentication Administrator** for an administrator account) | Only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`. A write permission: grant it only to a deployment that needs the tool. The account lookup before it needs `User.Read.All`. Without the permission the tool answers `missing_permission` for the auth mode in use and nothing changes |
 
 ### Required Azure RBAC
@@ -121,6 +122,26 @@ one field) to `{"error": "...", "missing_permission": "..."}` with a
 human-readable explanation of what role or permission is needed, so
 `health_check` and every other tool stay usable even before full permissions
 are granted.
+
+
+**Identity Protection (Entra ID P2).** `compromise_suspects` adds Microsoft's own
+risk verdicts when the tenant has them: a cheap `riskyUsers?$top=1` probe
+classifies each tenant as `licensed`, `not_licensed` (403 "not licensed": no
+Entra ID P2), `no_permission` (other 403: no `IdentityRiskyUser.Read.All`) or
+`error`; `licensed` and `not_licensed` are cached for an hour (a 200 whose rows
+say `riskLevel: hidden` also means no P2). The endpoint itself is probed:
+`/subscribedSkus` can be refused and a SKU list would still have to be mapped to
+P2. `health_check` reports it per tenant
+without changing `status`, and `daily_brief`'s summary per tenant, so the day
+P2 appears is noticed. Licensed: `microsoft_risky_users` lists open
+(`atRisk` / `confirmedCompromised`) high-risk users and, separately, medium,
+marking those also in `spray_breaches` / `foreign_successes`. `counts` are then
+distinct accounts over every finding, before the lists are cut: `high` is any
+account high here or in Microsoft's high list, `medium` any medium here or in
+Microsoft's medium list that is not high (`counts.microsoft_high` /
+`microsoft_medium` say how many Microsoft lists). Otherwise the
+section is `{available: false, reason}` and nothing else changes -- never read
+it as "no risky users".
 
 ## Setup
 

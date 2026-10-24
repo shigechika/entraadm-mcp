@@ -34,6 +34,7 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`compromise_suspects`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All`（delegated 認証ではサービス正常性を読める Entra ロール——Service Support Administrator や Global Reader 等——も必要） |
+| `compromise_suspects` の `microsoft_risky_users`、`identity_protection` の確認 | `IdentityRiskyUser.Read.All`（任意。Identity Protection には Entra ID P2 が要り，無ければ確認は `not_licensed`） |
 | `revoke_sign_in_sessions`（オプトイン、`ENTRAADM_ENABLE_REVOKE_SESSIONS=1`） | `User.RevokeSessions.All`（app-only）または User Administrator／Helpdesk Administrator ディレクトリロール（delegated。管理者アカウントが対象なら Privileged Authentication Administrator）。書き込みの権限なので、このツールを有効にする配備にだけ付与する。先に行う照会には `User.Read.All` が要る |
 
 ### 必要な Azure RBAC
@@ -64,7 +65,9 @@ ARM のツールは既定のテナントだけ。テナントのファイルを�
 
 ### `health_check()`
 
-引数なし。`{service, version, status, auth_mode, graph, signin_probe, arm, sites}` を返す。
+引数なし。`{service, version, status, auth_mode, graph, signin_probe, arm, sites, home_countries, identity_protection}` を返す
+（`identity_protection` は Identity Protection のライセンスの確認 `{status, detail}` で，情報だけ。`not_licensed` でも
+`status` は変わらない。`tenants` にもテナントごとに載る）。
 `graph` は基本的な Graph 到達性（`GET /users`、`$top=1` — `User.Read.All` のみで通る）を、`signin_probe` は
 サインインログ読み取り可否を追加でプローブする。`status` は両方成功で
 `"healthy"`、Graph到達可だがサインインログ読み取り不可で `"degraded"`、
@@ -144,6 +147,20 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 次に国と IP の多い順。国の無い成功は国外と見なさない。本拠の国が未設定なら一覧は空で
 `home_countries.configured: false`。`counts` は重大度ごとのアカウント数（両方にあれば high で
 1 回）。一覧は 50 件まで（`*_capped`），`capped` は走査に従い，`how_to_read` に対処の目安を
+**Identity Protection（Entra ID P2）。** `compromise_suspects` は，テナントが使えれば Microsoft 自身の
+危険度の判定も加える。`riskyUsers?$top=1` の軽い確認で，テナントごとに `licensed`・`not_licensed`
+（403「not licensed」。Entra ID P2 が無い）・`no_permission`（ほかの 403。`IdentityRiskyUser.Read.All` が
+無い）・`error` に分け，`licensed` と `not_licensed` だけを 1 時間覚えておく（200 でも行の `riskLevel` が `hidden`
+なら P2 が無い）。`/subscribedSkus` は拒まれることがあり，SKU の一覧から P2 を読み取る必要も残るので，
+エンドポイントそのものを確かめる。
+`health_check` はテナントごとに報告するが `status` は変えず，`daily_brief` の summary にもテナントごとに
+載せるので，P2 が入った日に気づける。使えるときは `microsoft_risky_users` に，危険が続いている
+（`atRisk`／`confirmedCompromised`）high のユーザーと，別に medium を並べ，`spray_breaches`／
+`foreign_successes` にもいるかを印す。そのとき `counts` は，一覧を切る前の全アカウントを重複なしで数える。
+`high` はこのツールか Microsoft の high にいるアカウント，`medium` はこのツールか Microsoft の medium にいて
+high でないアカウント（`counts.microsoft_high`／`microsoft_medium` は Microsoft の一覧の人数）。使えなければ節は `{available: false, reason}` だけで，ほかは何も変わらない。
+「危険なユーザーはいない」と読まないこと。
+
 書く。`daily_brief` は件数と各一覧の上位 5 件を，失敗の集計と同じ走査から載せる（取得項目に
 `clientAppUsed` と `location` が加わるので，期限で止まる走査は少し早く止まりうる）。summary にも
 `home_countries` の configured／error と `internal_ranges_known` を載せ，走査のエラーは
