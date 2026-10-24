@@ -2,10 +2,12 @@
 
 This repo is a stdio MCP server ([MCPServer](https://github.com/modelcontextprotocol/python-sdk), mcp 2.x)
 for Microsoft Entra ID sign-in and audit-log triage, plus Azure VM backup
-posture (Azure Resource Manager) and Microsoft 365 service health. All 13
-tools are read-only — there is no write/mutating tool in this server (no
-account unblock, password reset, or session revoke), and no approval-gate
-or write-tool allowlist to worry about.
+posture (Azure Resource Manager) and Microsoft 365 service health. The
+default tools are read-only. The one state-changing tool,
+`revoke_sign_in_sessions`, is registered only when
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (exactly "1") and re-checks that switch
+inside the function; the approval step lives in the caller that enables it,
+not in this server. There is no account unblock or password reset.
 
 Two clients share one `_RestClient` base in `entraadm_mcp/client.py`:
 `GraphClient` (Graph v1.0, `@odata.nextLink`) and `ArmClient`
@@ -108,8 +110,10 @@ token. The exception hierarchy is `ApiError` / `ApiDeadline` /
   (`ENTRAADM_TENANT_ID`/`_CLIENT_ID`/`_CLIENT_SECRET` for app-only, or none
   of the three for `az login`-based delegated auth). `config.py`'s
   `AuthConfig.from_env()` is the only place that reads these.
-- No write/mutating tools, so there is no approval-gate or write-tool
-  allowlist pattern (unlike some other servers in this fleet) to check.
+- Any new state-changing tool must be opt-in the same way (absent from
+  `tools/list` unless its switch is set), look the target up by exact
+  identifier before acting, and be listed in `STATE_CHANGING` with a
+  `skip=` probe so the smoke test never calls it.
 - `msgraph-sdk`/`kiota` and the `azure-mgmt-*` SDKs are intentionally not
   dependencies — Graph and ARM calls go through the hand-rolled clients in
   `client.py` (httpx + manual paging/error translation) so tests can mock

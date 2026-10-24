@@ -4,8 +4,9 @@
 
 MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
 plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
-service health. Transport is stdio only. All 14 tools are read-only — there
-is no write/mutating tool. Auth is env-var driven (see below); no config file. The
+service health. Transport is stdio only. The 14 default tools are read-only;
+one state-changing tool, `revoke_sign_in_sessions`, is registered only when
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (see Conventions). Auth is env-var driven (see below); no config file. The
 one optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
 ranges, same format as keycloak-mcp's `KEYCLOAK_SITES_INI`), loaded by
 `entraadm_mcp/sites.py` with longest-prefix lookup.
@@ -143,6 +144,18 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   registration client ID, or real userPrincipalName into code, tests,
   commits, PRs, or issues.
 
+- **Write tools are opt-in and absent by default.** `revoke_sign_in_sessions`
+  is registered by `_register_opt_in_tools()` only when
+  `config.revoke_sessions_enabled()` (`ENTRAADM_ENABLE_REVOKE_SESSIONS` is
+  exactly `"1"`), and re-checks the switch inside the function. A deployment
+  that never set it (a shared gateway) cannot list or call it. It resolves the
+  account through `_find_user` ($filter, never path) and interpolates only the
+  GUID-checked id; a guest is refused. `GraphClient.post()` retries like
+  `get()`, so it is for idempotent, body-less actions only. A
+  `GraphDeadline` after the POST is `revoked: null` (unknown), not `false`.
+  The smoke test skips it by name (`STATE_CHANGING` / `OPT_IN` in
+  `tests/test_smoke_probes.py`).
+
 ## Roadmap (deliberately not in the initial release)
 
 - `daily_brief_start`/`daily_brief_result` job+poll, if `daily_brief`'s
@@ -155,8 +168,7 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `on_premises_sync_enabled`/`on_premises_last_sync_date_time`) and triage
   hints attached to specific AADSTS codes (e.g. "compare this timestamp
   against the KeyCloak-side password-change event").
-- Write tools (unblock an account, force a password reset, revoke a
-  session), Identity Protection (`riskyUsers`, needs an Entra ID P2 licence
+- Further write tools (unblock an account, force a password reset), Identity Protection (`riskyUsers`, needs an Entra ID P2 licence
   — the API answers 403 "tenant is not licensed" without it, so do not add
   the tool before confirming the licence), Conditional Access policy reads
   (`Policy.Read.All`), the message center (`ServiceMessage.Read.All`) — none

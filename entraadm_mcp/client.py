@@ -308,6 +308,15 @@ class _RestClient:
         resp = self._request("GET", path, params=params, deadline=deadline)
         return self._parse(resp)
 
+    def post(self, path: str, deadline: float | None = None) -> dict:
+        """POST to an action with no request body (e.g. ``/users/{id}/revokeSignInSessions``).
+
+        Retried like ``get`` (429 once, 5xx and network errors twice), so only
+        idempotent actions may use it.
+        """
+        resp = self._request("POST", path, deadline=deadline)
+        return self._parse(resp)
+
     def _same_origin(self, url: str) -> bool:
         """Whether a continuation URL stays on this client's own API host.
 

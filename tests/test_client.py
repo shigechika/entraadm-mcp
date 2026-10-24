@@ -750,3 +750,36 @@ def test_arm_check_reports_an_expired_deadline_as_an_error_not_as_zero_subscript
     result = client.check(deadline=time.monotonic() - 1)
     assert result["auth"] == "error" and result["subscriptions"] is None and "deadline" in result["detail"]
     assert route.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# post (body-less action)
+# ---------------------------------------------------------------------------
+
+_REVOKE_URL = f"{GRAPH_BASE}/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions"
+
+
+@respx.mock
+def test_post_sends_an_empty_body_and_parses_the_answer(monkeypatch):
+    route = respx.post(_REVOKE_URL).mock(return_value=httpx.Response(200, json={"value": True}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    body = client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+    assert body == {"value": True}
+    request = route.calls.last.request
+    assert request.method == "POST"
+    assert request.headers["Authorization"] == "Bearer tok"
+    assert request.content == b""
+    assert request.headers.get("Content-Length") == "0"
+
+
+@respx.mock
+def test_post_403_is_a_permission_error(monkeypatch):
+    respx.post(_REVOKE_URL).mock(
+        return_value=httpx.Response(
+            403,
+            json={"error": {"code": "Authorization_RequestDenied", "message": "Insufficient privileges"}},
+        )
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiPermissionError, match="Authorization_RequestDenied"):
+        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")

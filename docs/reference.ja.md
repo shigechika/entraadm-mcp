@@ -34,6 +34,7 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All`（delegated 認証ではサービス正常性を読める Entra ロール——Service Support Administrator や Global Reader 等——も必要） |
+| `revoke_sign_in_sessions`（オプトイン、`ENTRAADM_ENABLE_REVOKE_SESSIONS=1`） | `User.RevokeSessions.All`（書き込みの権限。このツールを有効にする配備にだけ付与する） |
 
 ### 必要な Azure RBAC
 

@@ -5,8 +5,10 @@ spec), so adding a tool forces a decision: how would we know it works?
 
 Two constraints shape everything below.
 
-**Read-only.** Every tool here reads a sign-in log, an audit log, or a
-directory snapshot; nothing in the tenant is changed.
+**Read-only.** Every probed tool reads a sign-in log, an audit log, or a
+directory snapshot; nothing in the tenant is changed. The one state-changing
+tool, ``revoke_sign_in_sessions`` (registered only when
+``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``), is skipped by name, never called.
 
 **No tenant-specific values in this file.** This repository is public, so a
 probe may not name a real account, tenant id, or app registration.
@@ -174,6 +176,9 @@ PROBES: dict[str, Probe] = {
         require_keys=("found", "vm", "search_complete"),
         allow_empty=True,
         timeout=180,
+    ),
+    "revoke_sign_in_sessions": Probe(
+        skip="state-changing (signs an account out everywhere); never called by the smoke test",
     ),
     "m365_service_health": Probe(
         args={"max_pages": MAX_PAGES},

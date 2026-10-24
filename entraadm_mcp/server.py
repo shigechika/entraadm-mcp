@@ -1,4 +1,4 @@
-"""entraadm-mcp MCP server — Microsoft Entra ID sign-in/audit-log triage (read-only).
+"""entraadm-mcp MCP server — Microsoft Entra ID sign-in/audit-log triage.
 
 Tools:
 
@@ -15,6 +15,10 @@ Tools:
 - ``m365_service_health``    — Microsoft 365 service status and open incidents
 - ``daily_brief``            — one-call summary combining m365_service_health,
   signin_failure_stats and directory_audits
+- ``revoke_sign_in_sessions`` — opt-in (``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``), the one
+  state-changing tool: sign one account out everywhere
+
+Every tool except ``revoke_sign_in_sessions`` is read-only.
 
 Coverage contract: every result section that walks a paged Graph or ARM collection
 carries a ``capped`` boolean when its window was not fully scanned, so
@@ -56,10 +60,12 @@ from entraadm_mcp.client import (
 from entraadm_mcp.config import (
     MAX_MAX_PAGES,
     MIN_MAX_PAGES,
+    REVOKE_SESSIONS_ENV,
     AuthConfig,
     ConfigError,
     deadline_seconds,
     max_pages_default,
+    revoke_sessions_enabled,
 )
 
 
@@ -2455,3 +2461,87 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
         "signin_failure_stats": stats,
         "directory_audits": audits,
     }
+
+
+# ---------------------------------------------------------------------------
+# revoke_sign_in_sessions (opt-in, state-changing)
+# ---------------------------------------------------------------------------
+
+#: What revoking sessions leaves untouched; returned with every result so a
+#: responder does not read "revoked" as "the incident is closed".
+REVOKE_NOT_COVERED = (
+    "does not disable the account (accountEnabled is unchanged)",
+    "does not reset the password",
+    "does not remove MFA methods the attacker may have registered",
+    "access tokens already issued stay valid until they expire (typically about an hour)",
+    "legacy authentication and app passwords follow the tenant's own policy",
+)
+
+
+@_with_call_deadline
+def revoke_sign_in_sessions(upn: str) -> dict:
+    """Sign one account out everywhere: invalidate its refresh tokens and session cookies.
+
+    STATE-CHANGING -- the one tool in this server that writes. Registered only
+    when ``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``; a deployment without that
+    variable never lists it. Calls Graph ``POST /users/{id}/revokeSignInSessions``
+    after looking the account up by exact userPrincipalName; a guest account is
+    refused. The account must sign in again everywhere, so its owner is
+    affected too -- use it on a confirmed compromise, not for routine checks.
+
+    Returns ``revoked`` (Graph's own answer), ``at`` (UTC), the account's
+    ``account_enabled`` state before the call, and ``not_covered``: what this
+    does NOT do (disable the account, reset the password, remove MFA methods;
+    access tokens already issued keep working until they expire). A
+    nonexistent account is ``{"found": false, ...}``, nothing is called. A
+    call cut off after the request was sent returns ``revoked: null``
+    (unknown); calling again is safe, revocation is idempotent.
+
+    Needs the ``User.RevokeSessions.All`` application permission (admin
+    consent) for app-only auth; a 403 names it in ``missing_permission``.
+
+    Args:
+        upn: The account's exact userPrincipalName, e.g. "user@example.edu".
+    """
+    if not revoke_sessions_enabled():
+        return {"error": f"revoke_sign_in_sessions is disabled; set {REVOKE_SESSIONS_ENV}=1 to enable it"}
+    try:
+        validate_upn(upn)
+        client = _client()
+        user = _find_user(client, upn, "id,userPrincipalName,accountEnabled,userType")
+    except (ConfigError, GraphError) as e:
+        return {"error": str(e)}
+    if user is None:
+        return {"found": False, "user_principal_name": upn, "revoked": False}
+    if user.get("userType") == "Guest":
+        return {"found": True, "user_principal_name": upn, "revoked": False, "error": "refusing a guest account"}
+    user_id = user.get("id", "")
+    if not _GUID_RE.match(user_id):
+        return {"error": "unexpected id shape returned by Graph for this user"}
+
+    result: dict[str, Any] = {
+        "found": True,
+        "user_principal_name": user.get("userPrincipalName") or upn,
+        "account_enabled": user.get("accountEnabled"),
+        "not_covered": list(REVOKE_NOT_COVERED),
+    }
+    try:
+        body = client.post(f"/users/{user_id}/revokeSignInSessions", deadline=_current_deadline())
+    except GraphPermissionError as e:
+        return {**result, "revoked": False, "error": str(e), "missing_permission": "User.RevokeSessions.All"}
+    except GraphDeadline as e:
+        return {**result, "revoked": None, "error": f"{e}; outcome unknown, calling again is safe"}
+    except GraphError as e:
+        return {**result, "revoked": False, "error": str(e)}
+    result["revoked"] = body.get("value") is True
+    result["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return result
+
+
+def _register_opt_in_tools(server: MCPServer) -> None:
+    """Register the state-changing tools whose switch is on (see config.revoke_sessions_enabled)."""
+    if revoke_sessions_enabled():
+        server.tool()(revoke_sign_in_sessions)
+
+
+_register_opt_in_tools(mcp)
