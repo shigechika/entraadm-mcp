@@ -220,3 +220,40 @@ def test_the_secret_is_never_in_the_file(tmp_path):
     tenants = load_tenants({**_ini(tmp_path, text), "STUDENTS_SECRET": "s2"})
     assert "s2" not in (tmp_path / "tenants.ini").read_text(encoding="utf-8")
     assert tenants.get("students").auth.client_secret == "s2"
+
+
+@pytest.mark.parametrize("bad", ["staff", "common", "organizations", "consumers", "-", "..."])
+def test_tenant_id_must_be_a_guid_or_a_dotted_domain(tmp_path, bad):
+    text = f"[tenant.only]\ntenant_id = {bad}\ndomains = example.edu\n"
+    with pytest.raises(ConfigError, match="tenant_id must be a GUID"):
+        load_tenants(_ini(tmp_path, text))
+
+
+@pytest.mark.parametrize("good", [STAFF_ID, STAFF_ID.upper(), "contoso.onmicrosoft.com", "Example.EDU"])
+def test_tenant_id_accepts_a_guid_or_a_domain(tmp_path, good):
+    text = f"[tenant.only]\ntenant_id = {good}\ndomains = example.edu\n"
+    assert load_tenants(_ini(tmp_path, text)).default.auth.tenant_id == good
+
+
+def test_a_parse_error_names_the_line(tmp_path):
+    text = TWO_TENANTS + "domains = again.example.edu\n"
+    with pytest.raises(ConfigError, match=r"DuplicateOptionError: .*line +[0-9]+.*'domains'"):
+        load_tenants(_ini(tmp_path, text))
+
+
+def test_a_default_section_cannot_fill_in_a_tenant(tmp_path):
+    text = f"[__none__]\ntenant_id = {STAFF_ID}\ndomains = example.edu\n\n[tenant.staff]\n"
+    with pytest.raises(ConfigError, match=r"unknown section \[__none__\]"):
+        load_tenants(_ini(tmp_path, text))
+
+
+def test_resolve_by_tenant_id(tmp_path):
+    tenants = load_tenants(_ini(tmp_path, TWO_TENANTS))
+    assert tenants.resolve(STUDENTS_ID).name == "students"
+
+
+def test_env_only_resolves_default_and_its_tenant_id_only():
+    tenants = load_tenants(FULL_APP_ONLY)
+    assert tenants.resolve("default").name == "default"
+    assert tenants.resolve(FULL_APP_ONLY["ENTRAADM_TENANT_ID"]).name == "default"
+    assert tenants.resolve("example.edu") is None

@@ -87,13 +87,24 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `_state["clients"]` by name, created lazily; `_state["tenants"]` is the
   loaded `Tenants` (inject one to test routing). `_client()` returns the
   client of the tenant in effect (`_CURRENT_TENANT` contextvar).
-  `@_tenant_scoped(user_arg=..., refusal=...)` (innermost decorator) picks
-  it: explicit `tenant` argument (name or domain) > the UPN argument's
-  domain > the tenant already in effect (so `daily_brief`'s sections run in
-  the tenant it set) > default. An unknown tenant / unclaimed domain returns
-  `tenant_configured: false` (`configured_domains`), never raises; a
-  non-UPN is left to the tool's own validation. With a file, every dict
-  result gets `tenant`; env-only output is unchanged, except that
+  `@_tenant_scoped(user_arg=..., refusal=..., conflict=..., unclaimed=...)`
+  (innermost decorator) picks it: explicit `tenant` argument (name, domain
+  or tenant id; env-only: `default` or the env tenant id) > the UPN
+  argument's domain > the tenant already in effect (so `daily_brief`'s
+  sections run in the tenant it set) > default. An unknown tenant /
+  unclaimed domain returns `tenant_configured: false` with `found: null`
+  (no lookup ran -- never `found: false`, which means "no such account"),
+  never raises; a non-UPN is left to the tool's own validation.
+  `directory_audits` uses `conflict="refuse"` (explicit tenant vs another
+  tenant's user) and `unclaimed="fallback"`; `get_user`,
+  `get_user_auth_methods` and `signin_logs` take a `tenant` override;
+  `revoke_sign_in_sessions` has none, on purpose (a write only goes to the
+  tenant owning the UPN's domain). The ARM tools are wrapped by
+  `_default_tenant_tagged`. `health_check` gives each tenant's probes an even
+  share of `ENTRAADM_DEADLINE`; `daily_brief` narrows `_CALL_DEADLINE` per
+  tenant with `_deadline_share` (no budget: unbounded). With a file, every
+  dict result gets `tenant` (None on a refusal); env-only output is
+  unchanged, except that
   `revoke_sign_in_sessions` always carries `tenant`, `tenant_configured` and
   `configured_domains` (its key set is fixed).
   `health_check`/`daily_brief` keep the default tenant's keys on top and add

@@ -8,6 +8,7 @@ function callable.
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -61,6 +62,7 @@ class FakeGraphClient:
         )
         self.mode = mode
         self.calls = []
+        self.deadlines = []
 
     def get(self, path, params=None, deadline=None):
         self.calls.append(("get", path, params))
@@ -80,6 +82,7 @@ class FakeGraphClient:
 
     def get_paged(self, path, params=None, max_pages=5, deadline=None):
         self.calls.append(("get_paged", path, params, max_pages))
+        self.deadlines.append(deadline)
         response = self._paged_responses.get(path, self._paged_responses.get("*"))
         if isinstance(response, Exception):
             raise response
@@ -87,10 +90,12 @@ class FakeGraphClient:
             return [], False
         return response
 
-    def check(self):
+    def check(self, deadline=None):
+        self.calls.append(("check", deadline, None))
         return self._check_result
 
-    def probe_signin_access(self):
+    def probe_signin_access(self, deadline=None):
+        self.calls.append(("probe_signin_access", deadline, None))
         return self._signin_probe_result
 
 
@@ -2488,6 +2493,9 @@ def test_revoke_success_without_a_boolean_is_unknown(inject, revoke_on):
 # Several tenants (ENTRAADM_CONFIG)
 # ---------------------------------------------------------------------------
 
+_STAFF_GUID = "00000000-0000-0000-0000-00000000000a"
+_STUDENTS_GUID = "00000000-0000-0000-0000-00000000000b"
+
 TWO = Tenants(
     (
         TenantConfig(name="staff", auth=AuthConfig(mode="azure-cli"), domains=("example.edu",), default=True),
@@ -2519,7 +2527,7 @@ def test_a_upn_is_routed_to_the_tenant_claiming_its_domain(two_tenants):
 def test_an_unclaimed_domain_is_a_refusal_not_an_exception(two_tenants):
     staff, students = two_tenants
     out = server.get_user("someone@elsewhere.example")
-    assert out["found"] is False and out["tenant_configured"] is False
+    assert out["found"] is None and out["tenant_configured"] is False and out["tenant"] is None
     assert out["configured_domains"] == ["example.edu", "students.example.edu"]
     assert "error" in out
     assert not staff.calls and not students.calls
@@ -2536,7 +2544,7 @@ def test_revoke_in_an_unclaimed_domain_is_not_revoked(two_tenants, revoke_on):
     staff, students = two_tenants
     out = server.revoke_sign_in_sessions("someone@elsewhere.example")
     assert set(out) == _REVOKE_KEYS
-    assert out["revoked"] is False and out["found"] is False and out["tenant_configured"] is False
+    assert out["revoked"] is False and out["found"] is None and out["tenant_configured"] is False
     assert out["configured_domains"] == ["example.edu", "students.example.edu"]
     assert not staff.calls and not students.calls
 
@@ -2571,11 +2579,140 @@ def test_an_unknown_tenant_is_a_refusal(two_tenants):
     assert not staff.calls and not students.calls
 
 
-def test_directory_audits_follows_the_user_unless_a_tenant_is_given(two_tenants):
-    staff, students = two_tenants
+def test_directory_audits_follows_the_user(two_tenants):
     assert server.directory_audits(user="a@students.example.edu")["tenant"] == "students"
-    assert server.directory_audits(user="a@students.example.edu", tenant="staff")["tenant"] == "staff"
+    assert server.directory_audits(user="a@students.example.edu", tenant="students")["tenant"] == "students"
     assert server.directory_audits()["tenant"] == "staff"
+
+
+def test_directory_audits_refuses_a_tenant_that_does_not_own_the_user(two_tenants):
+    staff, students = two_tenants
+    out = server.directory_audits(user="a@students.example.edu", tenant="staff")
+    assert "belongs to tenant 'students'" in out["error"] and out["tenant"] is None
+    assert not staff.calls and not students.calls
+
+
+def test_directory_audits_searches_an_unclaimed_user_in_the_given_or_default_tenant(two_tenants):
+    staff, students = two_tenants
+    out = server.directory_audits(user="admin@partner.example")
+    assert out["tenant"] == "staff" and out["user_domain_claimed"] is False and staff.calls
+    out = server.directory_audits(user="admin@partner.example", tenant="students")
+    assert out["tenant"] == "students" and out["user_domain_claimed"] is False and students.calls
+
+
+@pytest.mark.parametrize("tool", ["get_user", "get_user_auth_methods", "signin_logs"])
+def test_an_explicit_tenant_wins_over_the_upn_domain(two_tenants, tool):
+    staff, students = two_tenants
+    out = getattr(server, tool)("guest@example.edu", tenant="students")
+    assert out["tenant"] == "students" and students.calls and not staff.calls
+
+
+def test_an_explicit_tenant_reaches_an_unclaimed_domain(two_tenants):
+    _, students = two_tenants
+    out = server.get_user("admin@contoso.onmicrosoft.com", tenant="students")
+    assert out["tenant"] == "students" and students.calls
+
+
+def test_revoke_has_no_tenant_override():
+    import inspect
+
+    assert "tenant" not in inspect.signature(server.revoke_sign_in_sessions).parameters
+
+
+def test_a_tenant_can_be_named_by_its_tenant_id(inject, monkeypatch):
+    staff = inject(FakeGraphClient())
+    students = FakeGraphClient()
+    by_id = Tenants(
+        (
+            TenantConfig("staff", AuthConfig("azure-cli", tenant_id=_STAFF_GUID), ("example.edu",), default=True),
+            TenantConfig("students", AuthConfig("azure-cli", tenant_id=_STUDENTS_GUID), ("students.example.edu",)),
+        ),
+        from_file=True,
+    )
+    monkeypatch.setitem(server._state, "tenants", by_id)
+    monkeypatch.setitem(server._state, "clients", {"students": students})
+    assert server.signin_failure_stats(tenant=_STUDENTS_GUID.upper())["tenant"] == "students"
+    assert students.calls and not staff.calls
+
+
+@pytest.mark.parametrize("ref", ["default", "DEFAULT", _STAFF_GUID])
+def test_env_only_accepts_default_or_its_tenant_id(inject, monkeypatch, ref):
+    client = inject(FakeGraphClient())
+    env_only = Tenants((TenantConfig("default", AuthConfig("app-only", _STAFF_GUID, "c", "s"), default=True),))
+    monkeypatch.setitem(server._state, "tenants", env_only)
+    out = server.signin_failure_stats(tenant=ref)
+    assert "tenant_configured" not in out and "tenant" not in out and client.calls
+
+
+@pytest.mark.parametrize("ref", ["example.edu", "staff", _STUDENTS_GUID])
+def test_env_only_refuses_anything_else(inject, ref):
+    client = inject(FakeGraphClient())
+    out = server.signin_failure_stats(tenant=ref)
+    assert out["tenant_configured"] is False and "tenant" not in out and not client.calls
+
+
+def test_every_result_names_its_tenant_under_a_tenant_file(two_tenants, inject_arm):
+    inject_arm(FakeArmClient())
+    assert server.list_subscriptions()["tenant"] == "staff"
+    assert server.vm_backup_status()["tenant"] == "staff"
+    assert server.get_user("not-an-upn")["tenant"] == "staff"  # an error dict
+    assert server.signin_by_ip("203.0.113.1", tenant="nobody")["tenant"] is None
+
+
+def test_arm_results_carry_no_tenant_env_only(inject, inject_arm):
+    inject(FakeGraphClient())
+    inject_arm(FakeArmClient())
+    assert "tenant" not in server.list_subscriptions()
+
+
+def test_daily_brief_gives_each_tenant_a_share_of_the_budget(two_tenants, monkeypatch):
+    staff, students = two_tenants
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "60")
+    start = time.monotonic()
+    server.daily_brief()
+    staff_deadlines = [d for d in staff.deadlines if d is not None]
+    student_deadlines = [d for d in students.deadlines if d is not None]
+    assert staff_deadlines and student_deadlines
+    assert max(staff_deadlines) - start == pytest.approx(30, abs=2)
+    assert min(student_deadlines) - start == pytest.approx(60, abs=2)
+
+
+def test_daily_brief_without_a_budget_stays_unbounded(two_tenants, monkeypatch):
+    staff, students = two_tenants
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "0")
+    server.daily_brief()
+    assert set(staff.deadlines) == {None} and set(students.deadlines) == {None}
+
+
+def _probe_deadlines(client):
+    return [c[1] for c in client.calls if c[0] in ("check", "probe_signin_access")]
+
+
+def test_health_check_probes_each_tenant_under_its_share(two_tenants, monkeypatch):
+    staff, students = two_tenants
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "40")
+    start = time.monotonic()
+    server.health_check()
+    for client in (staff, students):
+        deadlines = _probe_deadlines(client)
+        assert len(deadlines) == 2 and len(set(deadlines)) == 1
+        assert deadlines[0] - start == pytest.approx(20, abs=2)
+
+
+def test_health_check_without_a_budget_is_unbounded(two_tenants, monkeypatch):
+    staff, students = two_tenants
+    monkeypatch.setenv("ENTRAADM_DEADLINE", "0")
+    server.health_check()
+    assert set(_probe_deadlines(staff)) == {None} and set(_probe_deadlines(students)) == {None}
+
+
+def test_a_tenant_that_times_out_is_an_error_for_that_tenant_only(two_tenants):
+    _, students = two_tenants
+    students._check_result = {"auth": "error", "detail": "deadline passed while reading the response"}
+    students._signin_probe_result = {"auth": "error", "detail": "deadline passed before the request could start"}
+    out = server.health_check()
+    assert out["tenants"]["students"]["status"] == "error" and out["tenants"]["staff"]["status"] == "healthy"
+    assert out["status"] == "degraded"
 
 
 def test_env_only_results_do_not_name_a_tenant(inject):

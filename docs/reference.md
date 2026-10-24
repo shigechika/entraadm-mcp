@@ -57,11 +57,17 @@ tenant (`tenant_id`, `domains`, optional `default`, optional `client_id` +
 multi-tenant app and admin consent
 (`https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>`).
 A UPN-taking tool works in the tenant claiming the UPN's domain (an unclaimed
-domain: `tenant_configured: false`, `configured_domains`); the tenant-wide tools
-take `tenant` (section name or domain, default the default tenant);
-`health_check` / `daily_brief` keep the default tenant's keys on top and add
-`tenant` and `tenants`; the ARM tools serve the default tenant only. With a
-tenant file every result names its `tenant`.
+domain: `tenant_configured: false`, `found: null`, `configured_domains`);
+`get_user`, `get_user_auth_methods` and `signin_logs` take a `tenant` override,
+`revoke_sign_in_sessions` deliberately none. The tenant-wide tools take
+`tenant` (section name, domain or tenant id; env-only: `default` or the env
+tenant id), default the default tenant; `directory_audits` refuses a `tenant`
+that another tenant's `user` contradicts and searches an unclaimed `user` in
+the given or default tenant (`user_domain_claimed: false`). `health_check` /
+`daily_brief` keep the default tenant's keys on top, add `tenant` and
+`tenants`, and split the call budget evenly among the tenants
+(`ENTRAADM_DEADLINE=0`: unbounded). The ARM tools serve the default tenant
+only. With a tenant file every result names its `tenant`.
 
 ## Tools
 
@@ -82,7 +88,7 @@ pages existed) and is informational: it never changes `status`,
 because Azure RBAC is optional for this server. It runs under its own
 10-second budget so an unresponsive ARM cannot stall the whole call.
 
-### `get_user(upn)`
+### `get_user(upn, tenant=None)`
 
 Account lifecycle state: `accountEnabled`, `userType`, creation/last
 password-change timestamps, on-premises sync status, resolved license
@@ -94,7 +100,7 @@ short before resolving one of this account's own licenses -- when
 present, one or more `licenses` entries is a raw skuId rather than a
 friendly name.
 
-### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None)`
+### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None, tenant=None)`
 
 One user's sign-in events. `result`: `"failure"` (default, the common
 case), `"success"`, or `"all"` — filtered client-side, since Graph cannot
@@ -157,7 +163,7 @@ on the initiator, so this fetches the window and matches both sides
 client-side (a busy window may need a larger `max_pages` to find one
 person's audits).
 
-### `get_user_auth_methods(upn)`
+### `get_user_auth_methods(upn, tenant=None)`
 
 Registered authentication methods for one account. `mfa_registered` is
 `true` iff at least one non-password method is registered (Authenticator

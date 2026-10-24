@@ -13,9 +13,14 @@ One process may serve several Entra tenants: `ENTRAADM_CONFIG` names an INI
 file of `[tenant.<name>]` sections (`config.load_tenants()`). UPN-taking tools
 route by the UPN's domain through `@_tenant_scoped`; tenant-wide tools take a
 `tenant` argument; an unclaimed domain or unknown tenant is a
-`tenant_configured: false` refusal, never an exception or a silent fallback to
+`tenant_configured: false` refusal with `found: null` (never `found: false`,
+which means "no such account"), never an exception or a silent fallback to
 the default tenant (flag any change that falls back -- it would act on the
-wrong tenant). The ARM tools serve the default tenant only. Without the file,
+wrong tenant). The only deliberate fallback is `directory_audits` with a
+`user` no tenant claims (an external admin), which says
+`user_domain_claimed: false`. `revoke_sign_in_sessions` must keep having no
+`tenant` override. Per-tenant work in `health_check` / `daily_brief` must stay
+under a share of the call budget. The ARM tools serve the default tenant only. Without the file,
 output must stay unchanged (no `tenant` key), except
 `revoke_sign_in_sessions`, whose fixed key set always includes `tenant`,
 `tenant_configured` and `configured_domains`.

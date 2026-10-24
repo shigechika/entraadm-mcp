@@ -51,10 +51,14 @@ Azure RBAC は任意。`health_check` の `arm` プローブは情報扱い。
 省略可の `client_id` と `client_secret_env`）を持つ INI ファイルを指定する。形式・マルチテナントのアプリ・
 管理者の同意（`https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>`）は
 README の「複数のテナント」を参照。UPN を取るツールは UPN のドメインを持つテナントで動く（どこも
-持たなければ `tenant_configured: false` と `configured_domains`）。テナント全体を見るツールは `tenant`
-（節の名前かドメイン。省略で既定のテナント）を取る。`health_check`／`daily_brief` は最上位に既定の
-テナントのキーを残し，`tenant` と `tenants` を足す。ARM のツールは既定のテナントだけ。テナントの
-ファイルを使うと結果には必ず `tenant` が付く。
+持たなければ `tenant_configured: false`・`found: null`・`configured_domains`）。`get_user`・
+`get_user_auth_methods`・`signin_logs` は `tenant` で上書きでき，`revoke_sign_in_sessions` は意図的に
+できない。テナント全体を見るツールは `tenant`（節の名前・ドメイン・テナント ID。env だけなら `default`
+か env のテナント ID。省略で既定のテナント）を取る。`directory_audits` は，ほかのテナントの `user` と
+食い違う `tenant` を拒否し，どこも持たない `user` は指定か既定のテナントで探す
+（`user_domain_claimed: false`）。`health_check`／`daily_brief` は最上位に既定のテナントのキーを残し，
+`tenant` と `tenants` を足し，時間予算をテナントで均等に分ける（`ENTRAADM_DEADLINE=0` なら無制限）。
+ARM のツールは既定のテナントだけ。テナントのファイルを使うと結果には必ず `tenant` が付く。
 
 ## ツール
 
@@ -73,7 +77,7 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 このサーバでは任意なので `status` を変えない。ARM が応答しなくても呼び出し全体が止まらないよう，
 このプローブだけ 10 秒の予算で走る。
 
-### `get_user(upn)`
+### `get_user(upn, tenant=None)`
 
 アカウントのライフサイクル状態：`accountEnabled`、`userType`、作成日時・
 最終パスワード変更日時、オンプレ同期状態、解決済みライセンス名、
@@ -83,7 +87,7 @@ Graph自体に到達不可または認証設定不備で `"error"`。`graph`／`
 走査が打ち切られた場合にのみ現れる——このキーがある場合、`licenses` の一部は
 解決済みの名前ではなく生の skuId のまま。
 
-### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None)`
+### `signin_logs(user, hours=24, result="failure", top=25, max_pages=None, tenant=None)`
 
 このユーザのサインインイベント。`result`: `"failure"`（既定、最頻用途）／
 `"success"`／`"all"` — Graph はサインインを `status/errorCode` でサーバ側
@@ -140,7 +144,7 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 窓全体を取得してクライアント側で両方を照合する（混雑した窓では特定の人物の
 監査を見つけるために `max_pages` を大きくする必要がある場合がある）。
 
-### `get_user_auth_methods(upn)`
+### `get_user_auth_methods(upn, tenant=None)`
 
 このアカウントの登録済み認証方式。`mfa_registered` は、パスワード以外の方式
 （Authenticator アプリ・電話・FIDO2 セキュリティキー・Windows Hello・

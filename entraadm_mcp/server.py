@@ -23,10 +23,12 @@ Every tool except ``revoke_sign_in_sessions`` is read-only.
 Tenants: one Entra tenant from the env vars, or several from the INI file named
 by ``ENTRAADM_CONFIG`` (``[tenant.<name>]`` sections, see config.py). A tool that
 takes a UPN works in the tenant claiming the UPN's domain (an unclaimed domain is
-a refusal with ``tenant_configured: false``); a tenant-wide tool takes an
-optional ``tenant`` (section name or domain, default: the default tenant);
-health_check and daily_brief cover every tenant; the ARM tools serve the default
-tenant only.
+a refusal with ``tenant_configured: false`` and ``found: null``); get_user,
+get_user_auth_methods and signin_logs also take a ``tenant`` override,
+revoke_sign_in_sessions deliberately none; a tenant-wide tool takes an optional
+``tenant`` (section name, domain or tenant id; default: the default tenant);
+health_check and daily_brief cover every tenant, each under a share of the call
+budget; the ARM tools serve the default tenant only.
 
 Coverage contract: every result section that walks a paged Graph or ARM collection
 carries a ``capped`` boolean when its window was not fully scanned, so
@@ -275,39 +277,67 @@ def _arm() -> ArmClient:
 
 
 def _unknown_tenant(tenants: Tenants, ref: str) -> dict:
-    return {
-        "error": f"no configured tenant is named {ref!r} or claims that domain",
+    out = {
+        "error": f"no configured tenant is named {ref!r}, has that tenant id, or claims that domain",
         "tenant_configured": False,
         "configured_tenants": tenants.names,
         "configured_domains": tenants.domains,
     }
+    if tenants.from_file:
+        out["tenant"] = None
+    return out
 
 
 def _unknown_domain(tenants: Tenants, upn: str) -> dict:
+    # found is null, not false: no lookup ran, so nothing is known about the account.
     return {
-        "error": f"no configured tenant claims the domain of {upn!r}",
-        "found": False,
+        "error": f"no configured tenant claims the domain of {upn!r} (pass tenant= to search one anyway)",
+        "found": None,
         "user_principal_name": upn,
         "tenant_configured": False,
         "configured_domains": tenants.domains,
+        "tenant": None,
     }
 
 
-def _tenant_scoped(*, user_arg: str | None = None, refusal=None):
+def _tenant_conflict(tenants: Tenants, upn: str, given: TenantConfig, owner: TenantConfig) -> dict:
+    return {
+        "error": (
+            f"tenant {given.name!r} was given, but the domain of {upn!r} belongs to tenant {owner.name!r}; "
+            "searching one tenant's log for another tenant's account would silently find nothing"
+        ),
+        "tenant_configured": True,
+        "configured_domains": tenants.domains,
+        "tenant": None,
+    }
+
+
+def _tenant_scoped(*, user_arg: str | None = None, refusal=None, conflict: str = "allow", unclaimed: str = "refuse"):
     """Run a tool in the right tenant.
 
-    Precedence: a ``tenant`` argument (section name or one of its domains);
-    else the tenant claiming the domain of the ``user_arg`` argument (a UPN);
-    else the tenant already in effect (``daily_brief`` sets it per tenant);
-    else the default tenant. An unknown tenant or an unclaimed domain is a
-    normal refusal with ``tenant_configured: false`` (``refusal(arguments,
-    base)`` may reshape it), never an exception. A UPN that is not UPN-shaped
-    is left to the tool's own validation. With a tenant file, every dict
-    result names its ``tenant``; env-only results are unchanged.
+    Precedence: an explicit ``tenant`` argument (section name, one of its
+    domains or its tenant id); else the tenant claiming the domain of the
+    ``user_arg`` argument (a UPN); else the tenant already in effect
+    (``daily_brief`` sets it per tenant); else the default tenant.
+
+    ``conflict``: with both ``tenant`` and a UPN whose domain another tenant
+    claims, ``"allow"`` (the explicit tenant wins: a B2B guest's sign-ins live
+    in the host tenant) or ``"refuse"``. ``unclaimed``: a UPN domain no tenant
+    claims and no ``tenant`` given is ``"refuse"`` (``tenant_configured:
+    false``, ``found: null``) or ``"fallback"`` (searched in the tenant in
+    effect / the default). Whenever an unclaimed UPN is searched anyway, the
+    result says ``user_domain_claimed: false``.
+    ``refusal(arguments, base)`` may reshape a refusal; a non-UPN is left to
+    the tool's own validation. With a tenant file, every dict result carries
+    ``tenant`` (None on a refusal that picked none); env-only results are
+    unchanged.
     """
 
     def decorator(fn):
         sig = inspect.signature(fn)
+
+        def refuse(arguments, base):
+            return refusal(arguments, base) if refusal else base
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -318,28 +348,54 @@ def _tenant_scoped(*, user_arg: str | None = None, refusal=None):
             arguments = sig.bind_partial(*args, **kwargs).arguments
             ref = arguments.get("tenant")
             user = arguments.get(user_arg) if user_arg else None
+            owner = tenants.for_upn(user) if isinstance(user, str) and _is_upn(user) else None
+            note = None
             tenant: TenantConfig | None
             if isinstance(ref, str) and ref.strip():
                 tenant = tenants.resolve(ref)
                 if tenant is None:
-                    base = _unknown_tenant(tenants, ref)
-                    return refusal(arguments, base) if refusal else base
+                    return refuse(arguments, _unknown_tenant(tenants, ref))
+                if conflict == "refuse" and owner is not None and owner.name != tenant.name:
+                    return refuse(arguments, _tenant_conflict(tenants, user, tenant, owner))
+            elif owner is not None:
+                tenant = owner
             elif isinstance(user, str) and _is_upn(user):
-                tenant = tenants.for_upn(user)
-                if tenant is None:
-                    base = _unknown_domain(tenants, user)
-                    return refusal(arguments, base) if refusal else base
+                if unclaimed == "refuse":
+                    return refuse(arguments, _unknown_domain(tenants, user))
+                tenant = _current_tenant()
             else:
                 tenant = _current_tenant()
+            if owner is None and isinstance(user, str) and _is_upn(user):
+                note = False  # searched although no tenant claims the user's domain
             with _in_tenant(tenant.name):
                 out = fn(*args, **kwargs)
-            if tenants.from_file and isinstance(out, dict) and "tenant" not in out:
-                out = {**out, "tenant": tenant.name}
+            if isinstance(out, dict):
+                if tenants.from_file and "tenant" not in out:
+                    out = {**out, "tenant": tenant.name}
+                if note is not None and tenants.from_file:
+                    out = {**out, "user_domain_claimed": note}
             return out
 
         return wrapper
 
     return decorator
+
+
+def _default_tenant_tagged(fn):
+    """For the ARM tools, which serve the default tenant only: name it in file mode."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        try:
+            tenants = _tenants()
+        except ConfigError:
+            return out
+        if tenants.from_file and isinstance(out, dict) and "tenant" not in out:
+            out = {**out, "tenant": tenants.default.name}
+        return out
+
+    return wrapper
 
 
 def _is_upn(value: str) -> bool:
@@ -435,7 +491,10 @@ def health_check() -> dict:
     top-level keys stay the DEFAULT tenant's, as in a single-tenant
     deployment, plus ``tenant`` (the default's name) and ``tenants``:
     ``{name: {default, domains, auth_mode, status, graph, signin_probe}}``
-    for every tenant, the default included. Another tenant that is not
+    for every tenant, the default included. Each tenant's probes run under an
+    even share of the call budget (``ENTRAADM_DEADLINE``), so a tenant that
+    does not answer is an ``error`` there instead of stalling the call.
+    Another tenant that is not
     ``healthy`` makes the top-level ``status`` at most ``degraded`` (the
     default tenant alone can make it ``error``). ``arm`` is the default
     tenant's only. Env-only results carry neither key.
@@ -469,8 +528,17 @@ def health_check() -> dict:
             "sites": site_status,
         }
 
-    graph = client.check()
-    signin_probe = client.probe_signin_access()
+    # Every tenant's two probes share one call budget, an even share each, so an
+    # unreachable tenant is reported as such instead of outlasting the call.
+    budget = deadline_seconds()
+    shares = len(tenants.tenants)
+
+    def tenant_deadline() -> float | None:
+        return None if budget is None else time.monotonic() + budget / shares
+
+    default_deadline = tenant_deadline()
+    graph = client.check(deadline=default_deadline)
+    signin_probe = client.probe_signin_access(deadline=default_deadline)
     arm = _arm().check(deadline=time.monotonic() + _ARM_PROBE_SECONDS)
     status = _probe_status(graph, signin_probe)
     if status == "healthy" and site_status["error"] is not None:
@@ -496,7 +564,10 @@ def health_check() -> dict:
         else:
             with _in_tenant(t.name):
                 other = _client()
-                mode, t_graph, t_signin = other.mode, other.check(), other.probe_signin_access()
+                mode = other.mode
+                own_deadline = tenant_deadline()
+                t_graph = other.check(deadline=own_deadline)
+                t_signin = other.probe_signin_access(deadline=own_deadline)
         per_tenant[t.name] = {
             "default": t.default,
             "domains": list(t.domains),
@@ -600,7 +671,7 @@ def _user_entry(u: dict, license_names: list[str], licenses_capped: bool) -> dic
 @mcp.tool()
 @_with_call_deadline
 @_tenant_scoped(user_arg="upn")
-def get_user(upn: str) -> dict:
+def get_user(upn: str, tenant: str | None = None) -> dict:
     """One account's identity/lifecycle state -- the first thing to check on any triage report.
 
     ``account_enabled=false`` means the account itself is the whole story;
@@ -636,6 +707,8 @@ def get_user(upn: str) -> dict:
 
     Args:
         upn: The account's userPrincipalName, e.g. "user@example.edu".
+        tenant: Search this tenant instead of the one claiming the UPN's domain (section name, domain or
+            tenant id): for a <tenant>.onmicrosoft.com or #EXT# UPN, or a B2B guest's sign-ins in the host tenant.
     """
     try:
         validate_upn(upn)
@@ -722,6 +795,7 @@ def signin_logs(
     result: str = "failure",
     top: int = 25,
     max_pages: int | None = None,
+    tenant: str | None = None,
 ) -> dict:
     """One user's recent sign-in events, AADSTS-annotated.
 
@@ -752,6 +826,8 @@ def signin_logs(
         result: "failure" (default), "success", or "all".
         top: Maximum matching entries to return, clamped to [1, 500].
         max_pages: Page budget for the client-side filter walk (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        tenant: Search this tenant instead of the one claiming the UPN's domain (section name, domain or
+            tenant id): for a <tenant>.onmicrosoft.com or #EXT# UPN, or a B2B guest's sign-ins in the host tenant.
     """
     try:
         validate_upn(user)
@@ -1332,7 +1408,7 @@ def _matches_user(a: dict, user: str) -> bool:
 
 
 @mcp.tool()
-@_tenant_scoped(user_arg="user")
+@_tenant_scoped(user_arg="user", conflict="refuse", unclaimed="fallback")
 def directory_audits(
     user: str | None = None,
     hours: int = 24,
@@ -1441,7 +1517,7 @@ def _method_entry(m: dict) -> dict:
 @mcp.tool()
 @_with_call_deadline
 @_tenant_scoped(user_arg="upn")
-def get_user_auth_methods(upn: str) -> dict:
+def get_user_auth_methods(upn: str, tenant: str | None = None) -> dict:
     """Registered authentication methods for one account -- is MFA actually set up?
 
     ``mfa_registered`` answers "would this account survive a password-spray
@@ -1464,6 +1540,8 @@ def get_user_auth_methods(upn: str) -> dict:
 
     Args:
         upn: The account's userPrincipalName.
+        tenant: Search this tenant instead of the one claiming the UPN's domain (section name, domain or
+            tenant id): for a <tenant>.onmicrosoft.com or #EXT# UPN, or a B2B guest's sign-ins in the host tenant.
     """
     try:
         validate_upn(upn)
@@ -1632,6 +1710,7 @@ def _resolve_subscriptions(
 
 @mcp.tool()
 @_with_call_deadline
+@_default_tenant_tagged
 def list_subscriptions(max_pages: int | None = None) -> dict:
     """The Azure subscriptions this credential can see, as ARM lists them.
 
@@ -1783,6 +1862,7 @@ def _count_vms(rows: list[dict]) -> dict:
 
 @mcp.tool()
 @_with_call_deadline
+@_default_tenant_tagged
 def vm_backup_status(
     subscription: str | None = None, stale_hours: int = _DEFAULT_STALE_HOURS, max_pages: int | None = None
 ) -> dict:
@@ -2060,6 +2140,7 @@ def _policy_entry(policy: dict, vault: dict) -> dict:
 
 @mcp.tool()
 @_with_call_deadline
+@_default_tenant_tagged
 def vm_backup_policies(subscription: str | None = None, max_pages: int | None = None) -> dict:
     """Schedule and retention of the Azure VM backup policies in each Recovery Services vault.
 
@@ -2305,6 +2386,7 @@ def _read_activity_log(arm: ArmClient, subscription_id: str, log_filter: str, pa
 
 @mcp.tool()
 @_with_call_deadline
+@_default_tenant_tagged
 def vm_activity(
     vm: str,
     subscription: str | None = None,
@@ -2619,9 +2701,13 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
     With a tenant file (``ENTRAADM_CONFIG``) it covers every tenant: the
     top-level keys stay the DEFAULT tenant's brief, exactly as in a
     single-tenant deployment, plus ``tenant`` (the default's name) and
-    ``tenants`` (``{name: the same brief}`` for each other tenant). All
-    tenants share one call budget, run default first, so a slow default can
-    leave the others ``capped``. Env-only results carry neither key.
+    ``tenants`` (``{name: the same brief}`` for each other tenant). The call
+    budget (``ENTRAADM_DEADLINE``) is split: default first, each tenant gets
+    an even share of what is left, so a busy tenant cannot starve the next
+    one (a tenant that finishes early leaves its rest to the others). With
+    ``ENTRAADM_DEADLINE=0`` there is no budget and every tenant is scanned in
+    full, one after another, which can outlast a client's ~60 s cutoff.
+    Env-only results carry neither key.
 
     Runs both sections synchronously in one tool call, unlike the sibling
     gwsadm-mcp's job+poll ``daily_brief``. If this proves too slow for a
@@ -2642,16 +2728,33 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
             tenants = _tenants()
         except ConfigError:
             return _brief(hours, max_pages)  # each section reports the ConfigError itself
-        with _in_tenant(tenants.default.name):
-            out = _brief(hours, max_pages)
+        order = [tenants.default] + [t for t in tenants.tenants if t.name != tenants.default.name]
+        briefs = {}
+        for left, t in zip(range(len(order), 0, -1), order):
+            # Each tenant gets an even share of what is left, default first, so a busy
+            # default tenant cannot leave the others starting with an expired budget.
+            with _in_tenant(t.name), _deadline_share(left):
+                briefs[t.name] = _brief(hours, max_pages)
+        out = briefs[tenants.default.name]
         if tenants.from_file:
             out["tenant"] = tenants.default.name
-            out["tenants"] = {}
-            for t in tenants.tenants:
-                if t.name != tenants.default.name:
-                    with _in_tenant(t.name):
-                        out["tenants"][t.name] = _brief(hours, max_pages)
+            out["tenants"] = {name: b for name, b in briefs.items() if name != tenants.default.name}
         return out
+    finally:
+        _CALL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def _deadline_share(parts_left: int):
+    """Narrow the call budget to an even share of what is left (no budget: unchanged)."""
+    whole = _CALL_DEADLINE.get()
+    if whole is None or parts_left <= 1:
+        yield
+        return
+    now = time.monotonic()
+    token = _CALL_DEADLINE.set(now + max(whole - now, 0.0) / parts_left)
+    try:
+        yield
     finally:
         _CALL_DEADLINE.reset(token)
 
@@ -2760,9 +2863,9 @@ def _revoke_refusal(arguments: dict, refusal: dict) -> dict:
     upn = arguments.get("upn", "")
     return {
         **_revoke_base(upn),
-        "found": False,
+        "found": None,
         "tenant_configured": False,
-        "error": f"{refusal['error']}; nothing was sent",
+        "error": f"no configured tenant claims the domain of {upn!r}; nothing was sent",
         "configured_domains": refusal["configured_domains"],
     }
 
@@ -2792,6 +2895,12 @@ def revoke_sign_in_sessions(upn: str) -> dict:
     a 5xx after the retries, the deadline hit after the request was sent, or a
     success answer that could not be read. Calling again is safe: revocation is
     idempotent. A nonexistent account is ``found: false`` with ``error: null``.
+
+    With several tenants the account's tenant is always the one claiming its
+    UPN domain: there is deliberately no ``tenant`` override here, so a write
+    can never be aimed at another tenant by an argument. An unclaimed domain
+    is refused (``revoked: false``, ``found: null``, ``tenant_configured:
+    false``); nothing is sent.
 
     A 403 fills ``missing_permission`` for the auth mode in use: app-only needs
     the ``User.RevokeSessions.All`` application permission; delegated

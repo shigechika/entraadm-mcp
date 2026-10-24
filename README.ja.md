@@ -166,7 +166,7 @@ domains = students.example.edu
 
 | キー | 必須 | 意味 |
 |---|---|---|
-| `tenant_id` | はい | テナントの ID（GUID）かテナントのドメイン名 |
+| `tenant_id` | はい | テナントの ID（GUID）か，ドットを含むテナントのドメイン名（例 `contoso.onmicrosoft.com`）。`common`・`organizations`・`consumers` は受け付けない |
 | `domains` | はい | このテナントに振り分ける UPN のドメイン（カンマ区切り。完全一致・大文字小文字は区別しない） |
 | `default` | 複数あるときは 1 つに | 呼び出しでテナントを指定しないときに使う。節が 1 つならそれが既定 |
 | `client_id` と `client_secret_env` | いいえ（両方か，どちらも無しか） | 専用のアプリ。`client_secret_env` はシークレットを入れた環境変数の名前。ファイルにシークレットを書かない |
@@ -185,26 +185,38 @@ https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
 ```
 
 ファイルが読めない，`[tenant.*]` 以外の節や知らないキーがある，`tenant_id` か `domains` が無い，
+`tenant_id` が GUID でもドットを含むドメインでもない，
 同じドメインを 2 つのテナントが持つ，複数のテナントのうち既定が無い（または 2 つある），の
 いずれかなら，サーバは起動せず `--check` も失敗する。`--check` はすべてのテナントを調べる。
 
 振り分け:
 
 - UPN を取るツール（`get_user`・`get_user_auth_methods`・`signin_logs`・`revoke_sign_in_sessions`，
-  `user` を指定したときの `directory_audits`）は，UPN のドメインを `domains` に持つテナントで動く。
-  どのテナントも持たないドメインは例外ではなく拒否になる: `tenant_configured: false` と
-  `configured_domains` を返す（`revoke_sign_in_sessions` では `revoked: false`・`found: false`。何も送らない）。
+  `user` を指定したときの `directory_audits`）は，UPN のドメインを `domains` に持つテナント（完全一致）で動く。
+  どのテナントも持たないドメインは例外ではなく拒否になる: `tenant_configured: false`・`found: null`
+  （照会していない）・`configured_domains`。`revoke_sign_in_sessions` では `revoked: false`・`found: null` で，
+  何も送らない。`<tenant>.onmicrosoft.com` の UPN をよく引くなら `domains` に入れておく。
+- `get_user`・`get_user_auth_methods`・`signin_logs` は `tenant` も取り，UPN のドメインより優先する。
+  `*.onmicrosoft.com` や `#EXT#` の UPN，ホストのテナントに記録される B2B ゲストのサインインに使う。
+  `revoke_sign_in_sessions` には意図的にこの上書きが無い。書き込みは UPN のドメインを持つテナントにしか向かない。
 - テナント全体を見るツール（`signin_failure_stats`・`signin_success_stats`・`signin_by_ip`・
-  `directory_audits`・`m365_service_health`）は，省略可の `tenant`（節の名前かそのドメイン）を取る。
-  省略すると既定のテナント。`directory_audits` では `tenant` の指定が `user` より優先する。
+  `directory_audits`・`m365_service_health`）は省略可の `tenant` を取る。省略すると既定のテナント。
+  `directory_audits` で `tenant` と，ほかのテナントが持つドメインの `user` を両方指定すると拒否する
+  （違うログを探して何も見つからないため）。どのテナントも持たないドメインの `user`（外部・パートナーの
+  管理者，ゲスト）は指定のテナントか既定のテナントで探し，結果に `user_domain_claimed: false` を付ける。
+- `tenant` は節の名前・そのドメイン・テナント ID のいずれか。テナントのファイルが無いときは `default` か
+  env のテナント ID だけを受け付け，ほかは拒否する（`tenant_configured: false`）。
 - `health_check` と `daily_brief` はすべてのテナントを見る。最上位のキーはこれまでどおり既定のテナントの
-  もので，`tenant` がその名前，`tenants` がテナントごとの結果。ほかのテナントが healthy でなければ
-  `health_check` の `status` は高々 `degraded`。
+  もので，`tenant` がその名前，`tenants` がテナントごとの結果。呼び出しの時間予算（`ENTRAADM_DEADLINE`）は
+  テナントで均等に分ける（既定から順に，残りを残りのテナント数で割る）ので，遅いテナントがほかを止めない。
+  応答しないテナントはその項目で `error` になり，`health_check` の `status` は高々 `degraded`。
+  `ENTRAADM_DEADLINE=0` では予算が無く，全テナントを最後まで順に調べるので，クライアントの約 60 秒の
+  打ち切りを超えうる。
 - Azure Resource Manager のツール（`list_subscriptions`・`vm_backup_status`・`vm_backup_policies`・
   `vm_activity`）は既定のテナントだけを見る。
-- テナントのファイルを使うと，結果には必ず `tenant` が付く。env だけのときの結果は変わらない。
-  ただし `revoke_sign_in_sessions` はキーが常に同じなので，いつも `tenant`・`tenant_configured`・
-  `configured_domains` を含む。
+- テナントのファイルを使うと，結果には必ず `tenant` が付く（ARM のツールは既定のテナント，どのテナントも
+  選ばなかった拒否は `null`）。env だけのときの結果は変わらない。ただし `revoke_sign_in_sessions` はキーが
+  常に同じなので，いつも `tenant`・`tenant_configured`・`configured_domains` を含む。
 
 ## 使い方
 

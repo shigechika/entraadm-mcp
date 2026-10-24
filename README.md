@@ -188,7 +188,7 @@ domains = students.example.edu
 
 | Key | Required | Meaning |
 |---|---|---|
-| `tenant_id` | yes | The tenant's id (GUID) or its domain name |
+| `tenant_id` | yes | The tenant's id (GUID) or a domain name of it (with a dot, e.g. `contoso.onmicrosoft.com`); `common`, `organizations` and `consumers` are refused |
 | `domains` | yes | Comma-separated UPN domains routed to this tenant (exact match, any case) |
 | `default` | on one section when there are several | The tenant used when a call names none; a single section is the default anyway |
 | `client_id` + `client_secret_env` | no, both or neither | An app of its own; `client_secret_env` names the env var holding its secret. Never put a secret in the file |
@@ -210,28 +210,45 @@ https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
 
 The server refuses to start, and `--check` fails, when the file is unreadable,
 has a section that is not `[tenant.*]` or an unknown key, misses `tenant_id` or
-`domains`, gives one domain to two tenants, or has no default (or two) among
+`domains`, has a `tenant_id` that is neither a GUID nor a dotted domain, gives one domain to two tenants, or has no default (or two) among
 several tenants. `--check` probes every tenant.
 
 Routing:
 
 - A tool that takes a UPN (`get_user`, `get_user_auth_methods`, `signin_logs`,
   `revoke_sign_in_sessions`, and `directory_audits` when `user` is given) works
-  in the tenant whose `domains` holds the UPN's domain. A domain no tenant
-  claims is a refusal, not an exception: `tenant_configured: false` with the
-  `configured_domains` (for `revoke_sign_in_sessions`: `revoked: false`,
-  `found: false`; nothing is sent).
+  in the tenant whose `domains` holds the UPN's domain (exact match). A domain
+  no tenant claims is a refusal, not an exception: `tenant_configured: false`,
+  `found: null` (no lookup ran) and the `configured_domains`. For
+  `revoke_sign_in_sessions`: `revoked: false`, `found: null`, nothing is sent.
+  List `<tenant>.onmicrosoft.com` in `domains` if such UPNs are looked up often.
+- `get_user`, `get_user_auth_methods` and `signin_logs` also take `tenant`,
+  which wins over the UPN's domain: for a `*.onmicrosoft.com` or `#EXT#` UPN,
+  or a B2B guest whose sign-ins are logged in the host tenant.
+  `revoke_sign_in_sessions` has no such override on purpose: a write is only
+  ever aimed at the tenant that owns the UPN's domain.
 - A tenant-wide tool (`signin_failure_stats`, `signin_success_stats`,
   `signin_by_ip`, `directory_audits`, `m365_service_health`) takes an optional
-  `tenant`: a section name or one of its domains; default the default tenant.
-  An explicit `tenant` wins over `directory_audits`' `user`.
+  `tenant`; default the default tenant. `directory_audits` with both `tenant`
+  and a `user` whose domain another tenant claims is refused (it would search
+  the wrong log and find nothing); a `user` whose domain no tenant claims (an
+  external or partner admin, a guest) is searched in the given or default
+  tenant, and the result says `user_domain_claimed: false`.
+- `tenant` is a section name, one of its domains, or its tenant id. Without a
+  tenant file it may be `default` or the env tenant id; anything else is
+  refused (`tenant_configured: false`).
 - `health_check` and `daily_brief` cover every tenant. Their top-level keys stay
   the default tenant's, as before; `tenant` names it and `tenants` holds the
-  per-tenant results. Another unhealthy tenant makes `health_check`'s `status`
-  at most `degraded`.
+  per-tenant results. The call budget (`ENTRAADM_DEADLINE`) is split evenly
+  among the tenants (default first, each taking a share of what is left), so a
+  slow tenant cannot stall the others; a tenant that does not answer is an
+  `error` in its own entry, and makes `health_check`'s `status` at most
+  `degraded`. With `ENTRAADM_DEADLINE=0` there is no budget: every tenant is
+  scanned in full, one after another, which can outlast a client's ~60 s cutoff.
 - The Azure Resource Manager tools (`list_subscriptions`, `vm_backup_status`,
   `vm_backup_policies`, `vm_activity`) serve the default tenant only.
-- With a tenant file, every result names its `tenant`. Env-only results are
+- With a tenant file, every result names its `tenant` (the ARM tools: the
+  default tenant; a refusal that picked none: `null`). Env-only results are
   unchanged, except that `revoke_sign_in_sessions` always carries `tenant`,
   `tenant_configured` and `configured_domains` (its keys never vary).
 

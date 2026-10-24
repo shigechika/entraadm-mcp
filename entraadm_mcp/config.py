@@ -154,8 +154,18 @@ _TENANT_KEYS = {"tenant_id", "domains", "client_id", "client_secret_env", "defau
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _DOMAIN_RE = re.compile(rf"^(?=.{{1,253}}$){_LABEL}(?:\.{_LABEL})+$")
-#: A tenant id is a GUID or the tenant's own domain name (both are accepted as an authority).
-_TENANT_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}|[A-Za-z0-9.-]{1,253})$")
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+#: Authority aliases that name no single tenant; never a ``tenant_id``.
+_AUTHORITY_ALIASES = {"common", "organizations", "consumers"}
+
+
+def _valid_tenant_id(value: str) -> bool:
+    """A GUID, or a domain name (with a dot) such as a verified domain or <name>.onmicrosoft.com."""
+    if _GUID_RE.match(value):
+        return True
+    return value.lower() not in _AUTHORITY_ALIASES and bool(_DOMAIN_RE.match(value.lower()))
+
+
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 
@@ -212,15 +222,16 @@ class Tenants:
         return self._by_domain.get(domain.strip().lower())
 
     def resolve(self, ref: str | None) -> TenantConfig | None:
-        """A tenant by section name or by one of its domains (any case); None picks the default.
+        """A tenant by section name, one of its domains or its tenant id (any case); None picks the default.
 
-        An unknown reference is None, never the default.
+        Env-only, the one tenant answers to ``default`` and to its tenant id. An
+        unknown reference is None, never the default.
         """
         if ref is None or ref.strip() == "":
             return self.default
         key = ref.strip().lower()
         for t in self.tenants:
-            if t.name == key:
+            if t.name == key or (t.auth.tenant_id or "").lower() == key:
                 return t
         return self._by_domain.get(key)
 
@@ -245,8 +256,11 @@ def _tenant_from_section(name: str, sec, env) -> TenantConfig:
     tenant_id = (sec.get("tenant_id") or "").strip()
     if not tenant_id:
         raise ConfigError(f"[tenant.{name}]: tenant_id is required")
-    if not _TENANT_ID_RE.match(tenant_id):
-        raise ConfigError(f"[tenant.{name}]: tenant_id must be a GUID or the tenant's domain name")
+    if not _valid_tenant_id(tenant_id):
+        raise ConfigError(
+            f"[tenant.{name}]: tenant_id must be a GUID or the tenant's domain name with a dot "
+            f"(got {tenant_id!r}; common/organizations/consumers name no single tenant)"
+        )
     domains = []
     for raw in (sec.get("domains") or "").split(","):
         d = raw.strip().lower()
@@ -305,7 +319,12 @@ def load_tenants(env: dict | None = None) -> Tenants:
         with open(path, encoding="utf-8") as f:
             parser.read_file(f)
     except (OSError, UnicodeDecodeError, configparser.Error) as exc:
-        raise ConfigError(f"{CONFIG_ENV}: cannot read {path} ({type(exc).__name__})") from None
+        # The file holds no secret by design, so the parser's own detail (line, section, option) is safe.
+        raise ConfigError(f"{CONFIG_ENV}: cannot read {path} ({type(exc).__name__}: {exc})") from None
+    if parser.defaults():
+        # configparser hides its default section from sections() and copies its keys into every
+        # section, which would let a stray [__none__] fill in a tenant's required keys.
+        raise ConfigError(f"{CONFIG_ENV}: unknown section [{parser.default_section}] (only [tenant.<name>])")
 
     tenants: list[TenantConfig] = []
     seen_names: set[str] = set()
