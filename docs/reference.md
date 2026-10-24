@@ -333,6 +333,40 @@ synchronously, under one shared deadline; Azure VM backup is deliberately
 not a section (its ARM fan-out could exhaust the budget — call
 `vm_backup_status` separately). `samples` is currently unused (reserved).
 
+### `revoke_sign_in_sessions(upn)`
+
+Opt-in and state-changing: registered only when
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (exactly "1"; the switch is re-checked
+inside the call). Signs one account out everywhere with Graph
+`POST /users/{id}/revokeSignInSessions` (refresh tokens and session cookies
+are invalidated) after looking it up by exact userPrincipalName; a guest is
+refused. For a confirmed compromise: the owner has to sign in again too.
+
+Only `upn`: there is deliberately no `tenant` override. With several tenants
+the account's tenant is always the one claiming its UPN domain, so a write
+can never be aimed at another tenant by an argument. An unclaimed domain is
+refused with `revoked: false`, `found: null`, `tenant_configured: false` and
+`configured_domains`; nothing is sent.
+
+Every result has the same keys: `found`, `user_principal_name`,
+`account_enabled` (before the call), `revoked`, `at`, `error`,
+`missing_permission`, `tenant`, `tenant_configured`, `configured_domains` and
+`not_covered`. `revoked` is `true` when Graph confirmed it, `false` when
+nothing was done (switch off, unknown or guest account, failed lookup, a
+deadline before the request was sent, a 4xx from Graph), and `null` when the
+outcome is unknown (a response lost to a network error, a 5xx after the
+retries, a deadline after sending, an unreadable success answer) -- calling
+again is safe, revocation is idempotent. `not_covered` lists what this does
+not do: disable the account, reset the password, remove MFA methods;
+access tokens already issued keep working until they expire (typically about
+an hour); legacy authentication and app passwords follow the tenant's own policy.
+
+Permission: `User.RevokeSessions.All` (application permission, admin consent)
+for app-only auth; the User Administrator or Helpdesk Administrator directory
+role for delegated (`az login`) auth (Privileged Authentication Administrator
+for an administrator account). The lookup before it needs `User.Read.All`. A
+403 fills `missing_permission` for the auth mode in use.
+
 ## Errors
 
 Every tool's entry point catches configuration and API-client errors (Graph
