@@ -20,6 +20,8 @@ from entraadm_mcp.client import (
     GRAPH_SCOPE,
     ApiError,
     ApiPermissionError,
+    ApiResponseError,
+    ApiTransportError,
     ArmClient,
     GraphAuthError,
     GraphClient,
@@ -783,3 +785,35 @@ def test_post_403_is_a_permission_error(monkeypatch):
     client, _cred = _client(monkeypatch=monkeypatch)
     with pytest.raises(ApiPermissionError, match="Authorization_RequestDenied"):
         client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+
+
+@respx.mock
+def test_post_transport_error_after_retries_is_a_transport_error(monkeypatch):
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda _s: None)
+    route = respx.post(_REVOKE_URL).mock(side_effect=httpx.ReadError("connection reset"))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiTransportError):
+        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_post_malformed_success_body_is_a_response_error(monkeypatch):
+    respx.post(_REVOKE_URL).mock(return_value=httpx.Response(200, content=b"<html>ok</html>"))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiResponseError):
+        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+
+
+@pytest.mark.parametrize("status", [400, 500])
+@respx.mock
+def test_post_http_error_with_a_body_is_a_plain_api_error(monkeypatch, status):
+    monkeypatch.setattr("entraadm_mcp.client.time.sleep", lambda _s: None)
+    respx.post(_REVOKE_URL).mock(
+        return_value=httpx.Response(status, json={"error": {"code": "x", "message": "rejected"}})
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiError) as info:
+        client.post("/users/11111111-2222-3333-4444-555555555555/revokeSignInSessions")
+    assert not isinstance(info.value, (ApiTransportError, ApiResponseError))
+    assert str(status) in str(info.value)

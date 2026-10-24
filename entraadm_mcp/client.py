@@ -52,6 +52,22 @@ class ApiDeadline(ApiError):
     """The caller's wall-clock budget ran out before a request could finish."""
 
 
+class ApiTransportError(ApiError):
+    """The request could not complete at the network level (after the retries).
+
+    The request may have reached the API before the connection failed, so for
+    a state-changing call the outcome is unknown, not "rejected".
+    """
+
+
+class ApiResponseError(ApiError):
+    """A success status (2xx/3xx) came back with a body that is not JSON.
+
+    The API accepted the request, so for a state-changing call the outcome is
+    unknown, not "rejected".
+    """
+
+
 class ApiAuthError(ApiError):
     """The credential could not produce a usable access token, or the API rejected it outright."""
 
@@ -266,7 +282,7 @@ class _RestClient:
                     self._sleep_within(2 ** (2 - network_retries_left), deadline)
                     network_retries_left -= 1
                     continue
-                raise ApiError(f"{self.api_name} request failed: network error ({type(e).__name__})") from e
+                raise ApiTransportError(f"{self.api_name} request failed: network error ({type(e).__name__})") from e
             if resp.status_code == 429 and not retried_429:
                 retried_429 = True
                 self._sleep_within(_parse_retry_after(resp.headers.get("Retry-After")), deadline)
@@ -398,7 +414,7 @@ class _RestClient:
         try:
             body = resp.json()
         except ValueError:
-            raise ApiError(f"{self.api_name} returned a non-JSON body ({resp.status_code})") from None
+            raise ApiResponseError(f"{self.api_name} returned a non-JSON body ({resp.status_code})") from None
         return body if isinstance(body, dict) else {"value": body}
 
 

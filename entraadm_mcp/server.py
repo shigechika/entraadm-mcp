@@ -49,6 +49,8 @@ from entraadm_mcp.client import (
     ARM_ROLE_HINT,
     ApiError,
     ApiPermissionError,
+    ApiResponseError,
+    ApiTransportError,
     ArmClient,
     GraphClient,
     GraphDeadline,
@@ -2478,6 +2480,9 @@ REVOKE_NOT_COVERED = (
 )
 
 
+_REVOKE_UNKNOWN = "outcome unknown (the revocation may have been applied); calling again is safe, it is idempotent"
+
+
 @_with_call_deadline
 def revoke_sign_in_sessions(upn: str) -> dict:
     """Sign one account out everywhere: invalidate its refresh tokens and session cookies.
@@ -2494,8 +2499,10 @@ def revoke_sign_in_sessions(upn: str) -> dict:
     does NOT do (disable the account, reset the password, remove MFA methods;
     access tokens already issued keep working until they expire). A
     nonexistent account is ``{"found": false, ...}``, nothing is called. A
-    call cut off after the request was sent returns ``revoked: null``
-    (unknown); calling again is safe, revocation is idempotent.
+    call whose outcome is unknown -- cut off by the deadline, the connection
+    lost after the retries, or a success status with an unreadable body --
+    returns ``revoked: null``; calling again is safe, revocation is
+    idempotent. Graph answering with an HTTP error status is ``revoked: false``.
 
     Needs the ``User.RevokeSessions.All`` application permission (admin
     consent) for app-only auth; a 403 names it in ``missing_permission``.
@@ -2525,15 +2532,21 @@ def revoke_sign_in_sessions(upn: str) -> dict:
         "account_enabled": user.get("accountEnabled"),
         "not_covered": list(REVOKE_NOT_COVERED),
     }
+    # Graph answering with an HTTP error status is a definite "not revoked";
+    # anything that leaves the request's fate open (cut off, connection lost
+    # after the retries, a success status with an unreadable body) is unknown.
     try:
         body = client.post(f"/users/{user_id}/revokeSignInSessions", deadline=_current_deadline())
     except GraphPermissionError as e:
         return {**result, "revoked": False, "error": str(e), "missing_permission": "User.RevokeSessions.All"}
-    except GraphDeadline as e:
-        return {**result, "revoked": None, "error": f"{e}; outcome unknown, calling again is safe"}
+    except (GraphDeadline, ApiTransportError, ApiResponseError) as e:
+        return {**result, "revoked": None, "error": f"{e}; {_REVOKE_UNKNOWN}"}
     except GraphError as e:
         return {**result, "revoked": False, "error": str(e)}
-    result["revoked"] = body.get("value") is True
+    value = body.get("value")
+    if not isinstance(value, bool):
+        return {**result, "revoked": None, "error": f"Graph's answer had no boolean value; {_REVOKE_UNKNOWN}"}
+    result["revoked"] = value
     result["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return result
 

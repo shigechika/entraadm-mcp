@@ -12,7 +12,13 @@ import asyncio
 import pytest
 
 import entraadm_mcp.server as server
-from entraadm_mcp.client import GraphDeadline, GraphError, GraphPermissionError
+from entraadm_mcp.client import (
+    ApiResponseError,
+    ApiTransportError,
+    GraphDeadline,
+    GraphError,
+    GraphPermissionError,
+)
 
 PERM_ERROR = GraphPermissionError(
     "insufficient privileges: this endpoint needs the Reports Reader directory role "
@@ -2388,12 +2394,32 @@ def test_revoke_deadline_is_unknown_not_failed(inject, revoke_on):
     assert out["revoked"] is None and "calling again is safe" in out["error"]
 
 
-def test_revoke_other_graph_error(inject, revoke_on):
+@pytest.mark.parametrize("status", [400, 500])
+def test_revoke_http_error_status_is_a_definite_no(inject, revoke_on, status):
     inject(
         FakeGraphClient(
             get_responses={"/users": _revoke_user()},
-            post_responses={_REVOKE_PATH: GraphError("Graph request failed (400): bad")},
+            post_responses={_REVOKE_PATH: GraphError(f"Graph request failed ({status}): bad")},
         )
     )
     out = server.revoke_sign_in_sessions("user@example.edu")
-    assert out["revoked"] is False and "400" in out["error"]
+    assert out["revoked"] is False and str(status) in out["error"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ApiTransportError("Graph request failed: network error (ReadError)"),
+        ApiResponseError("Graph returned a non-JSON body (200)"),
+    ],
+)
+def test_revoke_indeterminate_failures_are_unknown(inject, revoke_on, error):
+    inject(FakeGraphClient(get_responses={"/users": _revoke_user()}, post_responses={_REVOKE_PATH: error}))
+    out = server.revoke_sign_in_sessions("user@example.edu")
+    assert out["revoked"] is None and "idempotent" in out["error"]
+
+
+def test_revoke_success_without_a_boolean_is_unknown(inject, revoke_on):
+    inject(FakeGraphClient(get_responses={"/users": _revoke_user()}, post_responses={_REVOKE_PATH: {}}))
+    out = server.revoke_sign_in_sessions("user@example.edu")
+    assert out["revoked"] is None and "idempotent" in out["error"]
