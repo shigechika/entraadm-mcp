@@ -52,8 +52,12 @@ IDENTIFIER_ARGS = {"user", "upn"}
 BOUNDING_ARGS = {"hours", "max_pages", "top", "samples"}
 
 #: Tools that change anything in the tenant. The smoke test must never call
-#: these. Empty: every tool in this server reads.
-STATE_CHANGING: set[str] = set()
+#: these.
+STATE_CHANGING: set[str] = {"revoke_sign_in_sessions"}
+
+#: Tools registered only behind an opt-in environment switch, so absent from
+#: the registry these tests read; their probe specs must still exist.
+OPT_IN: set[str] = set(smoke_probes.OPT_IN_TOOLS)
 
 
 def _registered_tool_names() -> set[str]:
@@ -87,14 +91,13 @@ def test_every_registered_tool_has_a_probe():
 
 def test_no_probe_targets_a_removed_tool():
     registered = _registered_tool_names()
-    stale = sorted(set(smoke_probes.PROBES) - registered)
+    stale = sorted(set(smoke_probes.PROBES) - registered - OPT_IN)
     assert not stale, f"Probe spec(s) for tools that are no longer registered: {stale}"
 
 
 def test_state_changing_tools_are_skipped():
     """A smoke test that changes what it is measuring is worse than none."""
-    registered = _registered_tool_names()
-    for name in sorted(STATE_CHANGING & registered):
+    for name in sorted(STATE_CHANGING):
         probe = smoke_probes.PROBES[name]
         assert probe.skip, f"{name} changes state and must be skipped, not exercised"
 
@@ -268,3 +271,7 @@ def test_in_process_result_decodes_to_plain_data_on_the_installed_sdk(monkeypatc
     decoded = smoke_test._decode(raw)
     assert isinstance(decoded, dict)
     assert decoded["service"] == "entraadm-mcp"
+
+
+def test_opt_in_tools_have_probe_specs():
+    assert OPT_IN <= set(smoke_probes.PROBES)

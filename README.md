@@ -6,7 +6,8 @@ English | [日本語](README.ja.md)
 
 MCP server for Microsoft Entra ID sign-in and audit-log triage, plus the two
 Azure-side questions a morning patrol asks with the same credential: are our
-Azure VMs backed up, and is Microsoft 365 itself degraded right now. Read-only.
+Azure VMs backed up, and is Microsoft 365 itself degraded right now. Read-only,
+except for one opt-in tool that signs a compromised account out everywhere.
 
 ## Why this instead of the official Microsoft MCP Server for Enterprise
 
@@ -22,7 +23,8 @@ and is not a fit for an unattended triage bot:
   server exposes one tool that lets the model construct arbitrary
   `GET`/schema-discovery calls against Microsoft Graph. That is flexible for
   a human, and awkward to put behind an allow-list for an automated triage
-  profile. entraadm-mcp exposes fourteen fixed, read-only tools instead.
+  profile. entraadm-mcp exposes fourteen fixed, read-only tools instead (plus one
+  opt-in write, below).
 - **No AADSTS translation.** Sign-in failures come back as raw error codes;
   triage still needs a lookup table. entraadm-mcp annotates every sign-in
   failure with what the code actually means.
@@ -51,8 +53,25 @@ and is not a fit for an unattended triage bot:
 | `m365_service_health` | Is a Microsoft 365 service degraded, and which incidents and advisories are open? |
 | `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
 
-Every tool is read-only. Write operations (unblocking an account, resetting a
-password, revoking a session) are out of scope for this server.
+Every tool above is read-only. One state-changing tool exists and is off by
+default:
+
+| Tool | What it does |
+|---|---|
+| `revoke_sign_in_sessions` | Signs one account out everywhere (Graph `revokeSignInSessions`: refresh tokens and session cookies are invalidated). For a confirmed compromise. Registered only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` |
+
+It looks the account up by exact userPrincipalName first and refuses a guest.
+Every result has the same keys, including `revoked` and `not_covered`: it does
+not disable the account, reset the password or remove MFA methods, and access
+tokens already issued keep working until they expire (typically about an
+hour). `revoked` is `true` when Graph confirmed it, `false` when nothing was
+done (a refusal, a deadline before the request was sent, a 4xx from Graph), and
+`null` when the outcome is unknown (a response lost to a network error, a 5xx
+after the retries, a deadline after the request was sent, an unreadable success
+answer); calling again is then safe, revocation is idempotent. Leave the
+switch unset on any deployment that is not behind its own approval step (a
+shared gateway, for instance) -- the tool is then absent from `tools/list`.
+Unblocking an account and resetting a password stay out of scope.
 
 The four Azure Resource Manager tools live in an Entra-named server on
 purpose: they use the same app registration and the same `azure-identity`
@@ -83,6 +102,7 @@ different auth mode than intended.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` | Under delegated auth the signed-in user also needs an Entra role that may read service health (for example Service Support Administrator or Global Reader) |
+| `revoke_sign_in_sessions` (opt-in) | `User.RevokeSessions.All` (app-only) or the **User Administrator** / **Helpdesk Administrator** directory role (delegated; **Privileged Authentication Administrator** for an administrator account) | Only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`. A write permission: grant it only to a deployment that needs the tool. The account lookup before it needs `User.Read.All`. Without the permission the tool answers `missing_permission` for the auth mode in use and nothing changes |
 
 ### Required Azure RBAC
 
@@ -133,6 +153,9 @@ export ENTRAADM_DEADLINE=45
 # Your own address ranges (NAT egress, offices, labs). Spray suspects inside them are
 # listed separately as internal_spray_suspects, labelled with the site.
 export ENTRAADM_SITES_INI=/path/to/sites.ini
+# Register revoke_sign_in_sessions, the one state-changing tool (exactly "1"; anything
+# else leaves it off). Also needs the User.RevokeSessions.All permission.
+export ENTRAADM_ENABLE_REVOKE_SESSIONS=1
 ```
 
 `ENTRAADM_SITES_INI` uses the same format as keycloak-mcp's `KEYCLOAK_SITES_INI`,
@@ -211,8 +234,8 @@ uv run ruff format --check .
 uv run python scripts/smoke_test.py
 ```
 
-Read-only, no payloads printed (tool names/statuses/row counts only), and
-bounded (small explicit windows/page caps) — nothing here writes to the
+Read-only (`revoke_sign_in_sessions` is skipped by name even when enabled), no
+payloads printed (tool names/statuses/row counts only), and bounded (small explicit windows/page caps) — nothing here writes to the
 tenant or scans more than a day of logs.
 
 ## Releasing

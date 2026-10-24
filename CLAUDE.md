@@ -4,8 +4,9 @@
 
 MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
 plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
-service health. Transport is stdio only. All 14 tools are read-only — there
-is no write/mutating tool. Auth is env-var driven (see below); no config file. The
+service health. Transport is stdio only. The 14 default tools are read-only;
+one state-changing tool, `revoke_sign_in_sessions`, is registered only when
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (see Conventions). Auth is env-var driven (see below); no config file. The
 one optional data file is `ENTRAADM_SITES_INI` (the tenant's own address
 ranges, same format as keycloak-mcp's `KEYCLOAK_SITES_INI`), loaded by
 `entraadm_mcp/sites.py` with longest-prefix lookup.
@@ -41,7 +42,13 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   token. `get_paged` refuses to follow a continuation link whose
   scheme/host/port differ from the client's base URL (it would hand the
   bearer token to that host) — `ApiError`, not followed. The exception
-  hierarchy is `ApiError`/`ApiDeadline`/`ApiAuthError`/`ApiPermissionError`;
+  hierarchy is `ApiError`/`ApiDeadline`/`ApiAuthError`/`ApiPermissionError`,
+  plus `ApiTransportError` (network failure after the retries),
+  `ApiServerError` (5xx after the retries) and `ApiResponseError` (a success
+  status with a non-JSON body). Every `ApiError` carries `may_have_applied`
+  (set by `_request_tracked`, and by `post()` from all attempts): False only
+  when no attempt can have been acted on. A write tool must branch on it --
+  never collapse an unknown outcome into a plain `GraphError` "not done";
   `GraphError` etc. are aliases kept for the older imports. `odata_quote()`/`validate_upn()` are the injection defenses —
   every `$filter` built from tool input goes through one or both; MCP tool
   input is treated as adversarial. HTTP 403 is translated via
@@ -143,6 +150,21 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   registration client ID, or real userPrincipalName into code, tests,
   commits, PRs, or issues.
 
+- **Write tools are opt-in and absent by default.** `revoke_sign_in_sessions`
+  is registered by `_register_opt_in_tools()` only when
+  `config.revoke_sessions_enabled()` (`ENTRAADM_ENABLE_REVOKE_SESSIONS` is
+  exactly `"1"`), and re-checks the switch inside the function. A deployment
+  that never set it (a shared gateway) cannot list or call it. It resolves the
+  account through `_find_user_checked` ($filter, never path; the one place the
+  id is checked to be a GUID) and interpolates only that id; a guest is
+  refused. `GraphClient.post()` retries like `get()`, so it is for idempotent,
+  body-less actions only. Every return has the same keys; `revoked` is `null`
+  exactly when the raised error has `may_have_applied` (or the success body
+  had no boolean), `false` for every path that sent nothing or got a 4xx. A
+  403 names the permission for the auth mode (`client.mode`).
+  The smoke test skips it by name (`STATE_CHANGING` / `OPT_IN` in
+  `tests/test_smoke_probes.py`).
+
 ## Roadmap (deliberately not in the initial release)
 
 - `daily_brief_start`/`daily_brief_result` job+poll, if `daily_brief`'s
@@ -155,8 +177,7 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   `on_premises_sync_enabled`/`on_premises_last_sync_date_time`) and triage
   hints attached to specific AADSTS codes (e.g. "compare this timestamp
   against the KeyCloak-side password-change event").
-- Write tools (unblock an account, force a password reset, revoke a
-  session), Identity Protection (`riskyUsers`, needs an Entra ID P2 licence
+- Further write tools (unblock an account, force a password reset), Identity Protection (`riskyUsers`, needs an Entra ID P2 licence
   — the API answers 403 "tenant is not licensed" without it, so do not add
   the tool before confirming the licence), Conditional Access policy reads
   (`Policy.Read.All`), the message center (`ServiceMessage.Read.All`) — none

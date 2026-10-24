@@ -1,6 +1,6 @@
 # entraadm-mcp
 
-Microsoft Entra ID のサインインログ・監査ログの triage 用 MCP サーバ。読み取り専用。
+Microsoft Entra ID のサインインログ・監査ログの triage 用 MCP サーバ。読み取り専用（オプトインのツール 1 本を除く）。
 
 「なぜこの人がサインインできないのか」という問い合わせを、人間が手作業でサインインログを引き、
 AADSTS コードを翻訳し、ディレクトリの監査証跡を確認する——という3段階の作業なしで triage
@@ -41,8 +41,13 @@ Microsoft は Entra ID データ向けに
 | `m365_service_health` | Microsoft 365 のサービス状態と開いているインシデント・アドバイザリ |
 | `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
 
-全ツールが読み取り専用。このサーバに書き込み系ツールは無い——アカウントのブロック解除・
-パスワードリセット・セッション失効はすべてスコープ外。
+上のツールはすべて読み取り専用。状態を変えるツールは `revoke_sign_in_sessions`（1 アカウントを
+すべての場所からサインアウト。Graph `revokeSignInSessions`）の 1 本だけで、
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ登録され、`User.RevokeSessions.All`（app-only）
+または User Administrator／Helpdesk Administrator ロール（delegated）が要る。
+ゲストは断り、`not_covered`（アカウントの無効化・パスワードのリセット・MFA の削除はしない。
+発行済みのアクセストークンは期限まで使える）を返す。`revoked: null` は結果不明で、呼び直してよい。独自の承認の段を持たない配備では
+スイッチを設定しないこと。アカウントのブロック解除とパスワードのリセットは引き続きスコープ外。
 
 ## 設計上の要点
 

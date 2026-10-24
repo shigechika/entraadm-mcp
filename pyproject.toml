@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "entraadm-mcp"
 dynamic = ["version"]
-description = "MCP server for Microsoft Entra ID sign-in and audit-log triage (read-only)"
+description = "MCP server for Microsoft Entra ID sign-in and audit-log triage (read-only by default)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

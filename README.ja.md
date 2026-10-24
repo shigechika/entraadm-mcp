@@ -4,7 +4,8 @@
 
 Microsoft Entra ID のサインインログ・監査ログの triage 用 MCP サーバ。同じクレデンシャルで朝の
 パトロールが聞く Azure 側の 2 つ——Azure VM はバックアップされているか、Microsoft 365 自体が
-いま劣化していないか——にも答える。読み取り専用。
+いま劣化していないか——にも答える。読み取り専用（侵害されたアカウントをすべての場所からサインアウトさせる
+オプトインのツール 1 本だけが例外）。
 
 ## 公式の Microsoft MCP Server for Enterprise ではなくこれを使う理由
 
@@ -17,7 +18,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 - **固定ツールセットではなく汎用 Graph クエリツール。** 公式サーバは、モデルが任意の
   `GET`／スキーマ探索呼び出しを Microsoft Graph へ構成できる1本のツールを公開する。
   人間には柔軟だが、自動 triage プロファイル向けの許可リストには馴染みにくい。
-  entraadm-mcp は固定・読み取り専用の13ツールを公開する
+  entraadm-mcp は固定・読み取り専用の14ツールを公開する（ほかにオプトインの書き込みが 1 本。下記）
 - **AADSTS の意味翻訳がない。** サインイン失敗は生のエラーコードのまま返ってきて、
   triage には結局ルックアップが必要になる。entraadm-mcp は全てのサインイン失敗に
   コードの意味を注釈する
@@ -45,8 +46,20 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `m365_service_health` | Microsoft 365 のサービスが劣化していないか、どのインシデント・アドバイザリが開いているか |
 | `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits` を1回でまとめたサマリ |
 
-全ツールが読み取り専用。書き込み操作（アカウントのブロック解除・パスワードリセット・
-セッション失効）はこのサーバのスコープ外。
+上のツールはすべて読み取り専用。状態を変えるツールが 1 本だけあり、既定では無効:
+
+| ツール | 何をするか |
+|---|---|
+| `revoke_sign_in_sessions` | 1 アカウントをすべての場所からサインアウトさせる（Graph `revokeSignInSessions`：リフレッシュトークンとセッション Cookie を無効化）。侵害が確定したときに使う。`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ登録される |
+
+先に userPrincipalName の完全一致でアカウントを引き、ゲストは断る。結果のキーはいつも同じで、
+`revoked` と `not_covered` を必ず含む。アカウントの無効化・パスワードのリセット・MFA 方式の削除はしない。
+発行済みのアクセストークンは期限（通常 1 時間程度）まで使える。`revoked` は、Graph が認めたら `true`、
+何もしていなければ `false`（断った・要求を送る前に期限切れ・Graph が 4xx）、結果が分からなければ `null`
+（通信エラーで応答が失われた・再試行後も 5xx・要求を送った後に期限切れ・成功の応答が読めない）。
+`null` のときはもう一度呼んでも安全（失効は冪等）。独自の承認の段を持たない配備（共有のゲートウェイなど）では
+このスイッチを設定しないこと（`tools/list` にも出なくなる）。アカウントのブロック解除と
+パスワードのリセットは引き続きスコープ外。
 
 Azure Resource Manager の 4 ツールを Entra の名を持つサーバに置いているのは意図的。同じアプリ登録・
 同じ `azure-identity` のクレデンシャル（トークンのスコープが `https://management.azure.com/.default` に
@@ -74,6 +87,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All` | delegated 認証ではサインインしたユーザにサービス正常性を読める Entra ロール（Service Support Administrator や Global Reader 等）も必要 |
+| `revoke_sign_in_sessions`（オプトイン） | `User.RevokeSessions.All`（app-only）または **User Administrator**／**Helpdesk Administrator** ディレクトリロール（delegated。管理者アカウントが対象なら **Privileged Authentication Administrator**） | `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ。書き込みの権限なので、このツールが要る配備にだけ付与する。先に行うアカウントの照会には `User.Read.All` が要る。無ければ認証方式に応じた `missing_permission` を返し、何も変わらない |
 
 ### 必要な Azure RBAC
 
@@ -119,6 +133,9 @@ export ENTRAADM_DEADLINE=45
 # 自組織のアドレス範囲（NAT の出口・事業所・実習室など）。この範囲のスプレー疑いは
 # internal_spray_suspects に拠点名付きで分けて出す
 export ENTRAADM_SITES_INI=/path/to/sites.ini
+# 状態を変える唯一のツール revoke_sign_in_sessions を登録する（ちょうど "1" のときだけ。
+# ほかの値では無効）。User.RevokeSessions.All の権限も要る
+export ENTRAADM_ENABLE_REVOKE_SESSIONS=1
 ```
 
 `ENTRAADM_SITES_INI` は keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ形式なので，1 つの
@@ -195,7 +212,7 @@ uv run ruff format --check .
 uv run python scripts/smoke_test.py
 ```
 
-読み取り専用・ペイロード非出力（ツール名／ステータス／行数のみ）・境界あり
+読み取り専用（`revoke_sign_in_sessions` は有効でも名前で飛ばす）・ペイロード非出力（ツール名／ステータス／行数のみ）・境界あり
 （小さな明示的な窓・ページ上限）— テナントへの書き込みも、1日を超えるログ走査も行わない。
 
 ## リリース

@@ -104,3 +104,18 @@ def deadline_seconds(env: dict | None = None) -> float | None:
     if not math.isfinite(value):
         return DEFAULT_DEADLINE_SECONDS  # nan / inf must not silently disable the budget
     return value if value > 0 else None
+
+
+#: Opt-in switch for ``revoke_sign_in_sessions``, the only state-changing tool.
+REVOKE_SESSIONS_ENV = "ENTRAADM_ENABLE_REVOKE_SESSIONS"
+
+
+def revoke_sessions_enabled(env: dict | None = None) -> bool:
+    """Whether ``revoke_sign_in_sessions`` is enabled (``ENTRAADM_ENABLE_REVOKE_SESSIONS`` is exactly "1").
+
+    Off by default, and any other value ("true", "yes", " 1") is off, so a
+    deployment that never set it -- a shared gateway, for instance -- cannot
+    expose the tool by accident.
+    """
+    e = os.environ if env is None else env
+    return e.get(REVOKE_SESSIONS_ENV) == "1"

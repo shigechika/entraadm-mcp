@@ -1,6 +1,7 @@
 # entraadm-mcp
 
-MCP server for Microsoft Entra ID sign-in and audit-log triage. Read-only.
+MCP server for Microsoft Entra ID sign-in and audit-log triage. Read-only, except
+for one opt-in tool.
 
 Built for triaging "why can't this person sign in" reports without a human
 manually pulling sign-in logs, translating AADSTS codes, and checking the
@@ -45,9 +46,16 @@ and not a fit for an unattended triage bot:
 | `m365_service_health` | Microsoft 365 service status and the open incidents and advisories |
 | `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats` and `directory_audits` |
 
-All tools are read-only. There is no write/mutating tool in this server —
-unblocking an account, resetting a password, and revoking a session are all
-out of scope.
+All tools above are read-only. The one state-changing tool,
+`revoke_sign_in_sessions` (sign one account out everywhere: Graph
+`revokeSignInSessions`), is registered only when
+`ENTRAADM_ENABLE_REVOKE_SESSIONS=1` and needs `User.RevokeSessions.All`
+(app-only) or the User Administrator / Helpdesk Administrator role (delegated).
+It refuses guests and returns `not_covered` (no account disable, no password
+reset, no MFA removal; issued access tokens live until they expire);
+`revoked: null` means the outcome is unknown and calling again is safe. Leave the
+switch unset on any deployment without its own approval step. Unblocking an
+account and resetting a password stay out of scope.
 
 ## Design notes
 

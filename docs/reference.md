@@ -38,6 +38,7 @@ but the valid ranges are still used.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` (delegated auth also needs an Entra role that may read service health, e.g. Service Support Administrator or Global Reader) |
+| `revoke_sign_in_sessions` (opt-in, `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`) | `User.RevokeSessions.All` (app-only) or the User Administrator / Helpdesk Administrator directory role (delegated; Privileged Authentication Administrator for an administrator account). A write permission; grant it only where the tool is enabled. The lookup before it needs `User.Read.All` |
 
 ### Required Azure RBAC
 

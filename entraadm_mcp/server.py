@@ -1,4 +1,4 @@
-"""entraadm-mcp MCP server — Microsoft Entra ID sign-in/audit-log triage (read-only).
+"""entraadm-mcp MCP server — Microsoft Entra ID sign-in/audit-log triage.
 
 Tools:
 
@@ -15,6 +15,10 @@ Tools:
 - ``m365_service_health``    — Microsoft 365 service status and open incidents
 - ``daily_brief``            — one-call summary combining m365_service_health,
   signin_failure_stats and directory_audits
+- ``revoke_sign_in_sessions`` — opt-in (``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``), the one
+  state-changing tool: sign one account out everywhere
+
+Every tool except ``revoke_sign_in_sessions`` is read-only.
 
 Coverage contract: every result section that walks a paged Graph or ARM collection
 carries a ``capped`` boolean when its window was not fully scanned, so
@@ -56,10 +60,12 @@ from entraadm_mcp.client import (
 from entraadm_mcp.config import (
     MAX_MAX_PAGES,
     MIN_MAX_PAGES,
+    REVOKE_SESSIONS_ENV,
     AuthConfig,
     ConfigError,
     deadline_seconds,
     max_pages_default,
+    revoke_sessions_enabled,
 )
 
 
@@ -232,6 +238,24 @@ def _find_user(client: GraphClient, upn: str, select: str) -> dict | None:
     return values[0] if values else None
 
 
+def _find_user_checked(client: GraphClient, upn: str, select: str) -> dict | None:
+    """``_find_user`` with ``id`` always selected and checked to be GUID-shaped.
+
+    The id is about to be interpolated into a URL path, so a value that is not
+    GUID-shaped is a Graph anomaly (GraphError), never used. None means no such
+    user, a normal answer.
+    """
+    fields = select.split(",")
+    if "id" not in fields:
+        fields.insert(0, "id")
+    user = _find_user(client, upn, ",".join(fields))
+    if user is None:
+        return None
+    if not _GUID_RE.match(str(user.get("id", ""))):
+        raise GraphError("unexpected id shape returned by Graph for this user")
+    return user
+
+
 def _resolve_user_id(client: GraphClient, upn: str) -> str | None:
     """Resolve a UPN to its Graph object id, or None if no such user exists.
 
@@ -239,17 +263,10 @@ def _resolve_user_id(client: GraphClient, upn: str) -> str | None:
     exist" -- not a Graph-client failure -- so it comes back as None rather
     than a raised error; callers turn that into ``{"found": False, ...}``
     instead of ``{"error": ...}``. GraphError is still raised for a genuine
-    anomaly: Graph returning something that isn't GUID-shaped where an id is
-    expected (defense in depth, since that id is about to be interpolated
-    into a URL path).
+    anomaly (see ``_find_user_checked``).
     """
-    user = _find_user(client, upn, "id")
-    if user is None:
-        return None
-    user_id = user.get("id", "")
-    if not _GUID_RE.match(user_id):
-        raise GraphError("unexpected id shape returned by Graph for this user")
-    return user_id
+    user = _find_user_checked(client, upn, "id")
+    return None if user is None else user["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -2455,3 +2472,134 @@ def daily_brief(hours: int = 24, max_pages: int | None = None, samples: int = 10
         "signin_failure_stats": stats,
         "directory_audits": audits,
     }
+
+
+# ---------------------------------------------------------------------------
+# revoke_sign_in_sessions (opt-in, state-changing)
+# ---------------------------------------------------------------------------
+
+#: What revoking sessions leaves untouched; returned with every result so a
+#: responder does not read "revoked" as "the incident is closed".
+REVOKE_NOT_COVERED = (
+    "does not disable the account (accountEnabled is unchanged)",
+    "does not reset the password",
+    "does not remove MFA methods the attacker may have registered",
+    "access tokens already issued stay valid until they expire (typically about an hour)",
+    "legacy authentication and app passwords follow the tenant's own policy",
+)
+
+
+_REVOKE_UNKNOWN = "outcome unknown (the revocation may have been applied); calling again is safe, it is idempotent"
+
+#: What a 403 on the revocation means, by auth mode.
+_REVOKE_PERMISSION = {
+    "app-only": "User.RevokeSessions.All (application permission, admin consent)",
+    "azure-cli": (
+        "User Administrator or Helpdesk Administrator directory role "
+        "(Privileged Authentication Administrator for an administrator account)"
+    ),
+}
+#: What a 403 on the account lookup means, by auth mode.
+_LOOKUP_PERMISSION = {
+    "app-only": "User.Read.All (application permission)",
+    "azure-cli": "a directory role that can read users (e.g. Directory Readers)",
+}
+
+
+@_with_call_deadline
+def revoke_sign_in_sessions(upn: str) -> dict:
+    """Sign one account out everywhere: invalidate its refresh tokens and session cookies.
+
+    STATE-CHANGING -- the one tool in this server that writes. Registered only
+    when ``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``; a deployment without that
+    variable never lists it. Calls Graph ``POST /users/{id}/revokeSignInSessions``
+    after looking the account up by exact userPrincipalName; a guest is refused.
+    The account must sign in again everywhere, so its owner is affected too --
+    use it on a confirmed compromise, not for routine checks.
+
+    Every result has the same keys: ``found``, ``user_principal_name``,
+    ``account_enabled`` (before the call), ``revoked``, ``at`` (UTC, when the
+    request was made), ``error``, ``missing_permission`` and ``not_covered``
+    (what this does NOT do: disable the account, reset the password, remove MFA
+    methods; access tokens already issued keep working until they expire).
+
+    ``revoked`` is True when Graph confirmed it, False when nothing was done
+    (the switch is off, the account is unknown or a guest, the lookup failed,
+    the deadline ran out before the request was sent, or Graph answered 4xx),
+    and null when the outcome is unknown -- a response lost to a network error,
+    a 5xx after the retries, the deadline hit after the request was sent, or a
+    success answer that could not be read. Calling again is safe: revocation is
+    idempotent. A nonexistent account is ``found: false`` with ``error: null``.
+
+    A 403 fills ``missing_permission`` for the auth mode in use: app-only needs
+    the ``User.RevokeSessions.All`` application permission; delegated
+    (``az login``) needs the User Administrator or Helpdesk Administrator role
+    (Privileged Authentication Administrator for an administrator account).
+
+    Args:
+        upn: The account's exact userPrincipalName, e.g. "user@example.edu".
+    """
+    result: dict[str, Any] = {
+        "found": None,
+        "user_principal_name": upn,
+        "account_enabled": None,
+        "revoked": False,
+        "at": None,
+        "error": None,
+        "missing_permission": None,
+        "not_covered": list(REVOKE_NOT_COVERED),
+    }
+    if not revoke_sessions_enabled():
+        return {**result, "error": f"revoke_sign_in_sessions is disabled; set {REVOKE_SESSIONS_ENV}=1 to enable it"}
+    client = None
+    try:
+        validate_upn(upn)
+        client = _client()
+        user = _find_user_checked(client, upn, "userPrincipalName,accountEnabled,userType")
+    except GraphPermissionError as e:
+        mode = getattr(client, "mode", None)
+        return {
+            **result,
+            "error": f"account lookup refused, nothing was sent: {e}",
+            "missing_permission": _LOOKUP_PERMISSION.get(mode, _LOOKUP_PERMISSION["app-only"]),
+        }
+    except (ConfigError, GraphError) as e:
+        return {**result, "error": f"{e}; nothing was sent"}
+    if user is None:
+        return {**result, "found": False}
+    result.update(
+        found=True,
+        user_principal_name=user.get("userPrincipalName") or upn,
+        account_enabled=user.get("accountEnabled"),
+    )
+    if user.get("userType") == "Guest":
+        return {**result, "error": "refusing a guest account; nothing was sent"}
+
+    result["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        body = client.post(f"/users/{user['id']}/revokeSignInSessions", deadline=_current_deadline())
+    except GraphError as e:
+        if getattr(e, "may_have_applied", False):
+            return {**result, "revoked": None, "error": f"{e}; {_REVOKE_UNKNOWN}"}
+        if isinstance(e, GraphPermissionError):
+            return {
+                **result,
+                "error": f"{e}; not revoked",
+                "missing_permission": _REVOKE_PERMISSION.get(client.mode, _REVOKE_PERMISSION["app-only"]),
+            }
+        if isinstance(e, GraphDeadline):
+            return {**result, "error": f"{e}; nothing was sent, not revoked"}
+        return {**result, "error": f"{e}; not revoked"}
+    value = body.get("value")
+    if not isinstance(value, bool):
+        return {**result, "revoked": None, "error": f"Graph's answer had no boolean value; {_REVOKE_UNKNOWN}"}
+    return {**result, "revoked": value, "error": None if value else "Graph answered false; not revoked"}
+
+
+def _register_opt_in_tools(server: MCPServer) -> None:
+    """Register the state-changing tools whose switch is on (see config.revoke_sessions_enabled)."""
+    if revoke_sessions_enabled():
+        server.tool()(revoke_sign_in_sessions)
+
+
+_register_opt_in_tools(mcp)
