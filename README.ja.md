@@ -268,6 +268,18 @@ https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
 }
 ```
 
+### Codex
+
+```bash
+codex mcp add entraadm-mcp \
+  --env ENTRAADM_TENANT_ID=your-tenant-id \
+  --env ENTRAADM_CLIENT_ID=your-client-id \
+  --env ENTRAADM_CLIENT_SECRET=your-client-secret \
+  -- uvx entraadm-mcp
+```
+
+stdio サーバーを起動できる MCP クライアントなら、どれでも同じ形で使える。コマンドに `uvx entraadm-mcp` を指定し、[設定](#設定)の環境変数 `ENTRAADM_*` を渡せばよい。
+
 ### 直接実行
 
 ```bash
