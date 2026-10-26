@@ -307,6 +307,20 @@ Add to `.mcp.json`:
 }
 ```
 
+### Codex
+
+```bash
+codex mcp add entraadm-mcp \
+  --env ENTRAADM_TENANT_ID=your-tenant-id \
+  --env ENTRAADM_CLIENT_ID=your-client-id \
+  --env ENTRAADM_CLIENT_SECRET=your-client-secret \
+  -- uvx entraadm-mcp
+```
+
+Any other MCP client that launches stdio servers works the same way: give it
+`uvx entraadm-mcp` as the command and set the `ENTRAADM_*` variables from
+[Configuration](#configuration) in its environment.
+
 ### Direct execution
 
 ```bash
