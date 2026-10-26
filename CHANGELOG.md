@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.1](https://github.com/shigechika/entraadm-mcp/compare/v1.8.0...v1.8.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **deps:** bump certifi and opentelemetry-api (security) ([#33](https://github.com/shigechika/entraadm-mcp/issues/33)) ([07f8176](https://github.com/shigechika/entraadm-mcp/commit/07f8176841ba68f4b8ad8d5c99d568c1b960491f))
+
 ## [1.8.0](https://github.com/shigechika/entraadm-mcp/compare/v1.7.0...v1.8.0) (2026-10-24)
 
 
