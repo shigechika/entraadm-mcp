@@ -358,5 +358,7 @@ entraadm-mcp archive-signins --dir /var/lib/entra-signins --keep-days 400
 `failed` に挙げる。行は `id` で重複を除く。区間の長さは `<dir>/<tenant>/SLOT_HOURS` に記録し，
 別の長さでの実行は断る（ファイル名は区間の始まりしか持たない）。人とそのアドレスを含むので，ディレクトリは 0700，
 ファイルは 0600。標準出力には実行ごとに JSON の要約を 1 つ出す（テナントごとの `written`・
-`skipped`・`rows`・`failed`・`pruned`）。取れない区間があれば exit 1，設定の誤りは 2。
+`skipped`・`rows`・`failed`・`pruned`・`error`）。最古の区間は `--days` 前以降から始め，保持期間の境目を
+またぐ区間は作らない。取り直しに失敗した区間は前のファイルの横に `<区間>.stale` を置き，読めるまで毎回取り直す。
+認証や権限のエラーはそのテナントをすぐ止める（要約の `error`）。取れない区間があれば exit 1，設定や引数の誤りは 2。
 必要な権限はサインインのツールと同じ。

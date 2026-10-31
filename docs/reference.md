@@ -439,7 +439,11 @@ that fails after 3 attempts leaves the previous file alone and is listed under
 `failed`. Rows are de-duplicated by `id`. The slot length is recorded in
 `<dir>/<tenant>/SLOT_HOURS`; a run with another length is refused (file names
 carry only the slot start). Directories are 0700 and files 0600:
-the rows name people and their addresses. Stdout is one JSON summary per run
-(`written`, `skipped`, `rows`, `failed`, `pruned` per tenant); exit 1 when any
-slot failed, 2 on a configuration error. Needs the same sign-in log access as
+the rows name people and their addresses. The oldest slot starts at or after
+`--days` before now, so no slot straddles the retention edge. A re-read that
+fails leaves `<slot>.stale` beside the earlier file, and that slot is re-read on
+every run until a read succeeds. An authentication or permission error stops
+that tenant at once (`error` in its summary). Stdout is one JSON summary per
+run (`written`, `skipped`, `rows`, `failed`, `pruned`, `error` per tenant);
+exit 1 when any slot failed, 2 on a configuration or argument error. Needs the same sign-in log access as
 the sign-in tools.
