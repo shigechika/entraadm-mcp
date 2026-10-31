@@ -142,8 +142,11 @@ MFA の掛からないプロトコル）で成功したアカウントを列挙�
 `ENTRAADM_HOME_COUNTRIES`（実在の ISO 3166-1 alpha-2，例 `JP`。不正なコードが 1 つでもあれば
 一覧を止めて `home_countries.error` を出す）以外の国からの成功をアカウントごとにまとめ，国・
 よく使われた IP 10 件と回数・クライアントアプリ・最初と最後・`home_success_in_window`
-（打ち切られた走査で見えなければ null）を返す。レガシー認証を使ったか high の spray breach にも
-あれば `high`，それ以外は `medium`。high を先に，
+（打ち切られた走査で見えなければ null）を返す。レガシー認証を使った，high の spray breach にもある，
+Azure CLI・Azure PowerShell・Azure AD PowerShell で成功した（`admin_tools`。よく知られたアプリ ID で判定する。
+一般の利用者が使う理由が無く，パスワードを直接受け取る），24 時間のうちに 3 か国以上から成功した（旅行者ではなく
+入れ替わるプロキシ）のいずれかなら `high`，それ以外は `medium`。どれに当たったかを `high_reasons`
+（`legacy_auth`・`spray_breach`・`admin_tool`・`multi_country_24h`）に返す。high を先に，
 次に国と IP の多い順。国の無い成功は国外と見なさない。本拠の国が未設定なら一覧は空で
 `home_countries.configured: false`。`counts` は重大度ごとのアカウント数（両方にあれば high で
 1 回）。一覧は 50 件まで（`*_capped`），`capped` は走査に従い，`how_to_read` に対処の目安を
@@ -330,3 +333,29 @@ Graph・ARM のコレクションから組み立てた結果は必ず `capped: b
 entraadm-mcp --version   # バージョンを表示
 entraadm-mcp --check     # 認証を解決し、Graph・サインインログ到達性をプローブ（ARM の情報行付き）。exit 0（設定エラー時は 1）
 ```
+
+### `archive-signins`
+
+Entra ID は対話型サインインのログを 30 日しか残さない。`archive-signins` はそれより長く残す。
+毎日（systemd timer や cron で）動かすと，終わった UTC の区間ごとに Graph のサインインを
+そのまま JSON Lines にして `<dir>/<tenant>/<YYYY-MM-DDTHH>.jsonl.gz` に書く。
+
+```bash
+entraadm-mcp archive-signins --dir /var/lib/entra-signins --keep-days 400
+```
+
+| オプション | 効果 |
+|---|---|
+| `--dir` | 退避先（必須）。テナントごとに `[tenant.<name>]` の名前（`ENTRAADM_CONFIG` が無ければ `default`）の下位ディレクトリを作る |
+| `--tenant` | このテナントだけ（複数指定可。既定は全テナント） |
+| `--days` | どこまで遡って埋めるか。1〜30（既定 30） |
+| `--refetch-hours` | 終わってからこの時間以内の区間は，Graph が遅れて届けるサインインのために毎回取り直す（既定 48） |
+| `--slot-hours` | 区間の長さ。24 の約数（既定 3。整数時間の時差なら，どの地域の 1 日も区間をまとめて作れる） |
+| `--keep-days` | これより古い区間のファイルを消す（既定 0：消さない） |
+
+区間は一時ファイルに書いてから置き換えるので，ファイルがあればその区間は読み切っている。
+サインインの無い区間も空のファイルを書く。3 回試して取れなかった区間は前のファイルを残し，
+`failed` に挙げる。行は `id` で重複を除く。人とそのアドレスを含むので，ディレクトリは 0700，
+ファイルは 0600。標準出力には実行ごとに JSON の要約を 1 つ出す（テナントごとの `written`・
+`skipped`・`rows`・`failed`・`pruned`）。取れない区間があれば exit 1，設定の誤りは 2。
+必要な権限はサインインのツールと同じ。

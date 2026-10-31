@@ -36,7 +36,7 @@ and not a fit for an unattended triage bot:
 | `signin_logs` | One user's sign-in events, each AADSTS error code annotated with what it means |
 | `signin_failure_stats` | Tenant-wide failure aggregation: top error codes, users, apps, source IPs, and password-spray suspects |
 | `signin_success_stats` | Tenant-wide success aggregation by source IP: IPs shared by several accounts, legacy-auth (SMTP/IMAP) successes — the view that finds a breach |
-| `compromise_suspects` | Which accounts were probably taken over: an outside IP that sprayed many accounts and got into some (`spray_breaches`), successes from outside the home countries (`foreign_successes`, high when over a legacy protocol), and Microsoft's own risky users when the tenant has Entra ID P2 |
+| `compromise_suspects` | Which accounts were probably taken over: an outside IP that sprayed many accounts and got into some (`spray_breaches`), successes from outside the home countries (`foreign_successes`, high when over a legacy protocol, through Azure CLI / PowerShell, or from 3+ countries within 24 hours), and Microsoft's own risky users when the tenant has Entra ID P2 |
 | `signin_by_ip` | Every sign-in from one source IP: who got in from it, who was tried, and when |
 | `directory_audits` | Who changed what in the directory (block/unblock, attribute edits), and when |
 | `get_user_auth_methods` | Is MFA actually registered for this account? |

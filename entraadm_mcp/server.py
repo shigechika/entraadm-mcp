@@ -1203,7 +1203,16 @@ def _failure_stats(rows: list, capped: bool, hours: int) -> dict:
 # ---------------------------------------------------------------------------
 
 _SUCCESS_SELECT = ",".join(
-    ["createdDateTime", "userPrincipalName", "appDisplayName", "clientAppUsed", "ipAddress", "location", "status"]
+    [
+        "createdDateTime",
+        "userPrincipalName",
+        "appId",
+        "appDisplayName",
+        "clientAppUsed",
+        "ipAddress",
+        "location",
+        "status",
+    ]
 )
 # Entra's "legacy authentication" client apps: no MFA, no Conditional Access
 # device signals, and the protocols credential-stuffing tools drive.
@@ -1229,7 +1238,16 @@ _LEGACY_AUTH_CLIENTS = frozenset(
 #: ``clientAppUsed`` make each row larger than signin_failure_stats' own walk; the page
 #: count is the same, but a deadline-bound walk can stop a little earlier.
 _BRIEF_SIGNIN_SELECT = ",".join(
-    ["createdDateTime", "userPrincipalName", "appDisplayName", "clientAppUsed", "ipAddress", "location", "status"]
+    [
+        "createdDateTime",
+        "userPrincipalName",
+        "appId",
+        "appDisplayName",
+        "clientAppUsed",
+        "ipAddress",
+        "location",
+        "status",
+    ]
 )
 _SHARED_IP_MIN_DISTINCT_USERS = 2
 _SHARED_IP_USERS_LIMIT = 25
@@ -1393,8 +1411,9 @@ _COMPROMISE_LIST_LIMIT = 50
 _COMPROMISE_IPS_LIMIT = 10
 _COMPROMISE_HOW_TO_READ = (
     "spray_breaches are the ones to act on: an outside address that failed for many accounts got into "
-    "these. A foreign_successes entry is a lead (travel, a VPN, a cloud proxy) unless it is high: a legacy "
-    "protocol (SMTP AUTH, IMAP, POP: password only, no MFA) or the same account in spray_breaches. For "
+    "these. A foreign_successes entry is a lead (travel, a VPN, a cloud proxy) unless it is high (high_reasons): a "
+    "legacy protocol (SMTP AUTH, IMAP, POP: password only, no MFA), the same account in spray_breaches, "
+    "Azure CLI / PowerShell from abroad, or 3+ countries within 24 hours. For "
     "those, contain the account in every system it signs in to (the identity provider, the mail and "
     "collaboration suites), not only here. capped=true means the window was not fully read: the lists are "
     "a lower bound."
@@ -1412,6 +1431,35 @@ def _home_status() -> dict:
 #: expired password (50055) is a correct one too, so none of them makes an IP a spray source.
 #: 50056 is "invalid or null password", 50064 "credential validation failed".
 _CREDENTIAL_FAILURE_CODES = frozenset({50034, 50053, 50056, 50057, 50064, 50126})
+
+#: Microsoft's first-party public clients for scripting the tenant (well-known application ids).
+#: A password sign-in through them from abroad is how stolen passwords are tested and used: they
+#: take a password directly, with no browser, and ordinary users have no reason to run them.
+_ADMIN_TOOL_APP_IDS = {
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46": "Microsoft Azure CLI",
+    "1950a258-227b-4e31-a9cf-717495945fc2": "Microsoft Azure PowerShell",
+    "1b730954-1685-4b74-9bfd-dac224a7b894": "Azure Active Directory PowerShell",
+}
+#: Foreign successes from this many distinct countries within any _MULTI_COUNTRY_SPAN make an
+#: account high: a traveller crosses one border at a time, a rotating proxy pool does not.
+_MULTI_COUNTRY_MIN = 3
+_MULTI_COUNTRY_SPAN = datetime.timedelta(hours=24)
+
+
+def _multi_country(seen: list) -> bool:
+    """True when some _MULTI_COUNTRY_SPAN window holds _MULTI_COUNTRY_MIN distinct countries.
+
+    ``seen`` is ``(time, country)`` pairs with parsed times; unparsable times were left out.
+    """
+    seen = sorted(seen)
+    start = 0
+    for end in range(len(seen)):
+        while seen[end][0] - seen[start][0] > _MULTI_COUNTRY_SPAN:
+            start += 1
+        if len({c for _, c in seen[start : end + 1]}) >= _MULTI_COUNTRY_MIN:
+            return True
+    return False
+
 
 _SPRAY_RANGES_UNKNOWN_NOTE = (
     "internal address ranges are not loaded (ENTRAADM_SITES_INI unset or unreadable): the tenant's own "
@@ -1499,6 +1547,8 @@ def _compromise(rows: list, capped: bool, hours: int, min_spray_users: int) -> d
                 "countries": set(),
                 "ips": collections.Counter(),
                 "apps": collections.Counter(),
+                "admin_tools": set(),
+                "seen": [],
                 "legacy": False,
                 "first": None,
                 "last": None,
@@ -1509,6 +1559,12 @@ def _compromise(rows: list, capped: bool, hours: int, min_spray_users: int) -> d
         f["ips"][ip] += 1
         if client_app:
             f["apps"][client_app] += 1
+        tool = _ADMIN_TOOL_APP_IDS.get((row.get("appId") or "").lower())
+        if tool:
+            f["admin_tools"].add(tool)
+        parsed = _parse_iso(when)
+        if parsed is not None:
+            f["seen"].append((parsed, country))
         f["legacy"] = f["legacy"] or legacy
         _widen(f, when)
 
@@ -1548,12 +1604,25 @@ def _compromise(rows: list, capped: bool, hours: int, min_spray_users: int) -> d
     foreign_rows = []
     for upn, f in foreign.items():
         by_spray = upn in breached and ranges_known
-        severity = "high" if f["legacy"] or by_spray else "medium"
+        multi = _multi_country(f["seen"])
+        reasons = [
+            name
+            for name, hit in (
+                ("legacy_auth", f["legacy"]),
+                ("spray_breach", by_spray),
+                ("admin_tool", bool(f["admin_tools"])),
+                ("multi_country_24h", multi),
+            )
+            if hit
+        ]
+        severity = "high" if reasons else "medium"
         top_ips = f["ips"].most_common(_COMPROMISE_IPS_LIMIT)
         foreign_rows.append(
             {
                 "user_principal_name": upn,
                 "severity": severity,
+                "high_reasons": reasons,
+                "admin_tools": sorted(f["admin_tools"]),
                 "countries": sorted(f["countries"]),
                 "distinct_ips": len(f["ips"]),
                 "ips": [{"ip_address": ip, "successes": n} for ip, n in top_ips],
@@ -1829,8 +1898,12 @@ def compromise_suspects(
       client apps, first/last, and ``home_success_in_window`` (the account
       also signed in from a home country or an internal IP in the window;
       null when not seen in a capped scan, since the unread part may hold
-      it). ``high`` when a legacy protocol was used (password only, no MFA)
-      or the account is also a high ``spray_breaches`` entry; ``medium``
+      it). ``high`` when a legacy protocol was used (password only, no MFA),
+      the account is also a high ``spray_breaches`` entry, the success came
+      through Azure CLI / Azure PowerShell / Azure AD PowerShell
+      (``admin_tools``; how stolen passwords are tested and used), or the
+      successes span 3 or more countries within 24 hours (a rotating proxy
+      pool, not a traveller); ``high_reasons`` names which. ``medium``
       otherwise. Unset home countries:
       ``home_countries.configured`` is false and this list stays empty --
       nothing is guessed. A success with no country is never called foreign.
