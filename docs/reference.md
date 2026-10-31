@@ -431,12 +431,14 @@ entraadm-mcp archive-signins --dir /var/lib/entra-signins --keep-days 400
 | `--days` | How far back to fill, 1-30 (default 30) |
 | `--refetch-hours` | Slots that ended this recently are fetched again every run, for sign-ins Graph delivers late (default 48) |
 | `--slot-hours` | Slot length, a divisor of 24 (default 3: whole slots also make up a local day at any whole-hour UTC offset) |
-| `--keep-days` | Delete slot files older than this (default 0: keep everything) |
+| `--keep-days` | Delete slot files older than this, more than `--days` (default 0: keep everything) |
 
 A slot is written to a temporary file and renamed into place, so a file that
 exists is a complete walk; a slot with no sign-ins gets an empty file. A walk
 that fails after 3 attempts leaves the previous file alone and is listed under
-`failed`. Rows are de-duplicated by `id`. Directories are 0700 and files 0600:
+`failed`. Rows are de-duplicated by `id`. The slot length is recorded in
+`<dir>/<tenant>/SLOT_HOURS`; a run with another length is refused (file names
+carry only the slot start). Directories are 0700 and files 0600:
 the rows name people and their addresses. Stdout is one JSON summary per run
 (`written`, `skipped`, `rows`, `failed`, `pruned` per tenant); exit 1 when any
 slot failed, 2 on a configuration error. Needs the same sign-in log access as

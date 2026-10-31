@@ -83,21 +83,28 @@ def _archive_signins(argv: list[str]) -> int:
         return 2
     now = datetime.datetime.now(datetime.timezone.utc)
     summary = {}
+    if args.keep_days and args.keep_days <= args.days:
+        print(f"entraadm-mcp: --keep-days must be 0 or more than --days ({args.days})", file=sys.stderr)
+        return 2
     for tenant in chosen:
 
         def log(msg: str, name: str = tenant.name) -> None:
             print(f"archive-signins: {name}: {msg}", file=sys.stderr, flush=True)
 
-        summary[tenant.name] = archive_tenant(
-            GraphClient(tenant.auth),
-            args.dir / tenant.name,
-            now,
-            days=args.days,
-            refetch_hours=args.refetch_hours,
-            slot_hours=args.slot_hours,
-            keep_days=args.keep_days,
-            log=log,
-        )
+        try:
+            summary[tenant.name] = archive_tenant(
+                GraphClient(tenant.auth),
+                args.dir / tenant.name,
+                now,
+                days=args.days,
+                refetch_hours=args.refetch_hours,
+                slot_hours=args.slot_hours,
+                keep_days=args.keep_days,
+                log=log,
+            )
+        except ValueError as e:
+            print(f"entraadm-mcp: {e}", file=sys.stderr)
+            return 2
     print(json.dumps({"generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "tenants": summary}))
     return 1 if any(s["failed"] for s in summary.values()) else 0
 

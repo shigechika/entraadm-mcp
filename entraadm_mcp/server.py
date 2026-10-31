@@ -1452,11 +1452,17 @@ def _multi_country(seen: list) -> bool:
     ``seen`` is ``(time, country)`` pairs with parsed times; unparsable times were left out.
     """
     seen = sorted(seen)
+    window: collections.Counter = collections.Counter()
     start = 0
-    for end in range(len(seen)):
-        while seen[end][0] - seen[start][0] > _MULTI_COUNTRY_SPAN:
+    for when, country in seen:
+        window[country] += 1
+        while when - seen[start][0] > _MULTI_COUNTRY_SPAN:
+            old = seen[start][1]
+            window[old] -= 1
+            if not window[old]:
+                del window[old]
             start += 1
-        if len({c for _, c in seen[start : end + 1]}) >= _MULTI_COUNTRY_MIN:
+        if len(window) >= _MULTI_COUNTRY_MIN:
             return True
     return False
 

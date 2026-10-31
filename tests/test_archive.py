@@ -120,6 +120,18 @@ def test_keep_days_prunes_older_slots(tmp_path):
     assert not (d / "2026-07-01T00.jsonl.gz").exists() and (d / "2026-08-19T00.jsonl.gz").exists()
 
 
+def test_another_slot_length_is_refused_for_an_existing_archive(tmp_path):
+    _run(tmp_path, FakeClient(), days=1, slot_hours=3)
+    assert (tmp_path / "staff" / "SLOT_HOURS").read_text() == "3\n"
+    with pytest.raises(ValueError, match="3-hour slots"):
+        _run(tmp_path, FakeClient(), days=1, slot_hours=24)
+
+
+def test_keep_days_must_exceed_the_fetch_window(tmp_path):
+    with pytest.raises(ValueError, match="keep_days"):
+        _run(tmp_path, FakeClient(), days=30, keep_days=30)
+
+
 def test_a_slot_length_that_does_not_tile_a_day_is_refused(tmp_path):
     with pytest.raises(ValueError):
         _run(tmp_path, FakeClient(), slot_hours=5)

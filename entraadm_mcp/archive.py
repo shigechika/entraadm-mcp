@@ -15,6 +15,9 @@ objects as JSON lines, to ``<dir>/<tenant>/<YYYY-MM-DDTHH>.jsonl.gz``:
 - Rows are de-duplicated by ``id`` and sorted by ``createdDateTime``.
 - Directories are created 0700 and files 0600: the rows name people and
   their addresses.
+- The slot length is recorded in ``<dir>/<tenant>/SLOT_HOURS`` on the first
+  run; a later run with another length is refused, since file names carry
+  only the slot start.
 """
 
 from __future__ import annotations
@@ -107,7 +110,16 @@ def archive_tenant(
     if slot_hours not in SLOT_HOURS_CHOICES:
         raise ValueError(f"slot_hours must be one of {SLOT_HOURS_CHOICES}")
     days = max(1, min(days, MAX_DAYS))
+    if keep_days and keep_days <= days:
+        raise ValueError(f"keep_days ({keep_days}) must be 0 or more than days ({days})")
     out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = out_dir / "SLOT_HOURS"
+    if marker.exists():
+        recorded = marker.read_text(encoding="ascii").strip()
+        if recorded != str(slot_hours):
+            raise ValueError(f"{out_dir} holds {recorded}-hour slots; refusing to mix in {slot_hours}-hour slots")
+    else:
+        marker.write_text(f"{slot_hours}\n", encoding="ascii")
     step = datetime.timedelta(hours=slot_hours)
     fresh_after = now - datetime.timedelta(hours=refetch_hours)
     result = {"written": 0, "skipped": 0, "rows": 0, "failed": [], "pruned": 0}
@@ -134,7 +146,7 @@ def archive_tenant(
     if keep_days > 0:
         cutoff = _slot_name(now - datetime.timedelta(days=keep_days))
         for f in out_dir.glob("*.jsonl.gz"):
-            if f.name < cutoff:
+            if f.name < cutoff and f.name not in result["failed"]:
                 f.unlink()
                 result["pruned"] += 1
     return result
