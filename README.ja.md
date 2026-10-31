@@ -36,7 +36,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `signin_logs` | このユーザのサインインがなぜ失敗（または成功）したか、AADSTS コードの意味付き |
 | `signin_failure_stats` | テナント全体の失敗集計：エラーコード・ユーザ・アプリ・送信元IPの上位、およびパスワードスプレーの疑い |
 | `signin_success_stats` | テナント全体の成功を送信元IPで集計：複数アカウントが共有するIP、レガシー認証（SMTP/IMAP）での成功——突破を見つけるための視点 |
-| `compromise_suspects` | 乗っ取られた疑いのあるアカウント：多数のアカウントに試行した学外の IP が入れたもの（`spray_breaches`），本拠の国以外からの成功（`foreign_successes`。レガシー認証なら high），Entra ID P2 があれば Microsoft の危険ユーザー |
+| `compromise_suspects` | 乗っ取られた疑いのあるアカウント：多数のアカウントに試行した学外の IP が入れたもの（`spray_breaches`），本拠の国以外からの成功（`foreign_successes`。レガシー認証・Azure CLI や PowerShell・24 時間に 3 か国以上なら high），Entra ID P2 があれば Microsoft の危険ユーザー |
 | `signin_by_ip` | 1 つの送信元IPからの全サインイン：そこから誰が入り、誰が試され、いつか |
 | `directory_audits` | ディレクトリで誰が何を変更したか（ブロック／解除・属性編集）、いつか |
 | `get_user_auth_methods` | このアカウントで MFA が実際に登録されているか |
@@ -292,6 +292,7 @@ entraadm-mcp
 |---|---|
 | `--version` | バージョンを表示して終了 |
 | `--check` | 認証を解決し、Graph 到達性とサインインログ読み取りをプローブしてレポートを出力（ARM の情報行付き）。exit 0（設定エラー時は 1） |
+| `archive-signins --dir DIR` | Entra の 30 日を超えてサインインログを残す。終わった UTC の区間ごとに `DIR/<tenant>/<区間>.jsonl.gz` に書く（毎日動かす。[リファレンス](https://shigechika.github.io/entraadm-mcp/ja/reference/#archive-signins)） |
 
 ## 補足
 

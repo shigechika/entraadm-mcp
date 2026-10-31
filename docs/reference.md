@@ -165,8 +165,13 @@ spray source).
 invalid code disables the list and sets `home_countries.error`), per account
 with countries, the 10 most used IPs with counts, client apps, first/last and
 `home_success_in_window` (null when not seen in a capped scan); `high` when a
-legacy protocol was used or the account is also a high spray breach, else
-`medium`; high first, then by countries and IPs. A
+legacy protocol was used, the account is also a high spray breach, a success
+came through Azure CLI / Azure PowerShell / Azure AD PowerShell (`admin_tools`,
+matched by their well-known application ids: ordinary users have no reason to
+run them, and they take a password directly), or the successes span 3 or more
+countries within 24 hours (a rotating proxy pool, not a traveller), else
+`medium`; `high_reasons` lists which of `legacy_auth`, `spray_breach`,
+`admin_tool`, `multi_country_24h` applied; high first, then by countries and IPs. A
 success with no country is never foreign; unset home countries leave the
 list empty with `home_countries.configured: false`. `counts` are distinct
 accounts per severity (an account in both lists counts once). Lists cap at
@@ -407,3 +412,38 @@ scanned."
 entraadm-mcp --version   # print version
 entraadm-mcp --check     # resolve auth, probe Graph + sign-in log reachability (plus an ARM info line), exit 0 (or 1 on config error)
 ```
+
+### `archive-signins`
+
+Entra ID keeps the interactive sign-in log for 30 days. `archive-signins` keeps
+it longer: run it daily (a systemd timer or cron) and it writes each ended UTC
+slot to `<dir>/<tenant>/<YYYY-MM-DDTHH>.jsonl.gz`, raw Graph sign-in objects
+as JSON lines.
+
+```bash
+entraadm-mcp archive-signins --dir /var/lib/entra-signins --keep-days 400
+```
+
+| Option | Effect |
+|---|---|
+| `--dir` | Archive root (required); each tenant gets a subdirectory named after its `[tenant.<name>]` section (`default` without `ENTRAADM_CONFIG`) |
+| `--tenant` | Only this tenant (repeatable; default every tenant) |
+| `--days` | How far back to fill, 1-30 (default 30) |
+| `--refetch-hours` | Slots that ended this recently are fetched again every run, for sign-ins Graph delivers late (default 48) |
+| `--slot-hours` | Slot length, a divisor of 24 (default 3: whole slots also make up a local day at any whole-hour UTC offset) |
+| `--keep-days` | Delete slot files older than this, more than `--days` (default 0: keep everything) |
+
+A slot is written to a temporary file and renamed into place, so a file that
+exists is a complete walk; a slot with no sign-ins gets an empty file. A walk
+that fails after 3 attempts leaves the previous file alone and is listed under
+`failed`. Rows are de-duplicated by `id`. The slot length is recorded in
+`<dir>/<tenant>/SLOT_HOURS`; a run with another length is refused (file names
+carry only the slot start). Directories are 0700 and files 0600:
+the rows name people and their addresses. The oldest slot starts at or after
+`--days` before now, so no slot straddles the retention edge. A re-read that
+fails leaves `<slot>.stale` beside the earlier file, and that slot is re-read on
+every run until a read succeeds. An authentication or permission error stops
+that tenant at once (`error` in its summary). Stdout is one JSON summary per
+run (`written`, `skipped`, `rows`, `failed`, `pruned`, `error` per tenant);
+exit 1 when any slot failed, 2 on a configuration or argument error. Needs the same sign-in log access as
+the sign-in tools.

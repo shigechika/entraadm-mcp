@@ -1,4 +1,4 @@
-"""Entry point: ``entraadm-mcp`` (stdio server) / ``entraadm-mcp --check`` / ``--version``."""
+"""Entry point: ``entraadm-mcp`` (stdio server) / ``--check`` / ``--version`` / ``archive-signins``."""
 
 import asyncio
 import os
@@ -47,8 +47,83 @@ def _check() -> int:
     return rc
 
 
+def _archive_signins(argv: list[str]) -> int:
+    """``archive-signins``: write each tenant's ended sign-in slots under --dir (see entraadm_mcp.archive)."""
+    import argparse
+    import datetime
+    import json
+    from pathlib import Path
+
+    from entraadm_mcp.archive import MAX_DAYS, SLOT_HOURS_CHOICES, archive_tenant
+    from entraadm_mcp.client import GraphClient
+    from entraadm_mcp.config import ConfigError, load_tenants
+
+    ap = argparse.ArgumentParser(
+        prog="entraadm-mcp archive-signins",
+        description="Archive the interactive sign-in log in UTC slots, one gzip JSON-lines file per slot.",
+    )
+    ap.add_argument("--dir", required=True, type=Path, help="archive root; each tenant gets <dir>/<tenant name>/")
+    ap.add_argument("--tenant", action="append", help="tenant section name (repeatable; default: every tenant)")
+    ap.add_argument(
+        "--days", type=int, default=MAX_DAYS, help=f"how far back to fill (1-{MAX_DAYS}, default {MAX_DAYS})"
+    )
+    ap.add_argument("--refetch-hours", type=int, default=48, help="re-read slots that ended this recently (default 48)")
+    ap.add_argument("--slot-hours", type=int, default=3, choices=SLOT_HOURS_CHOICES, help="slot length (default 3)")
+    ap.add_argument("--keep-days", type=int, default=0, help="delete slots older than this many days (0: keep all)")
+    args = ap.parse_args(argv)
+    try:
+        tenants = load_tenants()
+    except ConfigError as e:
+        print(f"entraadm-mcp: {e}", file=sys.stderr)
+        return 2
+    chosen = [t for t in tenants.tenants if not args.tenant or t.name in args.tenant]
+    unknown = sorted(set(args.tenant or ()) - {t.name for t in tenants.tenants})
+    if unknown:
+        print(f"entraadm-mcp: unknown tenant(s): {', '.join(unknown)}", file=sys.stderr)
+        return 2
+    now = datetime.datetime.now(datetime.timezone.utc)
+    summary = {}
+    if not 1 <= args.days <= MAX_DAYS:
+        print(f"entraadm-mcp: --days must be 1-{MAX_DAYS}", file=sys.stderr)
+        return 2
+    if args.refetch_hours < 0:
+        print("entraadm-mcp: --refetch-hours must not be negative", file=sys.stderr)
+        return 2
+    if args.keep_days and args.keep_days <= args.days:
+        print(f"entraadm-mcp: --keep-days must be 0 or more than --days ({args.days})", file=sys.stderr)
+        return 2
+    rc = 0
+    for tenant in chosen:
+
+        def log(msg: str, name: str = tenant.name) -> None:
+            print(f"archive-signins: {name}: {msg}", file=sys.stderr, flush=True)
+
+        try:
+            summary[tenant.name] = archive_tenant(
+                GraphClient(tenant.auth),
+                args.dir / tenant.name,
+                now,
+                days=args.days,
+                refetch_hours=args.refetch_hours,
+                slot_hours=args.slot_hours,
+                keep_days=args.keep_days,
+                log=log,
+            )
+        except (ValueError, OSError) as e:
+            # One tenant's archive cannot be used; the others still run and the summary still prints.
+            print(f"entraadm-mcp: {tenant.name}: {e}", file=sys.stderr)
+            summary[tenant.name] = {"written": 0, "skipped": 0, "rows": 0, "failed": [], "pruned": 0, "error": str(e)}
+            rc = 2
+    print(json.dumps({"generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "tenants": summary}))
+    if rc:
+        return rc
+    return 1 if any(s["failed"] or s["error"] for s in summary.values()) else 0
+
+
 def main() -> None:
     argv = sys.argv[1:]
+    if argv[:1] == ["archive-signins"]:
+        sys.exit(_archive_signins(argv[1:]))
     if "--version" in argv:
         print(f"entraadm-mcp {__version__}")
         return

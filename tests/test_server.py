@@ -8,6 +8,7 @@ function callable.
 """
 
 import asyncio
+import datetime
 import time
 
 import pytest
@@ -3117,7 +3118,7 @@ def test_daily_brief_walk_selects_the_union_of_both_needs(inject):
     server.daily_brief()
     (walk,) = [c for c in client.calls if c[0] == "get_paged" and c[1] == "/auditLogs/signIns"]
     fields = set(walk[2]["$select"].split(","))
-    assert fields == set(server._STATS_SELECT.split(",")) | {"clientAppUsed", "location"}
+    assert fields == set(server._STATS_SELECT.split(",")) | {"appId", "clientAppUsed", "location"}
 
 
 def test_daily_brief_summary_shows_an_unconfigured_setup(inject, monkeypatch):
@@ -3423,3 +3424,66 @@ def test_daily_brief_probes_once_and_before_the_walk(inject):
     assert order.count("/identityProtection/riskyUsers") == 1  # an error is not cached, yet probed once
     assert order.index("/identityProtection/riskyUsers") < order.index("/auditLogs/signIns")
     assert out["summary"]["identity_protection"] == "error"
+
+
+_AZ_CLI = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+_AZ_PS = "1950a258-227b-4e31-a9cf-717495945fc2"
+
+
+def _ok_app(upn, ip, app_id, when="2026-08-21T02:00:00Z", country="US"):
+    row = _ok(upn, ip, when=when, country=country, client="Mobile Apps and Desktop clients")
+    row["appId"] = app_id
+    return row
+
+
+def test_a_foreign_admin_tool_success_is_high(inject, home_jp):
+    rows = [
+        _ok_app("cli@example.edu", "203.0.113.1", _AZ_CLI.upper()),
+        _ok_app("ps@example.edu", "203.0.113.2", _AZ_PS),
+        _ok_app("office@example.edu", "203.0.113.3", "00000000-0000-0000-0000-000000000001"),
+    ]
+    out, client = _suspects(inject, rows)
+    by = {r["user_principal_name"]: r for r in out["foreign_successes"]}
+    assert by["cli@example.edu"]["severity"] == "high" and by["cli@example.edu"]["high_reasons"] == ["admin_tool"]
+    assert by["cli@example.edu"]["admin_tools"] == ["Microsoft Azure CLI"]
+    assert by["ps@example.edu"]["admin_tools"] == ["Microsoft Azure PowerShell"]
+    assert by["office@example.edu"]["severity"] == "medium" and by["office@example.edu"]["high_reasons"] == []
+    assert out["counts"]["high"] == 2 and out["counts"]["medium"] == 1
+    (lookup,) = [c for c in client.calls if c[1] == "/auditLogs/signIns"]
+    assert "appId" in lookup[2]["$select"].split(",")
+
+
+def test_an_admin_tool_success_at_home_is_not_listed(inject, home_jp):
+    out, _ = _suspects(inject, [_ok_app("dev@example.edu", "203.0.113.1", _AZ_CLI, country="JP")])
+    assert out["foreign_successes"] == [] and out["counts"]["high"] == 0
+
+
+def test_three_countries_within_a_day_is_high(inject, home_jp):
+    rows = [
+        _ok("proxy@example.edu", "203.0.113.1", when="2026-08-21T00:00:00Z", country="FR"),
+        _ok("proxy@example.edu", "203.0.113.2", when="2026-08-21T10:00:00Z", country="BR"),
+        _ok("proxy@example.edu", "203.0.113.3", when="2026-08-21T23:59:00Z", country="TR"),
+    ]
+    out, _ = _suspects(inject, rows, hours=48)
+    (row,) = out["foreign_successes"]
+    assert row["severity"] == "high" and row["high_reasons"] == ["multi_country_24h"]
+
+
+def test_three_countries_spread_over_days_stay_medium(inject, home_jp):
+    rows = [
+        _ok("traveller@example.edu", "203.0.113.1", when="2026-08-19T00:00:00Z", country="FR"),
+        _ok("traveller@example.edu", "203.0.113.2", when="2026-08-20T01:00:00Z", country="DE"),
+        _ok("traveller@example.edu", "203.0.113.3", when="2026-08-21T02:00:00Z", country="IT"),
+        _ok("traveller@example.edu", "203.0.113.4", when="not-a-time", country="ES"),
+    ]
+    out, _ = _suspects(inject, rows, hours=96)
+    (row,) = out["foreign_successes"]
+    assert row["severity"] == "medium" and row["high_reasons"] == [] and len(row["countries"]) == 4
+
+
+def test_multi_country_window_is_exactly_24_hours():
+    t0 = datetime.datetime(2026, 8, 21, tzinfo=datetime.timezone.utc)
+    seen = [(t0, "FR"), (t0 + datetime.timedelta(hours=12), "DE")]
+    assert server._multi_country(seen + [(t0 + datetime.timedelta(hours=24), "IT")]) is True
+    assert server._multi_country(seen + [(t0 + datetime.timedelta(hours=24, seconds=1), "IT")]) is False
+    assert server._multi_country([(t0, "FR"), (t0, "FR"), (t0, "FR")]) is False

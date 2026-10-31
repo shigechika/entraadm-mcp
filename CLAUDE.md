@@ -67,6 +67,15 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   stack trace. 429 retries once (respecting `Retry-After`); 5xx retries twice
   with exponential backoff. `credential`/`http_client` constructor params
   are `# injectable for tests` (respx-mocked httpx, a stub credential).
+- `entraadm_mcp/archive.py` — `archive-signins` (CLI only, not a tool): walks
+  `/auditLogs/signIns` per ended UTC slot (`slot_starts`), no deadline, a
+  backstop page budget; temp file + `os.replace`, dedupe by `id`, 0700/0600,
+  slots ending within `refetch_hours` re-read every run. A failed slot keeps
+  its previous file, gets `<slot>.stale` (re-read every run until it
+  succeeds) and is listed in `failed` (exit 1). The first slot is aligned UP
+  from the retention edge. ApiAuthError / ApiPermissionError are not retried
+  and stop the tenant (`error`); one tenant's ValueError/OSError does not stop
+  the others and the summary always prints.
 - `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 15 tools (16 with the opt-in revoke).
   `AADSTS_CODES` is a hand-maintained dict (not exhaustive) annotating
   sign-in failure codes; missing codes return `meaning: null`, never hidden.
@@ -162,7 +171,10 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   needs `ENTRAADM_HOME_COUNTRIES` (assigned ISO codes from `iso3166.py`;
   unset or one invalid code: the list stays empty,
   `home_countries.configured: false`) and a country on the row (no country
-  is never foreign). `home_success_in_window` is null, not false, when a
+  is never foreign). A foreign success is high for any of `high_reasons`:
+  legacy protocol, a high spray breach, an admin tool (`_ADMIN_TOOL_APP_IDS`,
+  matched on `appId`, never the display name), or `_multi_country` (3+
+  countries within 24 hours of parsed times). `home_success_in_window` is null, not false, when a
   capped scan did not see it. First/last compare parsed times. `counts` are distinct
   accounts, an account in both lists counted once as high. The aggregation
   lives in `_compromise()` over rows from `_fetch_signins()`, so
