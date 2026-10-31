@@ -103,6 +103,7 @@ def test_a_transient_error_is_retried(tmp_path):
     assert out["failed"] == [] and out["written"] == 1 and waits == [30]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
 def test_files_and_directories_are_private(tmp_path):
     d = tmp_path / "staff"
     d.mkdir(mode=0o755)
