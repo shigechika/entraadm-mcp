@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/shigechika/entraadm-mcp/compare/v1.8.1...v1.9.0) (2026-10-31)
+
+
+### Features
+
+* archive-signins CLI and stronger foreign-success severity ([#36](https://github.com/shigechika/entraadm-mcp/issues/36)) ([4736671](https://github.com/shigechika/entraadm-mcp/commit/473667139e11755e7164d647e5ab688bb7e0a412))
+
 ## [1.8.1](https://github.com/shigechika/entraadm-mcp/compare/v1.8.0...v1.8.1) (2026-10-26)
 
 
