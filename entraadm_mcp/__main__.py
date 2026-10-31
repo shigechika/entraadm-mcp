@@ -83,9 +83,16 @@ def _archive_signins(argv: list[str]) -> int:
         return 2
     now = datetime.datetime.now(datetime.timezone.utc)
     summary = {}
+    if not 1 <= args.days <= MAX_DAYS:
+        print(f"entraadm-mcp: --days must be 1-{MAX_DAYS}", file=sys.stderr)
+        return 2
+    if args.refetch_hours < 0:
+        print("entraadm-mcp: --refetch-hours must not be negative", file=sys.stderr)
+        return 2
     if args.keep_days and args.keep_days <= args.days:
         print(f"entraadm-mcp: --keep-days must be 0 or more than --days ({args.days})", file=sys.stderr)
         return 2
+    rc = 0
     for tenant in chosen:
 
         def log(msg: str, name: str = tenant.name) -> None:
@@ -102,11 +109,15 @@ def _archive_signins(argv: list[str]) -> int:
                 keep_days=args.keep_days,
                 log=log,
             )
-        except ValueError as e:
-            print(f"entraadm-mcp: {e}", file=sys.stderr)
-            return 2
+        except (ValueError, OSError) as e:
+            # One tenant's archive cannot be used; the others still run and the summary still prints.
+            print(f"entraadm-mcp: {tenant.name}: {e}", file=sys.stderr)
+            summary[tenant.name] = {"written": 0, "skipped": 0, "rows": 0, "failed": [], "pruned": 0, "error": str(e)}
+            rc = 2
     print(json.dumps({"generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "tenants": summary}))
-    return 1 if any(s["failed"] for s in summary.values()) else 0
+    if rc:
+        return rc
+    return 1 if any(s["failed"] or s["error"] for s in summary.values()) else 0
 
 
 def main() -> None:
