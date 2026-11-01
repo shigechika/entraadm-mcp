@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/shigechika/entraadm-mcp/compare/v1.10.0...v1.10.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* send the audit search service filter as serviceFilters ([#42](https://github.com/shigechika/entraadm-mcp/issues/42)) ([3b6fcf0](https://github.com/shigechika/entraadm-mcp/commit/3b6fcf03aae44ff1f7083fa946f712a9985116e2))
+
 ## [1.10.0](https://github.com/shigechika/entraadm-mcp/compare/v1.9.0...v1.10.0) (2026-11-01)
 
 
