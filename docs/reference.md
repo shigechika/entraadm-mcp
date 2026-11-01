@@ -362,7 +362,8 @@ Microsoft 365 for some minutes, so the records come from
 OneDrive/SharePoint file events, Exchange mailbox actions and cmdlets, Entra
 directory changes. The window is `hours` back from `end` (default now),
 clamped to [1, 4320] (180 days, Audit Standard retention), or `start` / `end`
-as ISO 8601 with an offset; a window may span at most 180 days. Filters
+as ISO 8601 with an offset (an `end` in the future counts as now); a window may span at most 180 days, and a
+window starting more than 180 days ago carries a `note` (older records exist only under Audit Premium retention). Filters
 (combined with AND; at least one is required, so a call never reads the whole
 tenant's log): `user` (a UPN), `record_types` (auditLogRecordType values such
 as `sharePointFileOperation`, `exchangeItem`), `operations` (`FileDownloaded`,
@@ -386,8 +387,8 @@ The tenant is chosen like `directory_audits`' (`tenant`, else the one claiming
 
 `GET /security/auditLog/queries/{id}`: `found`, `query_id`, `status`, `done`
 and the search's own filters (`query`). While `notStarted` / `running` only
-the status comes back (`done: false`); `failed` / `cancelled` are `done: true`
-with an `error`. Once `succeeded`, the records (`/records`) are paged within
+the status comes back (`done: false`); `failed` / `cancelled`, and any status
+this server does not know, are `done: true` with an `error`. Once `succeeded`, the records (`/records`) are paged within
 `max_pages` and the call deadline:
 
 - `summary`: `total_records`, `first_seen` / `last_seen`, `distinct` counts,
@@ -396,8 +397,7 @@ with an `error`. Once `succeeded`, the records (`/records`) are paged within
   appends to the address is dropped);
 - `records`: the newest `top` (default 50, at most 500) with `id`, `time`,
   `operation`, `service`, `record_type`, `user`, `user_id`, `client_ip`,
-  `object_id` and `details` (from `auditData`: `ClientIP`,
-  `ClientIPAddress`, `UserAgent`, `ClientInfoString`, `ResultStatus`,
+  `object_id` and `details` (from `auditData`: `UserAgent`, `ClientInfoString`, `ResultStatus`,
   `LogonType`, `ApplicationId`, `SiteUrl`, `SourceFileName`,
   `SourceRelativeUrl`, `ObjectId` when the record has none, and
   `ParameterNames`: the names of cmdlet parameters, never their values). Every

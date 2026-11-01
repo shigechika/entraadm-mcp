@@ -147,6 +147,7 @@ def test_start_explicit_window_is_sent_in_utc(graph):
         {"object_ids": ["x" * 1025]},
         {},
         {"keyword": "   "},
+        {"user": " someone@example.edu"},
     ],
 )
 @respx.mock
@@ -295,10 +296,11 @@ def test_result_failed_or_cancelled_is_done_with_an_error(graph, status):
 
 
 @respx.mock
-def test_result_unknown_status_is_passed_through(graph):
+def test_result_unknown_status_is_done_so_callers_stop_polling(graph):
     respx.get(QUERY_URL).mock(return_value=httpx.Response(200, json={"id": QUERY_ID, "status": "unknownFutureValue"}))
     out = server.audit_log_search_result(QUERY_ID)
-    assert out["status"] == "unknownFutureValue" and out["done"] is False and "records" not in out
+    assert out["status"] == "unknownFutureValue" and out["done"] is True and out["error"]
+    assert "records" not in out
 
 
 @respx.mock
@@ -419,3 +421,49 @@ def test_result_429_is_rate_limited(graph):
     respx.get(QUERY_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "0"}))
     out = server.audit_log_search_result(QUERY_ID)
     assert out["rate_limited"] is True
+
+
+@respx.mock
+def test_start_future_end_keeps_the_full_lookback(graph):
+    route = respx.post(QUERIES_URL).mock(return_value=_created())
+    future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=10)).isoformat()
+    out = server.audit_log_search_start(user="someone@example.edu", hours=24, end=future)
+    assert out["created"] is True
+    sent = _sent(route)
+    start = datetime.datetime.fromisoformat(sent["filterStartDateTime"].replace("Z", "+00:00"))
+    end = datetime.datetime.fromisoformat(sent["filterEndDateTime"].replace("Z", "+00:00"))
+    assert end - start == datetime.timedelta(hours=24)
+
+
+@respx.mock
+def test_start_window_past_standard_retention_carries_a_note(graph):
+    respx.post(QUERIES_URL).mock(return_value=_created())
+    start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=200)).isoformat()
+    end = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=190)).isoformat()
+    out = server.audit_log_search_start(user="someone@example.edu", start=start, end=end)
+    assert out["created"] is True and "Audit (Premium)" in out["note"]
+
+
+@respx.mock
+def test_result_429_while_reading_is_not_called_a_daily_limit(graph):
+    respx.get(QUERY_URL).mock(return_value=httpx.Response(429, headers={"Retry-After": "0"}))
+    out = server.audit_log_search_result(QUERY_ID)
+    assert out["rate_limited"] is True and "per day" not in out["error"]
+
+
+@respx.mock
+def test_result_puts_undated_records_last(graph):
+    respx.get(QUERY_URL).mock(return_value=httpx.Response(200, json={"id": QUERY_ID, "status": "succeeded"}))
+    respx.get(RECORDS_URL).mock(
+        return_value=httpx.Response(200, json={"value": [_record(1, createdDateTime=None), _record(2), _record(3)]})
+    )
+    out = server.audit_log_search_result(QUERY_ID, top=2)
+    assert [r["id"] for r in out["records"]] == ["rec-3", "rec-2"]
+
+
+@respx.mock
+def test_result_details_do_not_repeat_the_client_ip(graph):
+    respx.get(QUERY_URL).mock(return_value=httpx.Response(200, json={"id": QUERY_ID, "status": "succeeded"}))
+    respx.get(RECORDS_URL).mock(return_value=httpx.Response(200, json={"value": [_record(1)]}))
+    rec = server.audit_log_search_result(QUERY_ID)["records"][0]
+    assert rec["client_ip"] == "203.0.113.7" and "ClientIP" not in rec["details"]

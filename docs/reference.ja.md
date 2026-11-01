@@ -292,8 +292,8 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
 検索は Microsoft 365 側で数分かかるので，レコードは `audit_log_search_result` で受け取る。サインインの
 後にそのセッションが何をしたか（OneDrive/SharePoint のファイル操作，Exchange のメールボックス操作と
 コマンドレット，Entra のディレクトリ変更）に答える。窓は `end`（省略で現在）から `hours` さかのぼる
-（[1, 4320]＝180 日，Audit Standard の保持期間に丸める）か，オフセット付き ISO 8601 の `start`／`end`。
-窓の幅は最大 180 日。フィルタ（AND で組み合わせる。全テナントのログを読まないよう 1 つ以上必須）:
+（[1, 4320]＝180 日，Audit Standard の保持期間に丸める）か，オフセット付き ISO 8601 の `start`／`end`（未来の `end` は現在として扱う）。
+窓の幅は最大 180 日。180 日より前から始まる窓には `note` を付ける（それより古い記録は Audit Premium の保持でだけ残る）。フィルタ（AND で組み合わせる。全テナントのログを読まないよう 1 つ以上必須）:
 `user`（UPN），`record_types`（`sharePointFileOperation`・`exchangeItem` などの auditLogRecordType），
 `operations`（`FileDownloaded`・`New-InboxRule`・`MailItemsAccessed` など），`ip_addresses`，`keyword`，
 `service`（`Exchange`・`SharePoint`・`OneDrive`・`AzureActiveDirectory` など），`object_ids`。リストは
@@ -310,16 +310,15 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
 ### `audit_log_search_result(query_id, top=50, max_pages=None, tenant=None)`
 
 `GET /security/auditLog/queries/{id}`：`found`・`query_id`・`status`・`done` と，検索自身のフィルタ
-（`query`）。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` は
-`done: true` で `error` 付き。`succeeded` になったらレコード（`/records`）を `max_pages` と呼び出しの
+（`query`）。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` と，このサーバが
+知らない状態は `done: true` で `error` 付き。`succeeded` になったらレコード（`/records`）を `max_pages` と呼び出しの
 期限の範囲でページングし，次を返す:
 
 - `summary`：`total_records`，`first_seen`／`last_seen`，`distinct` の件数，`by_operation`・`by_service`・
   `by_record_type`・`by_user`・`by_client_ip`（件数・`first_seen`・`last_seen`。Exchange がアドレスに
   付けるポート番号は落とす）の上位 25
 - `records`：新しい方から `top` 件（既定 50，最大 500）。`id`・`time`・`operation`・`service`・
-  `record_type`・`user`・`user_id`・`client_ip`・`object_id` と `details`（`auditData` から `ClientIP`・
-  `ClientIPAddress`・`UserAgent`・`ClientInfoString`・`ResultStatus`・`LogonType`・`ApplicationId`・
+  `record_type`・`user`・`user_id`・`client_ip`・`object_id` と `details`（`auditData` から `UserAgent`・`ClientInfoString`・`ResultStatus`・`LogonType`・`ApplicationId`・
   `SiteUrl`・`SourceFileName`・`SourceRelativeUrl`，レコードに無いときだけ `ObjectId`，コマンドレットの
   パラメータ名だけの `ParameterNames`。値は返さない）。文字列はすべて 200 文字で切る。`auditData`
   全体は返さない

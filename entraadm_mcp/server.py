@@ -966,9 +966,7 @@ def signin_by_ip(
     # ipAddress string literally and an expanded IPv6 form from the log would
     # not match its compressed form
     ip = ip.strip()
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
+    if not _is_ip(ip):
         return {"error": f"ip must be an IPv4 or IPv6 address (got {ip!r})"}
     if result not in ("failure", "success", "all"):
         return {"error": f"result must be 'failure', 'success', or 'all' (got {result!r})"}
@@ -2856,24 +2854,36 @@ def _parse_window_time(value: str, label: str) -> datetime.datetime:
     return parsed
 
 
-def _activity_window(
-    start: str | None, end: str | None, hours: int, now: datetime.datetime
+def _window(
+    start: str | None,
+    end: str | None,
+    hours: int,
+    now: datetime.datetime,
+    max_hours: int,
+    retention_days: int | None,
+    retention_label: str,
 ) -> tuple[datetime.datetime, datetime.datetime]:
-    end_dt = _parse_window_time(end, "end") if end else now
+    """The [start, end) window of a log search: ``end`` defaults to now and is clamped to now
+    before a missing ``start`` is derived from ``hours`` (ValueError on a bad window)."""
+    end_dt = min(_parse_window_time(end, "end"), now) if end else now
     start_dt = (
         _parse_window_time(start, "start")
         if start
-        else end_dt - datetime.timedelta(hours=max(1, min(_ACTIVITY_MAX_HOURS, hours)))
+        else end_dt - datetime.timedelta(hours=max(1, min(max_hours, hours)))
     )
-    if end_dt > now:
-        end_dt = now
     if start_dt >= end_dt:
         raise ValueError("start must be before end (and before now)")
-    if end_dt - start_dt > datetime.timedelta(hours=_ACTIVITY_MAX_HOURS):
-        raise ValueError(f"the window may span at most {_ACTIVITY_MAX_HOURS} hours")
-    if start_dt < now - datetime.timedelta(days=_ACTIVITY_RETENTION_DAYS):
-        raise ValueError(f"the activity log keeps {_ACTIVITY_RETENTION_DAYS} days; start is older")
+    if end_dt - start_dt > datetime.timedelta(hours=max_hours):
+        raise ValueError(f"the window may span at most {max_hours} hours")
+    if retention_days is not None and start_dt < now - datetime.timedelta(days=retention_days):
+        raise ValueError(f"the {retention_label} keeps {retention_days} days; start is older")
     return start_dt, end_dt
+
+
+def _activity_window(
+    start: str | None, end: str | None, hours: int, now: datetime.datetime
+) -> tuple[datetime.datetime, datetime.datetime]:
+    return _window(start, end, hours, now, _ACTIVITY_MAX_HOURS, _ACTIVITY_RETENTION_DAYS, "activity log")
 
 
 def _utc_text(dt: datetime.datetime) -> str:
@@ -2885,9 +2895,14 @@ def _value(field: Any) -> str | None:
     return _str(_dict(field).get("value"))
 
 
-def _short(value: Any) -> str | None:
+def _cut(value: Any, limit: int) -> str | None:
+    """``value`` as text, cut to ``limit`` characters with an ellipsis."""
     text = _str(value)
-    return text if text is None or len(text) <= _ACTIVITY_DETAIL_CHARS else text[:_ACTIVITY_DETAIL_CHARS] + "…"
+    return text if text is None or len(text) <= limit else text[:limit] + "…"
+
+
+def _short(value: Any) -> str | None:
+    return _cut(value, _ACTIVITY_DETAIL_CHARS)
 
 
 def _operation_row(event: dict) -> dict:
@@ -3299,6 +3314,7 @@ _AUDIT_QUERY_PERMISSION = (
 _AUDIT_QUERIES_PATH = "/security/auditLog/queries"
 #: Microsoft Purview Audit (Standard) keeps records for 180 days; a window may not span more.
 _AUDIT_MAX_HOURS = 24 * 180
+_AUDIT_STANDARD_RETENTION_DAYS = 180
 _AUDIT_DEFAULT_HOURS = 24
 #: At most this many values per list filter (users, IPs, operations, ...).
 _AUDIT_FILTER_LIMIT = 20
@@ -3316,11 +3332,9 @@ _AUDIT_SERVICE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}$")
 _AUDIT_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,127}$")
 _AUDIT_DONE_STATUSES = ("succeeded", "failed", "cancelled")
 _AUDIT_PENDING_STATUSES = ("notStarted", "running")
-#: auditData keys returned per record. Scalars only, each string cut to _AUDIT_TEXT_CHARS;
-#: ``Parameters`` is reduced to its names (values can hold mailbox rules, addresses, paths).
+#: auditData keys returned per record (the client IP is ``client_ip``). Scalars only, each string cut to
+#: _AUDIT_TEXT_CHARS; ``Parameters`` is reduced to its names (values can hold mailbox rules, addresses, paths).
 _AUDIT_DATA_KEYS = (
-    "ClientIP",
-    "ClientIPAddress",
     "UserAgent",
     "ClientInfoString",
     "ResultStatus",
@@ -3334,8 +3348,7 @@ _AUDIT_DATA_KEYS = (
 
 
 def _audit_text(value: Any, limit: int = _AUDIT_TEXT_CHARS) -> str | None:
-    text = _str(value)
-    return text if text is None or len(text) <= limit else text[:limit] + "…"
+    return _cut(value, limit)
 
 
 def _has_control_chars(value: str) -> bool:
@@ -3345,19 +3358,8 @@ def _has_control_chars(value: str) -> bool:
 def _audit_window(
     start: str | None, end: str | None, hours: int, now: datetime.datetime
 ) -> tuple[datetime.datetime, datetime.datetime]:
-    end_dt = _parse_window_time(end, "end") if end else now
-    start_dt = (
-        _parse_window_time(start, "start")
-        if start
-        else end_dt - datetime.timedelta(hours=max(1, min(_AUDIT_MAX_HOURS, hours)))
-    )
-    if end_dt > now:
-        end_dt = now
-    if start_dt >= end_dt:
-        raise ValueError("start must be before end (and before now)")
-    if end_dt - start_dt > datetime.timedelta(hours=_AUDIT_MAX_HOURS):
-        raise ValueError(f"the window may span at most {_AUDIT_MAX_HOURS} hours (180 days)")
-    return start_dt, end_dt
+    # no retention check: Audit (Premium) keeps records past 180 days; start reports the case instead
+    return _window(start, end, hours, now, _AUDIT_MAX_HOURS, None, "audit log")
 
 
 def _audit_list(name: str, values: Any, check) -> list[str]:
@@ -3395,7 +3397,8 @@ def _audit_filters(
     """The validated filters, keyed like the tool arguments; empty ones left out (ValueError on bad input)."""
     filters: dict[str, Any] = {}
     if user is not None:
-        user = user.strip()
+        if user != user.strip():
+            raise ValueError("user must not have leading or trailing spaces")
         if not _is_upn(user):
             raise ValueError(f"user must be a user principal name (got {user[:80]!r})")
         filters["user"] = user
@@ -3436,7 +3439,7 @@ _AUDIT_BODY_FIELDS = {
 }
 
 
-def _audit_error(e: Exception) -> dict:
+def _audit_error(e: Exception, submitting: bool) -> dict:
     """An audit search error in the shared shape: missing_permission on a 403, rate_limited on a 429."""
     out: dict = {"error": str(e)}
     if isinstance(e, ApiPermissionError):
@@ -3445,6 +3448,8 @@ def _audit_error(e: Exception) -> dict:
         out["error"] = (
             "Graph refused the audit search with 429: the tenant's audit search limits "
             "(searches submitted per day, or searches running at once) are reached; try again later"
+            if submitting
+            else "Graph throttled reading the audit search (429); the search itself is unaffected, call again later"
         )
         out["rate_limited"] = True
         out["retry_after_seconds"] = e.retry_after
@@ -3505,7 +3510,7 @@ def _audit_details(data: dict, has_object_id: bool) -> dict:
         if key == "ObjectId" and has_object_id:
             continue
         value = data.get(key)
-        if isinstance(value, bool) or isinstance(value, int):
+        if isinstance(value, int):
             details[key] = value
         elif isinstance(value, str) and value:
             details[key] = _audit_text(value)
@@ -3677,7 +3682,7 @@ def audit_log_search_start(
     except ConfigError as e:
         return {**base, "error": str(e)}
     except ApiError as e:
-        out = {**base, **_audit_error(e)}
+        out = {**base, **_audit_error(e, submitting=True)}
         if e.may_have_applied:
             out["created"] = None
             out["error"] += "; the search may have been created anyway (not retried)"
@@ -3685,13 +3690,19 @@ def audit_log_search_start(
     query_id = _str(body.get("id"))
     if query_id is None or not _GUID_RE.match(query_id):
         return {**base, "created": None, "error": "Graph's answer carried no usable query id"}
-    return {
+    out = {
         **base,
         "created": True,
         "query_id": query_id,
         "status": _str(body.get("status")),
         "next": "call audit_log_search_result with this query_id (and the same tenant) until done is true",
     }
+    if window_start < now - datetime.timedelta(days=_AUDIT_STANDARD_RETENTION_DAYS):
+        out["note"] = (
+            f"the window starts more than {_AUDIT_STANDARD_RETENTION_DAYS} days ago; Audit (Standard) keeps "
+            f"{_AUDIT_STANDARD_RETENTION_DAYS} days, so older records exist only under Audit (Premium) retention"
+        )
+    return out
 
 
 @mcp.tool()
@@ -3707,8 +3718,8 @@ def audit_log_search_result(
 
     Reads Graph ``GET /security/auditLog/queries/{id}``. While ``status`` is
     ``notStarted`` or ``running`` the answer is the status only (``done:
-    false``); call again in a minute or two. ``failed`` and ``cancelled`` are
-    ``done: true`` with an ``error``. Once ``succeeded``, the records are paged
+    false``); call again in a minute or two. ``failed``, ``cancelled`` and any
+    status this server does not know are ``done: true`` with an ``error``. Once ``succeeded``, the records are paged
     (``/records``) and come back as:
 
     - ``summary``: ``total_records``, ``first_seen``/``last_seen``, counts by
@@ -3753,14 +3764,14 @@ def audit_log_search_result(
                 "query_id": query_id,
                 "note": "no such audit search in this tenant (a search exists only in the tenant that created it)",
             }
-        return {"query_id": query_id, **_audit_error(e)}
+        return {"query_id": query_id, **_audit_error(e, submitting=False)}
 
     status = _str(query.get("status"))
     out: dict[str, Any] = {
         "found": True,
         "query_id": query_id,
         "status": status,
-        "done": status in _AUDIT_DONE_STATUSES,
+        "done": status not in _AUDIT_PENDING_STATUSES,
         "query": _audit_query_entry(query),
     }
     if status in _AUDIT_PENDING_STATUSES:
@@ -3768,14 +3779,14 @@ def audit_log_search_result(
     if status != "succeeded":
         if status in _AUDIT_DONE_STATUSES:
             return {**out, "error": f"the audit search ended with status {status}; start a new one"}
-        return {**out, "note": f"unrecognised status {status!r}; nothing was read"}
+        return {**out, "error": f"unrecognised status {status!r}; nothing was read, start a new search"}
 
     try:
         raw, capped = client.get_paged(f"{_AUDIT_QUERIES_PATH}/{query_id}/records", max_pages=pages, deadline=deadline)
     except ApiError as e:
-        return {**out, **_audit_error(e)}
+        return {**out, **_audit_error(e, submitting=False)}
     records = [_audit_record(r) for r in raw if isinstance(r, dict)]
-    records.sort(key=lambda r: _ts(r["time"] or ""), reverse=True)
+    records.sort(key=lambda r: (r["time"] is not None, _ts(r["time"] or "")), reverse=True)
     return {
         **out,
         "capped": capped,

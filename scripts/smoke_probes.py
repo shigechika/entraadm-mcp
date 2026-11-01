@@ -230,8 +230,9 @@ PROBES: dict[str, Probe] = {
     "audit_log_search_result": Probe(
         args={"top": 5, "max_pages": MAX_PAGES},
         args_factory=_missing_audit_query_arg,
-        require_keys=("found", "query_id"),
-        must_match=(r'"found":\s*false',),
+        require_keys=("query_id",),
+        # found:false, or missing_permission until AuditLogsQuery is granted
+        must_match=(r'"found":\s*false|"missing_permission"',),
         allow_empty=True,
     ),
     "m365_service_health": Probe(
