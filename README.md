@@ -23,7 +23,7 @@ and is not a fit for an unattended triage bot:
   server exposes one tool that lets the model construct arbitrary
   `GET`/schema-discovery calls against Microsoft Graph. That is flexible for
   a human, and awkward to put behind an allow-list for an automated triage
-  profile. entraadm-mcp exposes fifteen fixed, read-only tools instead (plus one
+  profile. entraadm-mcp exposes seventeen fixed, read-only tools instead (plus one
   opt-in write, below).
 - **No AADSTS translation.** Sign-in failures come back as raw error codes;
   triage still needs a lookup table. entraadm-mcp annotates every sign-in
@@ -52,9 +52,13 @@ and is not a fit for an unattended triage bot:
 | `vm_backup_policies` | What schedule and retention do the Azure VM backup policies have? (ARM) |
 | `vm_activity` | Did someone restart this Azure VM, or did Azure (host failure, maintenance)? Activity log and Resource Health for a time window (ARM) |
 | `m365_service_health` | Is a Microsoft 365 service degraded, and which incidents and advisories are open? |
+| `audit_log_search_start` | What did this account (or this IP) do in OneDrive/SharePoint, Exchange and Entra? Submits a Microsoft Purview audit log search, which runs for some minutes in Microsoft 365 |
+| `audit_log_search_result` | That search's status, then its records: counts by operation, service, record type, user and client IP (with first/last seen) and a trimmed record list |
 | `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats`, `directory_audits` and `compromise_suspects` (counts and top 5) |
 
-Every tool above is read-only. One state-changing tool exists and is off by
+Every tool above is read-only. `audit_log_search_start` creates a saved audit
+search object (the one `audit_log_search_result` then reads) and changes no
+directory, mailbox or file data. One state-changing tool exists and is off by
 default:
 
 | Tool | What it does |
@@ -103,6 +107,7 @@ different auth mode than intended.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `compromise_suspects`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | App-only only; not available under delegated (`az login`) auth in a typical tenant role assignment |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` | Under delegated auth the signed-in user also needs an Entra role that may read service health (for example Service Support Administrator or Global Reader) |
+| `audit_log_search_start`, `audit_log_search_result` | `AuditLogsQuery.Read.All`, or the service-scoped `AuditLogsQuery-OneDrive.Read.All` / `AuditLogsQuery-SharePoint.Read.All` / `AuditLogsQuery-Exchange.Read.All` / `AuditLogsQuery-Entra.Read.All` (application permissions) | Optional. With only a service-scoped permission, pass the matching `service`. Each search counts against the tenant's audit search limits (searches per day, searches running at once); a 429 comes back as `rate_limited: true` and is not retried |
 | `compromise_suspects`' `microsoft_risky_users`, the `identity_protection` probe (health_check, daily_brief) | `IdentityRiskyUser.Read.All` | Optional. Identity Protection needs **Entra ID P2**: without it Graph answers 403 "not licensed" and the probe reports `not_licensed`; nothing else changes |
 | `revoke_sign_in_sessions` (opt-in) | `User.RevokeSessions.All` (app-only) or the **User Administrator** / **Helpdesk Administrator** directory role (delegated; **Privileged Authentication Administrator** for an administrator account) | Only when `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`. A write permission: grant it only to a deployment that needs the tool. The account lookup before it needs `User.Read.All`. Without the permission the tool answers `missing_permission` for the auth mode in use and nothing changes |
 
@@ -259,6 +264,11 @@ Routing:
   the wrong log and find nothing); a `user` whose domain no tenant claims (an
   external or partner admin, a guest) is searched in the given or default
   tenant, and the result says `user_domain_claimed: false`.
+- `audit_log_search_start` picks its tenant like `directory_audits` (`tenant`,
+  else the tenant claiming `user`'s domain, else the default).
+  `audit_log_search_result` takes `tenant` and must get the one the start call
+  used: a search exists only in the tenant that created it (elsewhere it is
+  `found: false`).
 - `tenant` is a section name, one of its domains, or its tenant id. Without a
   tenant file it may be `default` or the env tenant id; anything else is
   refused (`tenant_configured: false`).

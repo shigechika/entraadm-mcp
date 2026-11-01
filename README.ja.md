@@ -18,7 +18,7 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 - **固定ツールセットではなく汎用 Graph クエリツール。** 公式サーバは、モデルが任意の
   `GET`／スキーマ探索呼び出しを Microsoft Graph へ構成できる1本のツールを公開する。
   人間には柔軟だが、自動 triage プロファイル向けの許可リストには馴染みにくい。
-  entraadm-mcp は固定・読み取り専用の15ツールを公開する（ほかにオプトインの書き込みが 1 本。下記）
+  entraadm-mcp は固定・読み取り専用の17ツールを公開する（ほかにオプトインの書き込みが 1 本。下記）
 - **AADSTS の意味翻訳がない。** サインイン失敗は生のエラーコードのまま返ってきて、
   triage には結局ルックアップが必要になる。entraadm-mcp は全てのサインイン失敗に
   コードの意味を注釈する
@@ -45,9 +45,13 @@ Microsoft は Entra ID データ向けに [公式 MCP Server for Enterprise](htt
 | `vm_backup_policies` | Azure VM のバックアップポリシーのスケジュールと保持期間（ARM） |
 | `vm_activity` | この Azure VM を再起動したのは人か Azure（ホスト障害・メンテナンス）か。指定した時間帯のアクティビティログとリソース正常性（ARM） |
 | `m365_service_health` | Microsoft 365 のサービスが劣化していないか、どのインシデント・アドバイザリが開いているか |
+| `audit_log_search_start` | このアカウント（またはこの IP）が OneDrive/SharePoint・Exchange・Entra で何をしたか。Microsoft Purview の監査ログ検索を投入する（Microsoft 365 側で数分かかる） |
+| `audit_log_search_result` | その検索の状態と、終わったらレコード：操作・サービス・レコード種別・ユーザ・クライアント IP（最初と最後の時刻つき）ごとの件数と、切り詰めたレコード一覧 |
 | `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits`・`compromise_suspects`（件数と上位 5 件）を1回でまとめたサマリ |
 
-上のツールはすべて読み取り専用。状態を変えるツールが 1 本だけあり、既定では無効:
+上のツールはすべて読み取り専用。`audit_log_search_start` は監査検索のオブジェクト（`audit_log_search_result` が
+読むもの）を作るだけで、ディレクトリ・メールボックス・ファイルのデータは変えない。
+状態を変えるツールが 1 本だけあり、既定では無効:
 
 | ツール | 何をするか |
 |---|---|
@@ -88,6 +92,7 @@ app-only 用3変数のうち1つか2つだけ設定するのは設定ミスと�
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`compromise_suspects`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） | |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` | app-only 専用。典型的なロール割り当てでは delegated（`az login`）認証では利用不可 |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All` | delegated 認証ではサインインしたユーザにサービス正常性を読める Entra ロール（Service Support Administrator や Global Reader 等）も必要 |
+| `audit_log_search_start`、`audit_log_search_result` | `AuditLogsQuery.Read.All`, or the service-scoped `AuditLogsQuery-OneDrive.Read.All` / `AuditLogsQuery-SharePoint.Read.All` / `AuditLogsQuery-Exchange.Read.All` / `AuditLogsQuery-Entra.Read.All`（アプリケーション権限） | 任意。サービス別の権限だけなら、それに合う `service` を渡す。検索はテナントの監査検索の上限（1 日の投入数・同時実行数）を消費する。429 は `rate_limited: true` で返し、再試行しない |
 | `compromise_suspects` の `microsoft_risky_users`、`identity_protection` の確認（health_check・daily_brief） | `IdentityRiskyUser.Read.All` | 任意。Identity Protection には **Entra ID P2** が要る。無ければ Graph が 403「not licensed」を返し，確認は `not_licensed` を報告する。ほかは何も変わらない |
 | `revoke_sign_in_sessions`（オプトイン） | `User.RevokeSessions.All`（app-only）または **User Administrator**／**Helpdesk Administrator** ディレクトリロール（delegated。管理者アカウントが対象なら **Privileged Authentication Administrator**） | `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ。書き込みの権限なので、このツールが要る配備にだけ付与する。先に行うアカウントの照会には `User.Read.All` が要る。無ければ認証方式に応じた `missing_permission` を返し、何も変わらない |
 
@@ -224,6 +229,9 @@ https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<app-id>
   `directory_audits` で `tenant` と，ほかのテナントが持つドメインの `user` を両方指定すると拒否する
   （違うログを探して何も見つからないため）。どのテナントも持たないドメインの `user`（外部・パートナーの
   管理者，ゲスト）は指定のテナントか既定のテナントで探し，結果に `user_domain_claimed: false` を付ける。
+- `audit_log_search_start` は `directory_audits` と同じ順でテナントを選ぶ（`tenant`，無ければ `user` の
+  ドメインを持つテナント，無ければ既定）。`audit_log_search_result` は `tenant` を取り，開始時と同じものを
+  渡す。検索はそれを作ったテナントにしか無い（ほかのテナントでは `found: false`）。
 - `tenant` は節の名前・そのドメイン・テナント ID のいずれか。テナントのファイルが無いときは `default` か
   env のテナント ID だけを受け付け，ほかは拒否する（`tenant_configured: false`）。
 - `health_check` と `daily_brief` はすべてのテナントを見る。最上位のキーはこれまでどおり既定のテナントの

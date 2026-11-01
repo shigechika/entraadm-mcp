@@ -9,6 +9,10 @@ Two constraints shape everything below.
 directory snapshot; nothing in the tenant is changed. The one state-changing
 tool, ``revoke_sign_in_sessions`` (registered only when
 ``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``), is skipped by name, never called.
+``audit_log_search_start`` is skipped as well: it changes no tenant data, but
+each call leaves a saved audit search behind and spends the tenant's daily
+audit search quota. ``audit_log_search_result`` is probed with a random id that
+names no search (``found: false``).
 
 **No tenant-specific values in this file.** This repository is public, so a
 probe may not name a real account, tenant id, or app registration.
@@ -118,6 +122,13 @@ async def _missing_vm_in_one_subscription(call: Caller) -> dict[str, Any]:
     return {**args, "vm": f"smoke-test-{secrets.token_hex(8)}"}
 
 
+async def _missing_audit_query_arg(call: Caller) -> dict[str, Any]:
+    """A random GUID that names no audit search, so the probe reads nothing and creates nothing."""
+    del call
+    raw = secrets.token_hex(16)
+    return {"query_id": "-".join((raw[:8], raw[8:12], raw[12:16], raw[16:20], raw[20:]))}
+
+
 #: Tools registered only behind an opt-in environment switch. Their specs stay
 #: here, and a run without the switch must not report them as stale.
 OPT_IN_TOOLS = frozenset({"revoke_sign_in_sessions"})
@@ -212,6 +223,16 @@ PROBES: dict[str, Probe] = {
     ),
     "revoke_sign_in_sessions": Probe(
         skip="state-changing (signs an account out everywhere); never called by the smoke test",
+    ),
+    "audit_log_search_start": Probe(
+        skip="creates a saved audit search in the tenant and spends its daily audit search quota",
+    ),
+    "audit_log_search_result": Probe(
+        args={"top": 5, "max_pages": MAX_PAGES},
+        args_factory=_missing_audit_query_arg,
+        require_keys=("found", "query_id"),
+        must_match=(r'"found":\s*false',),
+        allow_empty=True,
     ),
     "m365_service_health": Probe(
         args={"max_pages": MAX_PAGES},

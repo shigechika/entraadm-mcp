@@ -45,9 +45,12 @@ and not a fit for an unattended triage bot:
 | `vm_backup_policies` | Schedule and retention of the Azure VM backup policies (ARM) |
 | `vm_activity` | Who or what restarted an Azure VM: activity log and Resource Health for a time window (ARM) |
 | `m365_service_health` | Microsoft 365 service status and the open incidents and advisories |
+| `audit_log_search_start` | Submit a Microsoft Purview audit log search: what an account or an IP did in OneDrive/SharePoint, Exchange and Entra |
+| `audit_log_search_result` | That search's status, then its records summarised (by operation, service, record type, user, client IP) and trimmed |
 | `daily_brief` | One-call summary combining `m365_service_health`, `signin_failure_stats`, `directory_audits` and `compromise_suspects` (counts and top 5) |
 
-All tools above are read-only. The one state-changing tool,
+All tools above are read-only (`audit_log_search_start` creates only the saved
+audit search it then reads). The one state-changing tool,
 `revoke_sign_in_sessions` (sign one account out everywhere: Graph
 `revokeSignInSessions`), is registered only when
 `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` and needs `User.RevokeSessions.All`

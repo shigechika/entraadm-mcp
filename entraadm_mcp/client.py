@@ -60,6 +60,10 @@ class ApiError(Exception):
         self.may_have_applied = may_have_applied
         self.code = ""
         self.api_message = ""
+        #: The HTTP status of the final answer when the API answered with an error status, else None.
+        self.status_code: int | None = None
+        #: Seconds from the ``Retry-After`` header of a 429 answer, else None.
+        self.retry_after: float | None = None
 
 
 class ApiDeadline(ApiError):
@@ -270,7 +274,13 @@ class _RestClient:
         return self._request_tracked(method, url, params=params, deadline=deadline)[0]
 
     def _request_tracked(
-        self, method: str, url: str, params: dict | None = None, deadline: float | None = None
+        self,
+        method: str,
+        url: str,
+        params: dict | None = None,
+        deadline: float | None = None,
+        json_body: dict | None = None,
+        idempotent: bool = True,
     ) -> tuple[httpx.Response, bool]:
         """The final response, and whether any earlier attempt may have been applied.
 
@@ -278,6 +288,10 @@ class _RestClient:
         its outcome is unknown: a network error other than a failed connect, or a
         5xx. A 429 or another 4xx is a definite "not done" for that attempt. Every
         ApiError raised from here carries the flag (see ApiError.may_have_applied).
+
+        ``idempotent=False`` (a request that creates something) retries only a
+        network error raised before the request left this host; a 429, a 5xx or a
+        lost response is answered at once, never sent again.
         """
         headers = {"Authorization": f"Bearer {self._access_token()}"}
         # Token acquisition (azure-identity, synchronous) cannot itself be bounded: a
@@ -304,17 +318,18 @@ class _RestClient:
                 timeout = min(30.0, max(remaining, 0.05))  # httpx needs a positive value
             try:
                 if timeout is None:
-                    resp = self._http.request(method, url, params=params, headers=headers)
+                    resp = self._http.request(method, url, params=params, headers=headers, json=json_body)
                 else:
-                    resp = self._bounded_request(method, url, params, headers, timeout, deadline)
+                    resp = self._bounded_request(method, url, params, headers, timeout, deadline, json_body)
             except httpx.RequestError as e:
                 # A connection/DNS/timeout failure never reaches _parse(), so
                 # without this it would propagate as a bare httpx exception --
                 # none of the ApiError family a tool's except clause
                 # catches, crashing the tool call instead of degrading it.
-                if not isinstance(e, _NOT_SENT_ERRORS):
+                not_sent = isinstance(e, _NOT_SENT_ERRORS)
+                if not not_sent:
                     maybe_applied = True
-                if network_retries_left > 0:
+                if network_retries_left > 0 and (idempotent or not_sent):
                     self._sleep_within(2 ** (2 - network_retries_left), deadline, maybe_applied)
                     network_retries_left -= 1
                     continue
@@ -324,6 +339,10 @@ class _RestClient:
                 ) from e
             except ApiDeadline as e:
                 raise ApiDeadline(str(e), may_have_applied=True) from e
+            if not idempotent:
+                if resp.status_code >= 500:
+                    maybe_applied = True
+                return resp, maybe_applied
             if resp.status_code == 429 and not retried_429:
                 retried_429 = True
                 self._sleep_within(_parse_retry_after(resp.headers.get("Retry-After")), deadline, maybe_applied)
@@ -336,14 +355,14 @@ class _RestClient:
                     continue
             return resp, maybe_applied
 
-    def _bounded_request(self, method, url, params, headers, timeout, deadline) -> httpx.Response:
+    def _bounded_request(self, method, url, params, headers, timeout, deadline, json_body=None) -> httpx.Response:
         """One request whose *total* time (connect, headers and body) stops at ``deadline``.
 
         httpx's timeout is per operation and the read timeout restarts on every chunk, so a
         response that trickles in would outlast it. The body is read chunk by chunk and the
         wall clock is checked between chunks (ApiDeadline past it).
         """
-        with self._http.stream(method, url, params=params, headers=headers, timeout=timeout) as resp:
+        with self._http.stream(method, url, params=params, headers=headers, json=json_body, timeout=timeout) as resp:
             chunks = []
             for chunk in resp.iter_raw():
                 # Checked before taking the next chunk: a body that has just finished
@@ -375,6 +394,21 @@ class _RestClient:
         ``may_have_applied``: False only when no attempt can have been acted on.
         """
         resp, maybe_applied = self._request_tracked("POST", path, deadline=deadline)
+        try:
+            return self._parse(resp)
+        except ApiError as e:
+            e.may_have_applied = e.may_have_applied or maybe_applied
+            raise
+
+    def post_json(self, path: str, body: dict, deadline: float | None = None) -> dict:
+        """POST a JSON body to a collection that creates an object (e.g. ``/security/auditLog/queries``).
+
+        Not idempotent: sent once, and sent again only when the attempt provably
+        never left this host (a failed connect). A 429, a 5xx or a lost response
+        is raised at once (a 429 carries ``status_code`` and ``retry_after``).
+        Every ApiError raised carries ``may_have_applied``, as for ``post``.
+        """
+        resp, maybe_applied = self._request_tracked("POST", path, deadline=deadline, json_body=body, idempotent=False)
         try:
             return self._parse(resp)
         except ApiError as e:
@@ -457,6 +491,7 @@ class _RestClient:
             raw = _error_of(body)
             error.code = str(raw.get("code") or "")
             error.api_message = str(raw.get("message") or "")
+            error.status_code = 403
             raise error
         if resp.status_code >= 400:
             try:
@@ -465,10 +500,16 @@ class _RestClient:
             except ValueError:
                 message = resp.text[:200]
             if resp.status_code >= 500:
-                raise ApiServerError(
+                error = ApiServerError(
                     f"{self.api_name} request failed ({resp.status_code}): {message}", may_have_applied=True
                 )
-            raise ApiError(f"{self.api_name} request failed ({resp.status_code}): {message}")
+            else:
+                error = ApiError(f"{self.api_name} request failed ({resp.status_code}): {message}")
+            error.status_code = resp.status_code
+            retry_after = resp.headers.get("Retry-After")
+            if resp.status_code == 429 and retry_after is not None:
+                error.retry_after = _parse_retry_after(retry_after)
+            raise error
         try:
             body = resp.json()
         except ValueError:

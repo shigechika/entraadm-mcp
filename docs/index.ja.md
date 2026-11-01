@@ -40,9 +40,11 @@ Microsoft は Entra ID データ向けに
 | `vm_backup_policies` | Azure VM バックアップポリシーのスケジュールと保持期間（ARM） |
 | `vm_activity` | Azure VM を再起動したのは人か Azure か：指定した時間帯のアクティビティログとリソース正常性（ARM） |
 | `m365_service_health` | Microsoft 365 のサービス状態と開いているインシデント・アドバイザリ |
+| `audit_log_search_start` | Microsoft Purview の監査ログ検索を投入する：アカウントや IP が OneDrive/SharePoint・Exchange・Entra で何をしたか |
+| `audit_log_search_result` | その検索の状態と、終わったらレコードの集計（操作・サービス・レコード種別・ユーザ・クライアント IP）と切り詰めた一覧 |
 | `daily_brief` | `m365_service_health`・`signin_failure_stats`・`directory_audits`・`compromise_suspects`（件数と上位 5 件）を1回でまとめたサマリ |
 
-上のツールはすべて読み取り専用。状態を変えるツールは `revoke_sign_in_sessions`（1 アカウントを
+上のツールはすべて読み取り専用（`audit_log_search_start` は自分が読む監査検索のオブジェクトを作るだけ）。状態を変えるツールは `revoke_sign_in_sessions`（1 アカウントを
 すべての場所からサインアウト。Graph `revokeSignInSessions`）の 1 本だけで、
 `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` のときだけ登録され、`User.RevokeSessions.All`（app-only）
 または User Administrator／Helpdesk Administrator ロール（delegated）が要る。

@@ -38,6 +38,7 @@ but the valid ranges are still used.
 | `signin_logs`, `signin_failure_stats`, `signin_success_stats`, `compromise_suspects`, `signin_by_ip`, `directory_audits`, `get_user`'s `sign_in_activity` field | `AuditLog.Read.All` (app-only) or the **Reports Reader** directory role (delegated) |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All` (app-only only) |
 | `m365_service_health`, `daily_brief`'s `service_health` section | `ServiceHealth.Read.All` (delegated auth also needs an Entra role that may read service health, e.g. Service Support Administrator or Global Reader) |
+| `audit_log_search_start`, `audit_log_search_result` | `AuditLogsQuery.Read.All`, or the service-scoped `AuditLogsQuery-OneDrive.Read.All` / `AuditLogsQuery-SharePoint.Read.All` / `AuditLogsQuery-Exchange.Read.All` / `AuditLogsQuery-Entra.Read.All` (application permissions; optional; with only a service-scoped one, pass the matching `service`) |
 | `compromise_suspects`' `microsoft_risky_users`, the `identity_protection` probe | `IdentityRiskyUser.Read.All` (optional; Identity Protection needs Entra ID P2, without it the probe says `not_licensed`) |
 | `revoke_sign_in_sessions` (opt-in, `ENTRAADM_ENABLE_REVOKE_SESSIONS=1`) | `User.RevokeSessions.All` (app-only) or the User Administrator / Helpdesk Administrator directory role (delegated; Privileged Authentication Administrator for an administrator account). A write permission; grant it only where the tool is enabled. The lookup before it needs `User.Read.All` |
 
@@ -64,7 +65,9 @@ domain: `tenant_configured: false`, `found: null`, `configured_domains`);
 `tenant` (section name, domain or tenant id; env-only: `default` or the env
 tenant id), default the default tenant; `directory_audits` refuses a `tenant`
 that another tenant's `user` contradicts and searches an unclaimed `user` in
-the given or default tenant (`user_domain_claimed: false`). `health_check` /
+the given or default tenant (`user_domain_claimed: false`);
+`audit_log_search_start` picks its tenant the same way, and
+`audit_log_search_result` must get the `tenant` the start call used. `health_check` /
 `daily_brief` keep the default tenant's keys on top, add `tenant` and
 `tenants`, and split the call budget evenly among the tenants
 (`ENTRAADM_DEADLINE=0`: unbounded). The ARM tools serve the default tenant
@@ -349,6 +352,62 @@ keeps for days such as `serviceRestored` are not counted),
 (both collections page; a capped scan is a lower bound). Each section degrades on
 its own with `{"error", "missing_permission": "ServiceHealth.Read.All"}`.
 The message center (`messages`) needs another permission and is not read.
+
+### `audit_log_search_start(user=None, hours=24, start=None, end=None, record_types=None, operations=None, ip_addresses=None, keyword=None, service=None, object_ids=None, tenant=None)`
+
+Submits a Microsoft Purview audit log search (Graph `POST
+/security/auditLog/queries`) and returns `query_id`; the search runs in
+Microsoft 365 for some minutes, so the records come from
+`audit_log_search_result`. It answers what a session did after signing in:
+OneDrive/SharePoint file events, Exchange mailbox actions and cmdlets, Entra
+directory changes. The window is `hours` back from `end` (default now),
+clamped to [1, 4320] (180 days, Audit Standard retention), or `start` / `end`
+as ISO 8601 with an offset; a window may span at most 180 days. Filters
+(combined with AND; at least one is required, so a call never reads the whole
+tenant's log): `user` (a UPN), `record_types` (auditLogRecordType values such
+as `sharePointFileOperation`, `exchangeItem`), `operations` (`FileDownloaded`,
+`New-InboxRule`, `MailItemsAccessed`, ...), `ip_addresses`, `keyword`,
+`service` (`Exchange`, `SharePoint`, `OneDrive`, `AzureActiveDirectory`, ...)
+and `object_ids`; up to 20 values per list, each checked for shape before
+anything is sent. The result: `created` (true; false when nothing was created;
+null when the answer was lost and a search may exist anyway, never retried),
+`query_id`, `status`, `display_name` (`entraadm-mcp <UTC time>`),
+`window_start`, `window_end` and the `filters` sent.
+
+The call creates a saved audit search object in the tenant and changes no
+directory, mailbox or file data, so it is not counted as state-changing. Each
+call counts against the tenant's audit search limits (searches per day,
+searches running at once): a 429 returns `rate_limited: true` with
+`retry_after_seconds` and is not retried. A 403 returns `missing_permission`.
+The tenant is chosen like `directory_audits`' (`tenant`, else the one claiming
+`user`'s domain, else the default). The smoke test skips this tool.
+
+### `audit_log_search_result(query_id, top=50, max_pages=None, tenant=None)`
+
+`GET /security/auditLog/queries/{id}`: `found`, `query_id`, `status`, `done`
+and the search's own filters (`query`). While `notStarted` / `running` only
+the status comes back (`done: false`); `failed` / `cancelled` are `done: true`
+with an `error`. Once `succeeded`, the records (`/records`) are paged within
+`max_pages` and the call deadline:
+
+- `summary`: `total_records`, `first_seen` / `last_seen`, `distinct` counts,
+  and the top 25 of `by_operation`, `by_service`, `by_record_type`, `by_user`
+  and `by_client_ip` (count, `first_seen`, `last_seen`; a port Exchange
+  appends to the address is dropped);
+- `records`: the newest `top` (default 50, at most 500) with `id`, `time`,
+  `operation`, `service`, `record_type`, `user`, `user_id`, `client_ip`,
+  `object_id` and `details` (from `auditData`: `ClientIP`,
+  `ClientIPAddress`, `UserAgent`, `ClientInfoString`, `ResultStatus`,
+  `LogonType`, `ApplicationId`, `SiteUrl`, `SourceFileName`,
+  `SourceRelativeUrl`, `ObjectId` when the record has none, and
+  `ParameterNames`: the names of cmdlet parameters, never their values). Every
+  string is cut to 200 characters; the full `auditData` is never returned;
+- `capped` (the page budget or the deadline ran out: the counts are lower
+  bounds), `count` and `records_truncated` (more records read than `top`).
+
+`query_id` must be a GUID (it goes into the URL path). An id unknown to the
+tenant is `found: false`: pass the `tenant` the start call used. 403:
+`missing_permission`; 429: `rate_limited: true`.
 
 ### `daily_brief(hours=24, max_pages=None, samples=10)`
 
