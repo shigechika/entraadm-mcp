@@ -471,17 +471,23 @@ def test_result_details_do_not_repeat_the_client_ip(graph):
 
 
 @pytest.mark.parametrize(
-    ("query", "service"),
+    ("query", "services"),
     [
-        ({"serviceFilters": ["Exchange"]}, "Exchange"),
-        ({"serviceFilter": "SharePoint"}, "SharePoint"),
-        ({}, None),
+        ({"serviceFilters": ["Exchange", "SharePoint"]}, ["Exchange", "SharePoint"]),
+        ({"serviceFilter": "SharePoint"}, ["SharePoint"]),
+        ({}, []),
     ],
 )
 @respx.mock
-def test_result_reads_back_the_service_filter(graph, query, service):
-    respx.get(QUERY_URL).mock(return_value=httpx.Response(200, json={"id": QUERY_ID, "status": "running", **query}))
-    assert server.audit_log_search_result(QUERY_ID)["query"]["service"] == service
+def test_result_reads_back_the_service_filters(graph, query, services):
+    respx.get(QUERY_URL).mock(
+        return_value=httpx.Response(
+            200, json={"id": QUERY_ID, "status": "running", "administrativeUnitIdFilters": ["au-1"], **query}
+        )
+    )
+    q = server.audit_log_search_result(QUERY_ID)["query"]
+    assert q["services"] == services
+    assert q["administrative_unit_ids"] == ["au-1"]
 
 
 @pytest.mark.parametrize(
@@ -491,11 +497,12 @@ def test_result_reads_back_the_service_filter(graph, query, service):
         (False, "1234", False, 1234),
         (None, None, None, None),
         ("yes", True, None, None),
+        (False, "\u00b2", False, None),
     ],
 )
 @respx.mock
 def test_result_reports_the_record_count_limit(graph, exceeded, approx, want_exceeded, want_approx):
-    query = {"id": QUERY_ID, "status": "succeeded"}
+    query = {"id": QUERY_ID, "status": "succeeded", "recordCountLimit": "50000"}
     if exceeded is not None:
         query["isRecordCountLimitExceeded"] = exceeded
     if approx is not None:
@@ -505,3 +512,7 @@ def test_result_reports_the_record_count_limit(graph, exceeded, approx, want_exc
     out = server.audit_log_search_result(QUERY_ID)
     assert out["query"]["record_count_limit_exceeded"] is want_exceeded
     assert out["query"]["approximate_record_count"] == want_approx
+    assert out["query"]["record_count_limit"] == 50000
+    # Graph's own limit makes the result partial even when every page was read
+    assert out["capped"] is (want_exceeded is True)
+    assert out["summary"]["capped"] is (want_exceeded is True)

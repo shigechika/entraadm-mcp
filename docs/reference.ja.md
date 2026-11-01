@@ -312,9 +312,9 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
 ### `audit_log_search_result(query_id, top=50, max_pages=None, tenant=None)`
 
 `GET /security/auditLog/queries/{id}`：`found`・`query_id`・`status`・`done` と，検索自身のフィルタ
-（`query`）。`query` には `record_count_limit_exceeded`（Graph が検索 1 回あたりの件数の上限で集めるのを
-止めた。`max_pages` に関係なく一部しか入っていないので，期間かフィルタを狭めて検索し直す）と
-`approximate_record_count` も入る。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` と，このサーバが
+（`query`。サービスはリストの `services`）。`query` には `record_count_limit_exceeded`（Graph が検索 1 回あたりの
+件数の上限 `record_count_limit` で集めるのを止めた。`max_pages` に関係なく一部しか入っていないので，期間か
+フィルタを狭めて検索し直す。このとき `capped` も true）と `approximate_record_count` も入る。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` と，このサーバが
 知らない状態は `done: true` で `error` 付き。`succeeded` になったらレコード（`/records`）を `max_pages` と呼び出しの
 期限の範囲でページングし，次を返す:
 
@@ -326,7 +326,7 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
   `SiteUrl`・`SourceFileName`・`SourceRelativeUrl`，レコードに無いときだけ `ObjectId`，コマンドレットの
   パラメータ名だけの `ParameterNames`。値は返さない）。文字列はすべて 200 文字で切る。`auditData`
   全体は返さない
-- `capped`（ページ予算か期限で打ち切った。件数は下限），`count`，`records_truncated`（`top` より多く
+- `capped`（ページ予算か期限で打ち切った，または Graph の件数の上限を超えた。件数は下限），`count`，`records_truncated`（`top` より多く
   読んだ）
 
 `query_id` は GUID でなければならない（URL のパスに入るため）。そのテナントに無い ID は `found: false`。
