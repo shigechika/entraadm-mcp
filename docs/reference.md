@@ -367,9 +367,11 @@ window starting more than 180 days ago carries a `note` (older records exist onl
 (combined with AND; at least one is required, so a call never reads the whole
 tenant's log): `user` (a UPN), `record_types` (auditLogRecordType values such
 as `sharePointFileOperation`, `exchangeItem`), `operations` (`FileDownloaded`,
-`New-InboxRule`, `MailItemsAccessed`, ...), `ip_addresses`, `keyword`,
-`service` (`Exchange`, `SharePoint`, `OneDrive`, `AzureActiveDirectory`, ...)
-and `object_ids`; up to 20 values per list, each checked for shape before
+`New-InboxRule`, `MailItemsAccessed`, ...), `ip_addresses`, `keyword` (matched
+against the workload-specific content of `auditData` only, not against the
+operation name or other indexed properties: use `operations` for those),
+`service` (`Exchange`, `SharePoint`, `OneDrive`, `AzureActiveDirectory`, ...;
+sent as `serviceFilters`) and `object_ids`; up to 20 values per list, each checked for shape before
 anything is sent. The result: `created` (true; false when nothing was created;
 null when the answer was lost and a search may exist anyway, never retried),
 `query_id`, `status`, `display_name` (`entraadm-mcp <UTC time>`),
@@ -386,7 +388,12 @@ The tenant is chosen like `directory_audits`' (`tenant`, else the one claiming
 ### `audit_log_search_result(query_id, top=50, max_pages=None, tenant=None)`
 
 `GET /security/auditLog/queries/{id}`: `found`, `query_id`, `status`, `done`
-and the search's own filters (`query`). While `notStarted` / `running` only
+and the search's own filters (`query`, the services as the list `services`),
+with `record_count_limit_exceeded` (Graph stopped collecting at its
+per-search record limit `record_count_limit`: the search holds only part of
+the matching records whatever `max_pages` is, so narrow the window or the
+filters and start again; `capped` is then true too) and
+`approximate_record_count`. While `notStarted` / `running` only
 the status comes back (`done: false`); `failed` / `cancelled`, and any status
 this server does not know, are `done: true` with an `error`. Once `succeeded`, the records (`/records`) are paged within
 `max_pages` and the call deadline:
@@ -402,8 +409,8 @@ this server does not know, are `done: true` with an `error`. Once `succeeded`, t
   `SourceRelativeUrl`, `ObjectId` when the record has none, and
   `ParameterNames`: the names of cmdlet parameters, never their values). Every
   string is cut to 200 characters; the full `auditData` is never returned;
-- `capped` (the page budget or the deadline ran out: the counts are lower
-  bounds), `count` and `records_truncated` (more records read than `top`).
+- `capped` (the page budget or the deadline ran out, or Graph's record limit
+  was exceeded: the counts are lower bounds), `count` and `records_truncated` (more records read than `top`).
 
 `query_id` must be a GUID (it goes into the URL path). An id unknown to the
 tenant is `found: false`: pass the `tenant` the start call used. 403:

@@ -2222,6 +2222,10 @@ def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
 def _dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
@@ -3428,15 +3432,17 @@ def _audit_filters(
     return filters
 
 
-#: Tool argument -> auditLogQuery property.
+#: Tool argument -> auditLogQuery property (``user`` is sent as userPrincipalNameFilters on its own).
 _AUDIT_BODY_FIELDS = {
     "record_types": "recordTypeFilters",
     "operations": "operationFilters",
     "ip_addresses": "ipAddressFilters",
     "object_ids": "objectIdFilters",
     "keyword": "keywordFilter",
-    "service": "serviceFilter",
+    "service": "serviceFilters",
 }
+#: Single-valued tool arguments whose property is a collection.
+_AUDIT_WRAPPED_FIELDS = frozenset({"service"})
 
 
 def _audit_error(e: Exception, submitting: bool) -> dict:
@@ -3456,6 +3462,13 @@ def _audit_error(e: Exception, submitting: bool) -> dict:
     return out
 
 
+def _audit_count(value: Any) -> int | None:
+    """An Int64 count: a JSON number, or a digit string when Graph sends Int64 as text."""
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    return _int(value)
+
+
 def _audit_query_entry(q: dict) -> dict:
     def texts(key: str) -> list[str]:
         return [t for t in (_audit_text(v) for v in _str_list(q.get(key))[:_AUDIT_FILTER_LIMIT]) if t]
@@ -3471,7 +3484,11 @@ def _audit_query_entry(q: dict) -> dict:
         "ip_addresses": texts("ipAddressFilters"),
         "object_ids": texts("objectIdFilters"),
         "keyword": _audit_text(q.get("keywordFilter")),
-        "service": _audit_text(q.get("serviceFilter")),
+        "services": texts("serviceFilters") or [t for t in [_audit_text(q.get("serviceFilter"))] if t],
+        "administrative_unit_ids": texts("administrativeUnitIdFilters"),
+        "record_count_limit_exceeded": _bool(q.get("isRecordCountLimitExceeded")),
+        "approximate_record_count": _audit_count(q.get("approximateReturnedRecordCount")),
+        "record_count_limit": _audit_count(q.get("recordCountLimit")),
     }
 
 
@@ -3636,7 +3653,8 @@ def audit_log_search_start(
         record_types: auditLogRecordType values, e.g. ["sharePointFileOperation", "exchangeItem"].
         operations: Operation names, e.g. ["FileDownloaded", "New-InboxRule", "MailItemsAccessed"].
         ip_addresses: Client IPv4/IPv6 addresses.
-        keyword: Free-text keyword matched anywhere in the record (at most 256 characters).
+        keyword: Free text matched against the workload-specific content of each record (auditData), not
+            against indexed properties such as the operation name; use operations for those (at most 256 characters).
         service: One workload, e.g. "Exchange", "SharePoint", "OneDrive", "AzureActiveDirectory".
         object_ids: Object ids, e.g. a file URL or a mailbox item id.
         tenant: Tenant to search: a [tenant.<name>] section name, one of its domains or its tenant id
@@ -3665,7 +3683,7 @@ def audit_log_search_start(
         payload["userPrincipalNameFilters"] = [filters["user"]]
     for arg, field in _AUDIT_BODY_FIELDS.items():
         if arg in filters:
-            payload[field] = filters[arg]
+            payload[field] = [filters[arg]] if arg in _AUDIT_WRAPPED_FIELDS else filters[arg]
     base = {
         "created": False,
         "query_id": None,
@@ -3731,9 +3749,13 @@ def audit_log_search_result(
       name, the names of cmdlet parameters -- never their values), every string
       cut to 200 characters. The full ``auditData`` is not returned.
 
-    ``capped=true`` means the page budget or the deadline ran out before every
-    record was read, so the counts are lower bounds; call again with a larger
-    ``max_pages``. ``records_truncated`` means more records were read than
+    ``capped=true`` means the counts are lower bounds: either the page budget or
+    the deadline ran out before every record was read (call again with a larger
+    ``max_pages``), or ``query.record_count_limit_exceeded`` is true -- Graph
+    itself stopped collecting at its per-search record limit
+    (``query.record_count_limit``), so the search holds only part of the
+    matching records whatever ``max_pages`` is; narrow the window or the
+    filters and start a new search. ``records_truncated`` means more records were read than
     ``top`` returns (the summary counts them all). An unknown id is ``found:
     false``: a search exists only in the tenant that created it, so pass the
     ``tenant`` its start call used. Permissions as audit_log_search_start; a
@@ -3787,6 +3809,8 @@ def audit_log_search_result(
         return {**out, **_audit_error(e, submitting=False)}
     records = [_audit_record(r) for r in raw if isinstance(r, dict)]
     records.sort(key=lambda r: (r["time"] is not None, _ts(r["time"] or "")), reverse=True)
+    # Graph stopped collecting at its per-search limit: the records are a part, however many pages are read
+    capped = capped or out["query"]["record_count_limit_exceeded"] is True
     return {
         **out,
         "capped": capped,

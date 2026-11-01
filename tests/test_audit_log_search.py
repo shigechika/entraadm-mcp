@@ -87,7 +87,8 @@ def test_start_sends_the_filters_and_returns_the_query_id(graph):
     assert body["operationFilters"] == ["FileDownloaded", "New-InboxRule", "Update user."]
     assert body["ipAddressFilters"] == ["203.0.113.7", "2001:db8::1"]
     assert body["keywordFilter"] == "invoice"
-    assert body["serviceFilter"] == "SharePoint"
+    assert body["serviceFilters"] == ["SharePoint"]
+    assert "serviceFilter" not in body
     assert body["objectIdFilters"] == ["https://files.example.edu/sites/a/doc.docx"]
     start = datetime.datetime.fromisoformat(body["filterStartDateTime"].replace("Z", "+00:00"))
     end = datetime.datetime.fromisoformat(body["filterEndDateTime"].replace("Z", "+00:00"))
@@ -467,3 +468,51 @@ def test_result_details_do_not_repeat_the_client_ip(graph):
     respx.get(RECORDS_URL).mock(return_value=httpx.Response(200, json={"value": [_record(1)]}))
     rec = server.audit_log_search_result(QUERY_ID)["records"][0]
     assert rec["client_ip"] == "203.0.113.7" and "ClientIP" not in rec["details"]
+
+
+@pytest.mark.parametrize(
+    ("query", "services"),
+    [
+        ({"serviceFilters": ["Exchange", "SharePoint"]}, ["Exchange", "SharePoint"]),
+        ({"serviceFilter": "SharePoint"}, ["SharePoint"]),
+        ({}, []),
+    ],
+)
+@respx.mock
+def test_result_reads_back_the_service_filters(graph, query, services):
+    respx.get(QUERY_URL).mock(
+        return_value=httpx.Response(
+            200, json={"id": QUERY_ID, "status": "running", "administrativeUnitIdFilters": ["au-1"], **query}
+        )
+    )
+    q = server.audit_log_search_result(QUERY_ID)["query"]
+    assert q["services"] == services
+    assert q["administrative_unit_ids"] == ["au-1"]
+
+
+@pytest.mark.parametrize(
+    ("exceeded", "approx", "want_exceeded", "want_approx"),
+    [
+        (True, 50000, True, 50000),
+        (False, "1234", False, 1234),
+        (None, None, None, None),
+        ("yes", True, None, None),
+        (False, "\u00b2", False, None),
+    ],
+)
+@respx.mock
+def test_result_reports_the_record_count_limit(graph, exceeded, approx, want_exceeded, want_approx):
+    query = {"id": QUERY_ID, "status": "succeeded", "recordCountLimit": "50000"}
+    if exceeded is not None:
+        query["isRecordCountLimitExceeded"] = exceeded
+    if approx is not None:
+        query["approximateReturnedRecordCount"] = approx
+    respx.get(QUERY_URL).mock(return_value=httpx.Response(200, json=query))
+    respx.get(RECORDS_URL).mock(return_value=httpx.Response(200, json={"value": []}))
+    out = server.audit_log_search_result(QUERY_ID)
+    assert out["query"]["record_count_limit_exceeded"] is want_exceeded
+    assert out["query"]["approximate_record_count"] == want_approx
+    assert out["query"]["record_count_limit"] == 50000
+    # Graph's own limit makes the result partial even when every page was read
+    assert out["capped"] is (want_exceeded is True)
+    assert out["summary"]["capped"] is (want_exceeded is True)

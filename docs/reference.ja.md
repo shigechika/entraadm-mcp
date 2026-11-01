@@ -295,8 +295,10 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
 （[1, 4320]＝180 日，Audit Standard の保持期間に丸める）か，オフセット付き ISO 8601 の `start`／`end`（未来の `end` は現在として扱う）。
 窓の幅は最大 180 日。180 日より前から始まる窓には `note` を付ける（それより古い記録は Audit Premium の保持でだけ残る）。フィルタ（AND で組み合わせる。全テナントのログを読まないよう 1 つ以上必須）:
 `user`（UPN），`record_types`（`sharePointFileOperation`・`exchangeItem` などの auditLogRecordType），
-`operations`（`FileDownloaded`・`New-InboxRule`・`MailItemsAccessed` など），`ip_addresses`，`keyword`，
-`service`（`Exchange`・`SharePoint`・`OneDrive`・`AzureActiveDirectory` など），`object_ids`。リストは
+`operations`（`FileDownloaded`・`New-InboxRule`・`MailItemsAccessed` など），`ip_addresses`，`keyword`
+（`auditData` のワークロード固有の中身だけに当たる。操作名などの索引付きの項目には当たらないので，
+それらは `operations` で絞る），`service`（`Exchange`・`SharePoint`・`OneDrive`・`AzureActiveDirectory` など。
+`serviceFilters` として送る），`object_ids`。リストは
 最大 20 個で，送る前に形を確かめる。結果は `created`（作れたら true，何も作っていなければ false，
 応答が失われて検索ができているかもしれないときは null。再試行しない），`query_id`，`status`，
 `display_name`（`entraadm-mcp <UTC 時刻>`），`window_start`，`window_end`，送った `filters`。
@@ -310,7 +312,9 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
 ### `audit_log_search_result(query_id, top=50, max_pages=None, tenant=None)`
 
 `GET /security/auditLog/queries/{id}`：`found`・`query_id`・`status`・`done` と，検索自身のフィルタ
-（`query`）。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` と，このサーバが
+（`query`。サービスはリストの `services`）。`query` には `record_count_limit_exceeded`（Graph が検索 1 回あたりの
+件数の上限 `record_count_limit` で集めるのを止めた。`max_pages` に関係なく一部しか入っていないので，期間か
+フィルタを狭めて検索し直す。このとき `capped` も true）と `approximate_record_count` も入る。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` と，このサーバが
 知らない状態は `done: true` で `error` 付き。`succeeded` になったらレコード（`/records`）を `max_pages` と呼び出しの
 期限の範囲でページングし，次を返す:
 
@@ -322,7 +326,7 @@ Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/audi
   `SiteUrl`・`SourceFileName`・`SourceRelativeUrl`，レコードに無いときだけ `ObjectId`，コマンドレットの
   パラメータ名だけの `ParameterNames`。値は返さない）。文字列はすべて 200 文字で切る。`auditData`
   全体は返さない
-- `capped`（ページ予算か期限で打ち切った。件数は下限），`count`，`records_truncated`（`top` より多く
+- `capped`（ページ予算か期限で打ち切った，または Graph の件数の上限を超えた。件数は下限），`count`，`records_truncated`（`top` より多く
   読んだ）
 
 `query_id` は GUID でなければならない（URL のパスに入るため）。そのテナントに無い ID は `found: false`。
