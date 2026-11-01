@@ -14,12 +14,16 @@ Tools:
 - ``vm_backup_status``       — which Azure VMs are backed up, and whether the last backup succeeded (ARM)
 - ``vm_backup_policies``     — schedule and retention of the Azure VM backup policies (ARM)
 - ``m365_service_health``    — Microsoft 365 service status and open incidents
+- ``audit_log_search_start`` — submit a Microsoft Purview audit log search (OneDrive/SharePoint,
+  Exchange, Entra); creates a saved search object, changes no tenant data
+- ``audit_log_search_result`` — that search's status, then its records summarised and trimmed
 - ``daily_brief``            — one-call summary combining m365_service_health,
   signin_failure_stats and directory_audits
 - ``revoke_sign_in_sessions`` — opt-in (``ENTRAADM_ENABLE_REVOKE_SESSIONS=1``), the one
   state-changing tool: sign one account out everywhere
 
-Every tool except ``revoke_sign_in_sessions`` is read-only.
+Every tool except ``revoke_sign_in_sessions`` is read-only (``audit_log_search_start``
+creates only the saved search object it then reads).
 
 Tenants: one Entra tenant from the env vars, or several from the INI file named
 by ``ENTRAADM_CONFIG`` (``[tenant.<name>]`` sections, see config.py). A tool that
@@ -47,6 +51,7 @@ import datetime
 import functools
 import inspect
 import ipaddress
+import json
 import re
 import time
 from typing import Any
@@ -961,9 +966,7 @@ def signin_by_ip(
     # ipAddress string literally and an expanded IPv6 form from the log would
     # not match its compressed form
     ip = ip.strip()
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
+    if not _is_ip(ip):
         return {"error": f"ip must be an IPv4 or IPv6 address (got {ip!r})"}
     if result not in ("failure", "success", "all"):
         return {"error": f"result must be 'failure', 'success', or 'all' (got {result!r})"}
@@ -2851,24 +2854,36 @@ def _parse_window_time(value: str, label: str) -> datetime.datetime:
     return parsed
 
 
-def _activity_window(
-    start: str | None, end: str | None, hours: int, now: datetime.datetime
+def _window(
+    start: str | None,
+    end: str | None,
+    hours: int,
+    now: datetime.datetime,
+    max_hours: int,
+    retention_days: int | None,
+    retention_label: str,
 ) -> tuple[datetime.datetime, datetime.datetime]:
-    end_dt = _parse_window_time(end, "end") if end else now
+    """The [start, end) window of a log search: ``end`` defaults to now and is clamped to now
+    before a missing ``start`` is derived from ``hours`` (ValueError on a bad window)."""
+    end_dt = min(_parse_window_time(end, "end"), now) if end else now
     start_dt = (
         _parse_window_time(start, "start")
         if start
-        else end_dt - datetime.timedelta(hours=max(1, min(_ACTIVITY_MAX_HOURS, hours)))
+        else end_dt - datetime.timedelta(hours=max(1, min(max_hours, hours)))
     )
-    if end_dt > now:
-        end_dt = now
     if start_dt >= end_dt:
         raise ValueError("start must be before end (and before now)")
-    if end_dt - start_dt > datetime.timedelta(hours=_ACTIVITY_MAX_HOURS):
-        raise ValueError(f"the window may span at most {_ACTIVITY_MAX_HOURS} hours")
-    if start_dt < now - datetime.timedelta(days=_ACTIVITY_RETENTION_DAYS):
-        raise ValueError(f"the activity log keeps {_ACTIVITY_RETENTION_DAYS} days; start is older")
+    if end_dt - start_dt > datetime.timedelta(hours=max_hours):
+        raise ValueError(f"the window may span at most {max_hours} hours")
+    if retention_days is not None and start_dt < now - datetime.timedelta(days=retention_days):
+        raise ValueError(f"the {retention_label} keeps {retention_days} days; start is older")
     return start_dt, end_dt
+
+
+def _activity_window(
+    start: str | None, end: str | None, hours: int, now: datetime.datetime
+) -> tuple[datetime.datetime, datetime.datetime]:
+    return _window(start, end, hours, now, _ACTIVITY_MAX_HOURS, _ACTIVITY_RETENTION_DAYS, "activity log")
 
 
 def _utc_text(dt: datetime.datetime) -> str:
@@ -2880,9 +2895,14 @@ def _value(field: Any) -> str | None:
     return _str(_dict(field).get("value"))
 
 
-def _short(value: Any) -> str | None:
+def _cut(value: Any, limit: int) -> str | None:
+    """``value`` as text, cut to ``limit`` characters with an ellipsis."""
     text = _str(value)
-    return text if text is None or len(text) <= _ACTIVITY_DETAIL_CHARS else text[:_ACTIVITY_DETAIL_CHARS] + "…"
+    return text if text is None or len(text) <= limit else text[:limit] + "…"
+
+
+def _short(value: Any) -> str | None:
+    return _cut(value, _ACTIVITY_DETAIL_CHARS)
 
 
 def _operation_row(event: dict) -> dict:
@@ -3281,6 +3301,500 @@ def m365_service_health(max_pages: int | None = None, tenant: str | None = None)
         summary["open_incidents"] = issues
         summary["open_advisories"] = issues
     return {"summary": summary, "services": services, "issues": issues, "capped": capped}
+
+
+# ---------------------------------------------------------------------------
+# audit_log_search_start / audit_log_search_result
+# ---------------------------------------------------------------------------
+
+_AUDIT_QUERY_PERMISSION = (
+    "AuditLogsQuery.Read.All, or a service-scoped AuditLogsQuery-OneDrive.Read.All / "
+    "AuditLogsQuery-SharePoint.Read.All / AuditLogsQuery-Exchange.Read.All / AuditLogsQuery-Entra.Read.All"
+)
+_AUDIT_QUERIES_PATH = "/security/auditLog/queries"
+#: Microsoft Purview Audit (Standard) keeps records for 180 days; a window may not span more.
+_AUDIT_MAX_HOURS = 24 * 180
+_AUDIT_STANDARD_RETENTION_DAYS = 180
+_AUDIT_DEFAULT_HOURS = 24
+#: At most this many values per list filter (users, IPs, operations, ...).
+_AUDIT_FILTER_LIMIT = 20
+_AUDIT_KEYWORD_CHARS = 256
+_AUDIT_OBJECT_ID_CHARS = 1024
+#: Every string taken from a record is cut to this length.
+_AUDIT_TEXT_CHARS = 200
+#: Rows per summary list (by operation, service, record type, user, client IP).
+_AUDIT_SUMMARY_LIMIT = 25
+_AUDIT_PARAMETER_NAMES_LIMIT = 20
+_AUDIT_DEFAULT_TOP = 50
+_AUDIT_RECORD_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}$")
+_AUDIT_SERVICE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}$")
+#: Exchange cmdlets (New-InboxRule), file events (FileDownloaded), Entra operations ("Update user.").
+_AUDIT_OPERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,127}$")
+_AUDIT_DONE_STATUSES = ("succeeded", "failed", "cancelled")
+_AUDIT_PENDING_STATUSES = ("notStarted", "running")
+#: auditData keys returned per record (the client IP is ``client_ip``). Scalars only, each string cut to
+#: _AUDIT_TEXT_CHARS; ``Parameters`` is reduced to its names (values can hold mailbox rules, addresses, paths).
+_AUDIT_DATA_KEYS = (
+    "UserAgent",
+    "ClientInfoString",
+    "ResultStatus",
+    "LogonType",
+    "ApplicationId",
+    "SiteUrl",
+    "SourceFileName",
+    "SourceRelativeUrl",
+    "ObjectId",
+)
+
+
+def _audit_text(value: Any, limit: int = _AUDIT_TEXT_CHARS) -> str | None:
+    return _cut(value, limit)
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in value)
+
+
+def _audit_window(
+    start: str | None, end: str | None, hours: int, now: datetime.datetime
+) -> tuple[datetime.datetime, datetime.datetime]:
+    # no retention check: Audit (Premium) keeps records past 180 days; start reports the case instead
+    return _window(start, end, hours, now, _AUDIT_MAX_HOURS, None, "audit log")
+
+
+def _audit_list(name: str, values: Any, check) -> list[str]:
+    """A list filter from tool input: a list of non-empty strings, each passing ``check`` (ValueError otherwise)."""
+    if values is None:
+        return []
+    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+        raise ValueError(f"{name} must be a list of strings")
+    cleaned = [v.strip() for v in values]
+    if len(cleaned) > _AUDIT_FILTER_LIMIT:
+        raise ValueError(f"{name} takes at most {_AUDIT_FILTER_LIMIT} values")
+    for v in cleaned:
+        if not v or not check(v):
+            raise ValueError(f"{name} has an invalid value: {v[:80]!r}")
+    return cleaned
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _audit_filters(
+    user: str | None,
+    record_types: Any,
+    operations: Any,
+    ip_addresses: Any,
+    keyword: str | None,
+    service: str | None,
+    object_ids: Any,
+) -> dict:
+    """The validated filters, keyed like the tool arguments; empty ones left out (ValueError on bad input)."""
+    filters: dict[str, Any] = {}
+    if user is not None:
+        if user != user.strip():
+            raise ValueError("user must not have leading or trailing spaces")
+        if not _is_upn(user):
+            raise ValueError(f"user must be a user principal name (got {user[:80]!r})")
+        filters["user"] = user
+    if record_types:
+        filters["record_types"] = _audit_list("record_types", record_types, _AUDIT_RECORD_TYPE_RE.match)
+    if operations:
+        filters["operations"] = _audit_list("operations", operations, _AUDIT_OPERATION_RE.match)
+    if ip_addresses:
+        # validate only: keep the caller's spelling, as signin_by_ip does
+        filters["ip_addresses"] = _audit_list("ip_addresses", ip_addresses, _is_ip)
+    if object_ids:
+        filters["object_ids"] = _audit_list(
+            "object_ids",
+            object_ids,
+            lambda v: len(v) <= _AUDIT_OBJECT_ID_CHARS and not _has_control_chars(v),
+        )
+    if keyword is not None and keyword.strip():
+        keyword = keyword.strip()
+        if len(keyword) > _AUDIT_KEYWORD_CHARS or _has_control_chars(keyword):
+            raise ValueError(f"keyword must be at most {_AUDIT_KEYWORD_CHARS} characters, without control characters")
+        filters["keyword"] = keyword
+    if service is not None and service.strip():
+        service = service.strip()
+        if not _AUDIT_SERVICE_RE.match(service):
+            raise ValueError(f"service must be a service name such as Exchange or SharePoint (got {service[:80]!r})")
+        filters["service"] = service
+    return filters
+
+
+#: Tool argument -> auditLogQuery property.
+_AUDIT_BODY_FIELDS = {
+    "record_types": "recordTypeFilters",
+    "operations": "operationFilters",
+    "ip_addresses": "ipAddressFilters",
+    "object_ids": "objectIdFilters",
+    "keyword": "keywordFilter",
+    "service": "serviceFilter",
+}
+
+
+def _audit_error(e: Exception, submitting: bool) -> dict:
+    """An audit search error in the shared shape: missing_permission on a 403, rate_limited on a 429."""
+    out: dict = {"error": str(e)}
+    if isinstance(e, ApiPermissionError):
+        out["missing_permission"] = _AUDIT_QUERY_PERMISSION
+    elif isinstance(e, ApiError) and e.status_code == 429:
+        out["error"] = (
+            "Graph refused the audit search with 429: the tenant's audit search limits "
+            "(searches submitted per day, or searches running at once) are reached; try again later"
+            if submitting
+            else "Graph throttled reading the audit search (429); the search itself is unaffected, call again later"
+        )
+        out["rate_limited"] = True
+        out["retry_after_seconds"] = e.retry_after
+    return out
+
+
+def _audit_query_entry(q: dict) -> dict:
+    def texts(key: str) -> list[str]:
+        return [t for t in (_audit_text(v) for v in _str_list(q.get(key))[:_AUDIT_FILTER_LIMIT]) if t]
+
+    return {
+        "display_name": _audit_text(q.get("displayName")),
+        "status": _str(q.get("status")),
+        "window_start": _str(q.get("filterStartDateTime")),
+        "window_end": _str(q.get("filterEndDateTime")),
+        "users": texts("userPrincipalNameFilters"),
+        "record_types": texts("recordTypeFilters"),
+        "operations": texts("operationFilters"),
+        "ip_addresses": texts("ipAddressFilters"),
+        "object_ids": texts("objectIdFilters"),
+        "keyword": _audit_text(q.get("keywordFilter")),
+        "service": _audit_text(q.get("serviceFilter")),
+    }
+
+
+def _audit_data(value: Any) -> dict:
+    """``auditData`` as a dict: Graph documents an object, but a JSON string is accepted too."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, RecursionError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _audit_ip(value: Any) -> str | None:
+    """A client IP in canonical form; Exchange writes ``1.2.3.4:port`` or ``[v6]:port``. Unparsable: cut text."""
+    text = _str(value)
+    if text is None:
+        return None
+    text = text.strip()
+    candidates = [text]
+    if text.startswith("[") and "]" in text:
+        candidates.append(text[1 : text.index("]")])
+    elif text.count(":") == 1:
+        candidates.append(text.split(":", 1)[0])
+    for candidate in candidates:
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return _audit_text(text, 64)
+
+
+def _audit_details(data: dict, has_object_id: bool) -> dict:
+    details: dict[str, Any] = {}
+    for key in _AUDIT_DATA_KEYS:
+        if key == "ObjectId" and has_object_id:
+            continue
+        value = data.get(key)
+        if isinstance(value, int):
+            details[key] = value
+        elif isinstance(value, str) and value:
+            details[key] = _audit_text(value)
+    parameters = data.get("Parameters")
+    if isinstance(parameters, list):
+        names = [_audit_text(_dict(p).get("Name"), 64) for p in parameters]
+        names = [n for n in names if n]
+        if names:
+            details["ParameterNames"] = names[:_AUDIT_PARAMETER_NAMES_LIMIT]
+    return details
+
+
+def _audit_record(r: dict) -> dict:
+    data = _audit_data(r.get("auditData"))
+    object_id = _audit_text(r.get("objectId"))
+    return {
+        "id": _audit_text(r.get("id"), 64),
+        "time": _str(r.get("createdDateTime")),
+        "operation": _audit_text(r.get("operation")),
+        "service": _audit_text(r.get("service")),
+        "record_type": _audit_text(r.get("auditLogRecordType")),
+        "user": _audit_text(r.get("userPrincipalName")),
+        "user_id": _audit_text(r.get("userId"), 64),
+        "client_ip": _audit_ip(r.get("clientIp") or data.get("ClientIP") or data.get("ClientIPAddress")),
+        "object_id": object_id,
+        "details": _audit_details(data, object_id is not None),
+    }
+
+
+def _audit_counts(counter: collections.Counter, key: str) -> list[dict]:
+    return [{key: k, "count": n} for k, n in counter.most_common(_AUDIT_SUMMARY_LIMIT)]
+
+
+def _audit_summary(records: list[dict], capped: bool) -> dict:
+    operations: collections.Counter = collections.Counter()
+    services: collections.Counter = collections.Counter()
+    record_types: collections.Counter = collections.Counter()
+    users: collections.Counter = collections.Counter()
+    ips: dict[str, dict] = {}
+    span = {"first": None, "last": None}
+    for r in records:
+        operations[r["operation"] or "(none)"] += 1
+        services[r["service"] or "(none)"] += 1
+        record_types[r["record_type"] or "(none)"] += 1
+        if r["user"]:
+            users[r["user"]] += 1
+        when = r["time"] or ""
+        _widen(span, when)
+        ip = r["client_ip"]
+        if ip:
+            entry = ips.setdefault(ip, {"client_ip": ip, "count": 0, "first": None, "last": None})
+            entry["count"] += 1
+            _widen(entry, when)
+    by_ip = sorted(ips.values(), key=lambda e: (-e["count"], e["client_ip"]))[:_AUDIT_SUMMARY_LIMIT]
+    return {
+        "total_records": len(records),
+        "capped": capped,
+        "first_seen": span["first"],
+        "last_seen": span["last"],
+        "distinct": {
+            "operations": len(operations),
+            "services": len(services),
+            "record_types": len(record_types),
+            "users": len(users),
+            "client_ips": len(ips),
+        },
+        "by_operation": _audit_counts(operations, "operation"),
+        "by_service": _audit_counts(services, "service"),
+        "by_record_type": _audit_counts(record_types, "record_type"),
+        "by_user": _audit_counts(users, "user"),
+        "by_client_ip": [
+            {"client_ip": e["client_ip"], "count": e["count"], "first_seen": e["first"], "last_seen": e["last"]}
+            for e in by_ip
+        ],
+    }
+
+
+@mcp.tool()
+@_with_call_deadline
+@_tenant_scoped(user_arg="user", conflict="refuse", unclaimed="fallback")
+def audit_log_search_start(
+    user: str | None = None,
+    hours: int = _AUDIT_DEFAULT_HOURS,
+    start: str | None = None,
+    end: str | None = None,
+    record_types: list[str] | None = None,
+    operations: list[str] | None = None,
+    ip_addresses: list[str] | None = None,
+    keyword: str | None = None,
+    service: str | None = None,
+    object_ids: list[str] | None = None,
+    tenant: str | None = None,
+) -> dict:
+    """Start a Microsoft Purview audit log search: what was done in OneDrive/SharePoint, Exchange, Entra.
+
+    The follow-up to a confirmed takeover: the sign-in log shows which
+    resources a session obtained tokens for, this shows what it then did (files
+    opened or downloaded, mailbox rules and cmdlets, directory changes). A
+    search runs asynchronously in Microsoft 365 and usually takes several
+    minutes, so this only submits it (Graph ``POST /security/auditLog/queries``)
+    and returns ``query_id``; call ``audit_log_search_result`` with that id (and
+    the same ``tenant``) until ``done`` is true.
+
+    The call creates a saved audit search object in the tenant (listed in the
+    Purview audit search page); it changes no directory, mailbox or file data.
+    Each call counts against the tenant's audit search limits (searches per
+    day, searches running at once): a 429 comes back as ``rate_limited: true``
+    and is not retried. At least one filter besides the window is required, so
+    a call never searches the whole tenant's log. The filters combine with AND.
+
+    Needs the application permission ``AuditLogsQuery.Read.All``, or the
+    service-scoped ``AuditLogsQuery-OneDrive.Read.All`` /
+    ``-SharePoint.Read.All`` / ``-Exchange.Read.All`` / ``-Entra.Read.All``
+    (then set ``service`` to match). A 403 returns ``missing_permission``.
+    ``created`` is true, false (nothing was created), or null (the answer was
+    lost; a search may exist anyway).
+
+    Args:
+        user: Only records of this userPrincipalName.
+        hours: How far back from ``end`` (or now) to search, clamped to [1, 4320] (180 days). Ignored with ``start``.
+        start: Window start, ISO 8601 with an offset (e.g. 2026-10-21T22:00:00+09:00).
+        end: Window end, ISO 8601 with an offset (default: now).
+        record_types: auditLogRecordType values, e.g. ["sharePointFileOperation", "exchangeItem"].
+        operations: Operation names, e.g. ["FileDownloaded", "New-InboxRule", "MailItemsAccessed"].
+        ip_addresses: Client IPv4/IPv6 addresses.
+        keyword: Free-text keyword matched anywhere in the record (at most 256 characters).
+        service: One workload, e.g. "Exchange", "SharePoint", "OneDrive", "AzureActiveDirectory".
+        object_ids: Object ids, e.g. a file URL or a mailbox item id.
+        tenant: Tenant to search: a [tenant.<name>] section name, one of its domains or its tenant id
+            (default: the tenant claiming the user's domain, else the default tenant).
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        window_start, window_end = _audit_window(start, end, hours, now)
+        filters = _audit_filters(user, record_types, operations, ip_addresses, keyword, service, object_ids)
+    except (ValueError, TypeError, AttributeError) as e:
+        return {"created": False, "error": str(e)}
+    if not filters:
+        return {
+            "created": False,
+            "error": "give at least one filter (user, record_types, operations, ip_addresses, keyword, service or "
+            "object_ids); a window-only search would read the whole tenant's audit log",
+        }
+
+    payload: dict[str, Any] = {
+        "@odata.type": "#microsoft.graph.security.auditLogQuery",
+        "displayName": f"entraadm-mcp {_utc_text(now)}",
+        "filterStartDateTime": _utc_text(window_start),
+        "filterEndDateTime": _utc_text(window_end),
+    }
+    if "user" in filters:
+        payload["userPrincipalNameFilters"] = [filters["user"]]
+    for arg, field in _AUDIT_BODY_FIELDS.items():
+        if arg in filters:
+            payload[field] = filters[arg]
+    base = {
+        "created": False,
+        "query_id": None,
+        "status": None,
+        "display_name": payload["displayName"],
+        "window_start": payload["filterStartDateTime"],
+        "window_end": payload["filterEndDateTime"],
+        "filters": filters,
+    }
+
+    try:
+        client = _client()
+        body = client.post_json(_AUDIT_QUERIES_PATH, payload, deadline=_current_deadline())
+    except ConfigError as e:
+        return {**base, "error": str(e)}
+    except ApiError as e:
+        out = {**base, **_audit_error(e, submitting=True)}
+        if e.may_have_applied:
+            out["created"] = None
+            out["error"] += "; the search may have been created anyway (not retried)"
+        return out
+    query_id = _str(body.get("id"))
+    if query_id is None or not _GUID_RE.match(query_id):
+        return {**base, "created": None, "error": "Graph's answer carried no usable query id"}
+    out = {
+        **base,
+        "created": True,
+        "query_id": query_id,
+        "status": _str(body.get("status")),
+        "next": "call audit_log_search_result with this query_id (and the same tenant) until done is true",
+    }
+    if window_start < now - datetime.timedelta(days=_AUDIT_STANDARD_RETENTION_DAYS):
+        out["note"] = (
+            f"the window starts more than {_AUDIT_STANDARD_RETENTION_DAYS} days ago; Audit (Standard) keeps "
+            f"{_AUDIT_STANDARD_RETENTION_DAYS} days, so older records exist only under Audit (Premium) retention"
+        )
+    return out
+
+
+@mcp.tool()
+@_with_call_deadline
+@_tenant_scoped()
+def audit_log_search_result(
+    query_id: str,
+    top: int = _AUDIT_DEFAULT_TOP,
+    max_pages: int | None = None,
+    tenant: str | None = None,
+) -> dict:
+    """Status and, once finished, the summarised records of an audit search started by audit_log_search_start.
+
+    Reads Graph ``GET /security/auditLog/queries/{id}``. While ``status`` is
+    ``notStarted`` or ``running`` the answer is the status only (``done:
+    false``); call again in a minute or two. ``failed``, ``cancelled`` and any
+    status this server does not know are ``done: true`` with an ``error``. Once ``succeeded``, the records are paged
+    (``/records``) and come back as:
+
+    - ``summary``: ``total_records``, ``first_seen``/``last_seen``, counts by
+      operation, service, record type and user, and per client IP the count with
+      first/last seen (top 25 of each list; ``distinct`` has the full counts);
+    - ``records``: the newest ``top`` records, each with time, operation,
+      service, record type, user, client IP, object id and a few ``details``
+      from ``auditData`` (client IP, user agent, result status, site URL, file
+      name, the names of cmdlet parameters -- never their values), every string
+      cut to 200 characters. The full ``auditData`` is not returned.
+
+    ``capped=true`` means the page budget or the deadline ran out before every
+    record was read, so the counts are lower bounds; call again with a larger
+    ``max_pages``. ``records_truncated`` means more records were read than
+    ``top`` returns (the summary counts them all). An unknown id is ``found:
+    false``: a search exists only in the tenant that created it, so pass the
+    ``tenant`` its start call used. Permissions as audit_log_search_start; a
+    403 returns ``missing_permission``.
+
+    Args:
+        query_id: The ``query_id`` returned by audit_log_search_start (a GUID).
+        top: Maximum records to return, clamped to [1, 500].
+        max_pages: Page budget for the records (default: ENTRAADM_MAX_PAGES_DEFAULT).
+        tenant: Tenant the search was started in: a [tenant.<name>] section name, one of its domains or its
+            tenant id (default: the default tenant).
+    """
+    query_id = query_id.strip() if isinstance(query_id, str) else ""
+    if not _GUID_RE.match(query_id):
+        return {"error": "query_id must be the GUID returned by audit_log_search_start"}
+    top = _clamp_top(top)
+    pages = _resolve_max_pages(max_pages)
+    deadline = _current_deadline()
+    try:
+        client = _client()
+        query = client.get(f"{_AUDIT_QUERIES_PATH}/{query_id}", deadline=deadline)
+    except ConfigError as e:
+        return {"query_id": query_id, "error": str(e)}
+    except ApiError as e:
+        if not isinstance(e, ApiPermissionError) and e.status_code == 404:
+            return {
+                "found": False,
+                "query_id": query_id,
+                "note": "no such audit search in this tenant (a search exists only in the tenant that created it)",
+            }
+        return {"query_id": query_id, **_audit_error(e, submitting=False)}
+
+    status = _str(query.get("status"))
+    out: dict[str, Any] = {
+        "found": True,
+        "query_id": query_id,
+        "status": status,
+        "done": status not in _AUDIT_PENDING_STATUSES,
+        "query": _audit_query_entry(query),
+    }
+    if status in _AUDIT_PENDING_STATUSES:
+        return {**out, "next": "the search is still running; call again in a minute or two"}
+    if status != "succeeded":
+        if status in _AUDIT_DONE_STATUSES:
+            return {**out, "error": f"the audit search ended with status {status}; start a new one"}
+        return {**out, "error": f"unrecognised status {status!r}; nothing was read, start a new search"}
+
+    try:
+        raw, capped = client.get_paged(f"{_AUDIT_QUERIES_PATH}/{query_id}/records", max_pages=pages, deadline=deadline)
+    except ApiError as e:
+        return {**out, **_audit_error(e, submitting=False)}
+    records = [_audit_record(r) for r in raw if isinstance(r, dict)]
+    records.sort(key=lambda r: (r["time"] is not None, _ts(r["time"] or "")), reverse=True)
+    return {
+        **out,
+        "capped": capped,
+        "summary": _audit_summary(records, capped),
+        "count": min(len(records), top),
+        "records_truncated": len(records) > top,
+        "records": records[:top],
+    }
 
 
 # ---------------------------------------------------------------------------

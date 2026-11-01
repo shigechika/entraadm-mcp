@@ -34,6 +34,7 @@ keycloak-mcp の `KEYCLOAK_SITES_INI` と同じ（拠点ごとに 1 セクショ
 | `signin_logs`、`signin_failure_stats`、`signin_success_stats`、`compromise_suspects`、`signin_by_ip`、`directory_audits`、`get_user` の `sign_in_activity` フィールド | `AuditLog.Read.All`（app-only）または **Reports Reader** ディレクトリロール（delegated） |
 | `get_user_auth_methods` | `UserAuthenticationMethod.Read.All`（app-only 専用） |
 | `m365_service_health`、`daily_brief` の `service_health` セクション | `ServiceHealth.Read.All`（delegated 認証ではサービス正常性を読める Entra ロール——Service Support Administrator や Global Reader 等——も必要） |
+| `audit_log_search_start`、`audit_log_search_result` | `AuditLogsQuery.Read.All`, or the service-scoped `AuditLogsQuery-OneDrive.Read.All` / `AuditLogsQuery-SharePoint.Read.All` / `AuditLogsQuery-Exchange.Read.All` / `AuditLogsQuery-Entra.Read.All`（アプリケーション権限。任意。サービス別の権限だけなら，それに合う `service` を渡す） |
 | `compromise_suspects` の `microsoft_risky_users`、`identity_protection` の確認 | `IdentityRiskyUser.Read.All`（任意。Identity Protection には Entra ID P2 が要り，無ければ確認は `not_licensed`） |
 | `revoke_sign_in_sessions`（オプトイン、`ENTRAADM_ENABLE_REVOKE_SESSIONS=1`） | `User.RevokeSessions.All`（app-only）または User Administrator／Helpdesk Administrator ディレクトリロール（delegated。管理者アカウントが対象なら Privileged Authentication Administrator）。書き込みの権限なので、このツールを有効にする配備にだけ付与する。先に行う照会には `User.Read.All` が要る |
 
@@ -57,7 +58,8 @@ README の「複数のテナント」を参照。UPN を取るツールは UPN �
 できない。テナント全体を見るツールは `tenant`（節の名前・ドメイン・テナント ID。env だけなら `default`
 か env のテナント ID。省略で既定のテナント）を取る。`directory_audits` は，ほかのテナントの `user` と
 食い違う `tenant` を拒否し，どこも持たない `user` は指定か既定のテナントで探す
-（`user_domain_claimed: false`）。`health_check`／`daily_brief` は最上位に既定のテナントのキーを残し，
+（`user_domain_claimed: false`）。`audit_log_search_start` も同じ順でテナントを選び，`audit_log_search_result`
+には開始時と同じ `tenant` を渡す。`health_check`／`daily_brief` は最上位に既定のテナントのキーを残し，
 `tenant` と `tenants` を足し，時間予算をテナントで均等に分ける（`ENTRAADM_DEADLINE=0` なら無制限）。
 ARM のツールは既定のテナントだけ。テナントのファイルを使うと結果には必ず `tenant` が付く。
 
@@ -283,6 +285,48 @@ VM の ARM id で結合する（大文字小文字は区別しない）。VM ご
 `open_incidents`、`open_advisories`、`capped`（どちらもページングするので、途中で切れた数は下限）。各セクションは
 `{"error", "missing_permission": "ServiceHealth.Read.All"}` に個別に劣化する。メッセージセンター
 （`messages`）は別の権限が要るので読まない。
+
+### `audit_log_search_start(user=None, hours=24, start=None, end=None, record_types=None, operations=None, ip_addresses=None, keyword=None, service=None, object_ids=None, tenant=None)`
+
+Microsoft Purview の監査ログ検索を投入し（Graph `POST /security/auditLog/queries`），`query_id` を返す。
+検索は Microsoft 365 側で数分かかるので，レコードは `audit_log_search_result` で受け取る。サインインの
+後にそのセッションが何をしたか（OneDrive/SharePoint のファイル操作，Exchange のメールボックス操作と
+コマンドレット，Entra のディレクトリ変更）に答える。窓は `end`（省略で現在）から `hours` さかのぼる
+（[1, 4320]＝180 日，Audit Standard の保持期間に丸める）か，オフセット付き ISO 8601 の `start`／`end`（未来の `end` は現在として扱う）。
+窓の幅は最大 180 日。180 日より前から始まる窓には `note` を付ける（それより古い記録は Audit Premium の保持でだけ残る）。フィルタ（AND で組み合わせる。全テナントのログを読まないよう 1 つ以上必須）:
+`user`（UPN），`record_types`（`sharePointFileOperation`・`exchangeItem` などの auditLogRecordType），
+`operations`（`FileDownloaded`・`New-InboxRule`・`MailItemsAccessed` など），`ip_addresses`，`keyword`，
+`service`（`Exchange`・`SharePoint`・`OneDrive`・`AzureActiveDirectory` など），`object_ids`。リストは
+最大 20 個で，送る前に形を確かめる。結果は `created`（作れたら true，何も作っていなければ false，
+応答が失われて検索ができているかもしれないときは null。再試行しない），`query_id`，`status`，
+`display_name`（`entraadm-mcp <UTC 時刻>`），`window_start`，`window_end`，送った `filters`。
+
+この呼び出しはテナントに保存済みの監査検索オブジェクトを作るが，ディレクトリ・メールボックス・
+ファイルのデータは変えないので，状態を変えるツールには数えない。呼ぶたびにテナントの監査検索の上限
+（1 日の投入数・同時実行数）を消費する。429 は `rate_limited: true` と `retry_after_seconds` で返し，
+再試行しない。403 は `missing_permission`。テナントは `directory_audits` と同じ順で選ぶ（`tenant`，
+無ければ `user` のドメインを持つテナント，無ければ既定）。スモークテストはこのツールを呼ばない。
+
+### `audit_log_search_result(query_id, top=50, max_pages=None, tenant=None)`
+
+`GET /security/auditLog/queries/{id}`：`found`・`query_id`・`status`・`done` と，検索自身のフィルタ
+（`query`）。`notStarted`／`running` の間は状態だけを返す（`done: false`）。`failed`／`cancelled` と，このサーバが
+知らない状態は `done: true` で `error` 付き。`succeeded` になったらレコード（`/records`）を `max_pages` と呼び出しの
+期限の範囲でページングし，次を返す:
+
+- `summary`：`total_records`，`first_seen`／`last_seen`，`distinct` の件数，`by_operation`・`by_service`・
+  `by_record_type`・`by_user`・`by_client_ip`（件数・`first_seen`・`last_seen`。Exchange がアドレスに
+  付けるポート番号は落とす）の上位 25
+- `records`：新しい方から `top` 件（既定 50，最大 500）。`id`・`time`・`operation`・`service`・
+  `record_type`・`user`・`user_id`・`client_ip`・`object_id` と `details`（`auditData` から `UserAgent`・`ClientInfoString`・`ResultStatus`・`LogonType`・`ApplicationId`・
+  `SiteUrl`・`SourceFileName`・`SourceRelativeUrl`，レコードに無いときだけ `ObjectId`，コマンドレットの
+  パラメータ名だけの `ParameterNames`。値は返さない）。文字列はすべて 200 文字で切る。`auditData`
+  全体は返さない
+- `capped`（ページ予算か期限で打ち切った。件数は下限），`count`，`records_truncated`（`top` より多く
+  読んだ）
+
+`query_id` は GUID でなければならない（URL のパスに入るため）。そのテナントに無い ID は `found: false`。
+開始時と同じ `tenant` を渡す。403 は `missing_permission`，429 は `rate_limited: true`。
 
 ### `daily_brief(hours=24, max_pages=None, samples=10)`
 

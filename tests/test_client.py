@@ -6,6 +6,7 @@ GraphClient's real ``httpx.Client(base_url=GRAPH_BASE)`` (built when no
 a custom client through the constructor for these tests.
 """
 
+import json
 import time
 from collections import namedtuple
 
@@ -894,3 +895,104 @@ def test_bounded_request_deadline_while_reading_may_have_applied(monkeypatch):
     with pytest.raises(ApiDeadline) as info:
         client.post(_REVOKE_PATH, deadline=time.monotonic() + 5)
     assert info.value.may_have_applied is True
+
+
+# ---------------------------------------------------------------------------
+# post_json (creates an object: never re-sent once it may have arrived)
+# ---------------------------------------------------------------------------
+
+_QUERIES_PATH = "/security/auditLog/queries"
+_QUERIES_URL = f"{GRAPH_BASE}{_QUERIES_PATH}"
+
+
+@respx.mock
+def test_post_json_sends_the_body_as_json_and_parses_a_201(monkeypatch):
+    route = respx.post(_QUERIES_URL).mock(return_value=httpx.Response(201, json={"id": "q-1", "status": "notStarted"}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    assert client.post_json(_QUERIES_PATH, {"displayName": "x", "operationFilters": ["FileDownloaded"]}) == {
+        "id": "q-1",
+        "status": "notStarted",
+    }
+    request = route.calls.last.request
+    assert request.headers["Authorization"] == "Bearer tok"
+    assert request.headers["Content-Type"] == "application/json"
+    assert json.loads(request.content) == {"displayName": "x", "operationFilters": ["FileDownloaded"]}
+
+
+@respx.mock
+def test_post_json_sends_the_body_under_a_deadline_too(monkeypatch):
+    route = respx.post(_QUERIES_URL).mock(return_value=httpx.Response(201, json={"id": "q-1"}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    client.post_json(_QUERIES_PATH, {"keywordFilter": "k"}, deadline=time.monotonic() + 30)
+    assert route.calls.last.request.content == b'{"keywordFilter":"k"}'
+
+
+@respx.mock
+def test_post_json_403_is_a_permission_error_that_was_not_applied(monkeypatch):
+    respx.post(_QUERIES_URL).mock(
+        return_value=httpx.Response(403, json={"error": {"code": "Forbidden", "message": "Missing role"}})
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiPermissionError) as info:
+        client.post_json(_QUERIES_PATH, {})
+    assert info.value.may_have_applied is False and info.value.status_code == 403
+
+
+@respx.mock
+def test_post_json_429_is_not_retried_and_carries_retry_after(monkeypatch, no_sleep):
+    route = respx.post(_QUERIES_URL).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "30"}, json={"error": {"message": "Too many"}})
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiError) as info:
+        client.post_json(_QUERIES_PATH, {})
+    assert route.call_count == 1
+    assert info.value.status_code == 429 and info.value.retry_after == 30.0
+    assert info.value.may_have_applied is False
+
+
+@respx.mock
+def test_post_json_429_without_retry_after_leaves_it_unset(monkeypatch):
+    respx.post(_QUERIES_URL).mock(return_value=httpx.Response(429))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiError) as info:
+        client.post_json(_QUERIES_PATH, {})
+    assert info.value.status_code == 429 and info.value.retry_after is None
+
+
+@respx.mock
+def test_post_json_5xx_is_not_retried_and_may_have_applied(monkeypatch, no_sleep):
+    route = respx.post(_QUERIES_URL).mock(return_value=httpx.Response(503))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiServerError) as info:
+        client.post_json(_QUERIES_PATH, {})
+    assert route.call_count == 1
+    assert info.value.may_have_applied is True and info.value.status_code == 503
+
+
+@respx.mock
+def test_post_json_lost_response_is_not_retried_and_may_have_applied(monkeypatch, no_sleep):
+    route = respx.post(_QUERIES_URL).mock(side_effect=httpx.ReadError("response lost"))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiTransportError) as info:
+        client.post_json(_QUERIES_PATH, {})
+    assert route.call_count == 1 and info.value.may_have_applied is True
+
+
+@respx.mock
+def test_post_json_retries_a_connect_failure_that_never_left_this_host(monkeypatch, no_sleep):
+    route = respx.post(_QUERIES_URL).mock(
+        side_effect=[httpx.ConnectError("refused"), httpx.Response(201, json={"id": "q-1"})]
+    )
+    client, _cred = _client(monkeypatch=monkeypatch)
+    assert client.post_json(_QUERIES_PATH, {}) == {"id": "q-1"}
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_get_errors_carry_the_status_code(monkeypatch):
+    respx.get(f"{GRAPH_BASE}/organization").mock(return_value=httpx.Response(404, json={"error": {"message": "no"}}))
+    client, _cred = _client(monkeypatch=monkeypatch)
+    with pytest.raises(ApiError) as info:
+        client.get("/organization")
+    assert info.value.status_code == 404

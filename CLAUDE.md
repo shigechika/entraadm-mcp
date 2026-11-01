@@ -4,7 +4,8 @@
 
 MCP server for Microsoft Entra ID (Azure AD) sign-in and audit-log triage,
 plus Azure VM backup posture (Azure Resource Manager) and Microsoft 365
-service health. Transport is stdio only. The 15 default tools are read-only;
+service health. Transport is stdio only. The 17 default tools are read-only
+(`audit_log_search_start` creates only the saved audit search it then reads);
 one state-changing tool, `revoke_sign_in_sessions`, is registered only when
 `ENTRAADM_ENABLE_REVOKE_SESSIONS=1` (see Conventions). Auth is env-var driven
 for one tenant; the optional `ENTRAADM_CONFIG` INI file (`[tenant.<name>]`
@@ -76,7 +77,7 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   from the retention edge. ApiAuthError / ApiPermissionError are not retried
   and stop the tenant (`error`); one tenant's ValueError/OSError does not stop
   the others and the summary always prints.
-- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 15 tools (16 with the opt-in revoke).
+- `entraadm_mcp/server.py` — `MCPServer("entraadm-mcp")` with 17 tools (18 with the opt-in revoke).
   `AADSTS_CODES` is a hand-maintained dict (not exhaustive) annotating
   sign-in failure codes; missing codes return `meaning: null`, never hidden.
   `_state = {"client": None, "arm": None}` holds the two test-injection
@@ -198,6 +199,17 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   {available: false, reason}`) and never read as "no risky users"; it never
   changes `status` or the existing counts. The tests' `FakeGraphClient`
   answers riskyUsers with "not licensed" by default, like the real tenants.
+- **Audit log search is start/result, and the start is not a write.**
+  `audit_log_search_start` POSTs `/security/auditLog/queries` through
+  `post_json` (never re-sent; `created: null` when the answer was lost) and
+  needs at least one filter besides the window. The saved search changes no
+  tenant data, so it is not in `STATE_CHANGING`, but the smoke test skips it
+  (it spends the tenant's daily audit search quota); `audit_log_search_result`
+  is probed with a random GUID (`found: false`, a 404). A 429 is told apart by
+  `ApiError.status_code` (`rate_limited: true`, `retry_after` from the header),
+  never matched in the message text. Records come back trimmed: chosen
+  `auditData` keys only (`_AUDIT_DATA_KEYS`, `Parameters` as names), every
+  string cut to `_AUDIT_TEXT_CHARS`; the full `auditData` never leaves the tool.
 - `daily_brief` carries `m365_service_health` and not VM backup. Service
   health is two small reads and runs first; the ARM fan-out is the one scan
   that could exhaust the shared budget, so callers invoke `vm_backup_status`
@@ -242,7 +254,9 @@ uv run python scripts/smoke_test.py   # live smoke test against a real tenant
   account through `_find_user_checked` ($filter, never path; the one place the
   id is checked to be a GUID) and interpolates only that id; a guest is
   refused. `GraphClient.post()` retries like `get()`, so it is for idempotent,
-  body-less actions only. Every return has the same keys; `revoked` is `null`
+  body-less actions only. `post_json()` is the non-idempotent POST (it creates
+  an object): sent again only after a failed connect; a 429, a 5xx or a lost
+  response is raised at once. Every return has the same keys; `revoked` is `null`
   exactly when the raised error has `may_have_applied` (or the success body
   had no boolean), `false` for every path that sent nothing or got a 4xx. A
   403 names the permission for the auth mode (`client.mode`).
