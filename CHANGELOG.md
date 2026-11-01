@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.0](https://github.com/shigechika/entraadm-mcp/compare/v1.9.0...v1.10.0) (2026-11-01)
+
+
+### Features
+
+* search the Purview audit log via the Graph audit log query API ([#39](https://github.com/shigechika/entraadm-mcp/issues/39)) ([6db98e7](https://github.com/shigechika/entraadm-mcp/commit/6db98e74e36c44c323859a9d997fcbefd75f473d))
+
 ## [1.9.0](https://github.com/shigechika/entraadm-mcp/compare/v1.8.1...v1.9.0) (2026-10-31)
 
 
