@@ -226,7 +226,7 @@ def _with_call_deadline(fn):
 
 
 def _since(hours: int) -> str:
-    dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
+    dt = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=hours)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -2530,7 +2530,7 @@ def vm_backup_status(
     if not_found is not None:
         return not_found
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     entries: list[dict] = []
     skipped: list[dict] = []
     raw_vms: dict[str, list[dict]] = {}
@@ -2842,7 +2842,7 @@ _VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _RESOURCE_GROUP_RE = re.compile(r"^(?!\.+$)[\w.()\-]{1,90}(?<!\.)$")
 #: A minute-precision timestamp with an offset; the seconds are added before parsing.
 _ISO_MINUTES_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$")
-_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.UTC)
 
 
 def _parse_window_time(value: str, label: str) -> datetime.datetime:
@@ -2891,7 +2891,7 @@ def _activity_window(
 
 
 def _utc_text(dt: datetime.datetime) -> str:
-    return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.astimezone(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _value(field: Any) -> str | None:
@@ -3078,7 +3078,7 @@ def vm_activity(
     if resource_group is not None and not _RESOURCE_GROUP_RE.match(resource_group.strip()):
         return {"error": "resource_group is not a valid resource group name"}
     rg_name = resource_group.strip() if resource_group is not None else None
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     try:
         start_dt, end_dt = _activity_window(start, end, hours, now)
     except ValueError as e:
@@ -3660,7 +3660,7 @@ def audit_log_search_start(
         tenant: Tenant to search: a [tenant.<name>] section name, one of its domains or its tenant id
             (default: the tenant claiming the user's domain, else the default tenant).
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     try:
         window_start, window_end = _audit_window(start, end, hours, now)
         filters = _audit_filters(user, record_types, operations, ip_addresses, keyword, service, object_ids)
@@ -4152,7 +4152,7 @@ def revoke_sign_in_sessions(upn: str) -> dict:
     if user.get("userType") == "Guest":
         return {**result, "error": "refusing a guest account; nothing was sent"}
 
-    result["at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result["at"] = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         body = client.post(f"/users/{user['id']}/revokeSignInSessions", deadline=_current_deadline())
     except GraphError as e:

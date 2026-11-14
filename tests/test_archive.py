@@ -13,7 +13,7 @@ import pytest
 from entraadm_mcp.archive import archive_tenant, slot_starts
 from entraadm_mcp.client import ApiError
 
-UTC = datetime.timezone.utc
+UTC = datetime.UTC
 NOW = datetime.datetime(2026, 8, 21, 7, 30, tzinfo=UTC)
 
 

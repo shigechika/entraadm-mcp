@@ -1307,7 +1307,7 @@ def _policies_path(sub, name="vault1", rg="rg1"):
 def frozen_now(monkeypatch):
     import datetime as dt
 
-    fixed = dt.datetime(2026, 10, 16, 8, 0, tzinfo=dt.timezone.utc)
+    fixed = dt.datetime(2026, 10, 16, 8, 0, tzinfo=dt.UTC)
 
     class FrozenDateTime(dt.datetime):
         @classmethod
@@ -1774,12 +1774,10 @@ def test_vm_backup_status_tolerates_null_and_wrong_typed_fields(inject, inject_a
 def test_parse_iso_handles_fractions_offsets_and_garbage():
     import datetime as dt
 
-    assert server._parse_iso("2026-10-15T08:29:28.08Z") == dt.datetime(
-        2026, 10, 15, 8, 29, 28, 80000, tzinfo=dt.timezone.utc
-    )
+    assert server._parse_iso("2026-10-15T08:29:28.08Z") == dt.datetime(2026, 10, 15, 8, 29, 28, 80000, tzinfo=dt.UTC)
     assert server._parse_iso("2026-10-15T08:29:28.1234567Z").microsecond == 123456
     assert server._parse_iso("2026-10-15T08:29:28+09:00").utcoffset() == dt.timedelta(hours=9)
-    assert server._parse_iso("2026-10-15T08:29:28").tzinfo == dt.timezone.utc
+    assert server._parse_iso("2026-10-15T08:29:28").tzinfo == dt.UTC
     for bad in (None, 5, "", "yesterday", "2026-13-45T99:99:99Z", "2026-10-15"):
         assert server._parse_iso(bad) is None
 
@@ -3482,7 +3480,7 @@ def test_three_countries_spread_over_days_stay_medium(inject, home_jp):
 
 
 def test_multi_country_window_is_exactly_24_hours():
-    t0 = datetime.datetime(2026, 8, 21, tzinfo=datetime.timezone.utc)
+    t0 = datetime.datetime(2026, 8, 21, tzinfo=datetime.UTC)
     seen = [(t0, "FR"), (t0 + datetime.timedelta(hours=12), "DE")]
     assert server._multi_country(seen + [(t0 + datetime.timedelta(hours=24), "IT")]) is True
     assert server._multi_country(seen + [(t0 + datetime.timedelta(hours=24, seconds=1), "IT")]) is False

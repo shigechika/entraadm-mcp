@@ -53,7 +53,7 @@ RETRY_WAIT_SECONDS = 30
 def slot_starts(now: datetime.datetime, days: int, slot_hours: int) -> list[datetime.datetime]:
     """Starts of the slots that have ended, from ``days`` before ``now`` (aligned up) to the last full one."""
     step = datetime.timedelta(hours=slot_hours)
-    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
     first = now - datetime.timedelta(days=days)
     start = epoch + -((epoch - first) // step) * step
     out = []
