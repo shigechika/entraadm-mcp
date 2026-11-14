@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.0](https://github.com/shigechika/entraadm-mcp/compare/v1.10.1...v1.11.0) (2026-11-14)
+
+
+### Features
+
+* drop Python 3.10 (EOL) and add Python 3.15 support ([#44](https://github.com/shigechika/entraadm-mcp/issues/44)) ([2e08813](https://github.com/shigechika/entraadm-mcp/commit/2e08813caf6643c7f28bf7ca7ac18613a58873bc))
+
 ## [1.10.1](https://github.com/shigechika/entraadm-mcp/compare/v1.10.0...v1.10.1) (2026-11-01)
 
 
