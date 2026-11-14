@@ -81,7 +81,7 @@ def _archive_signins(argv: list[str]) -> int:
     if unknown:
         print(f"entraadm-mcp: unknown tenant(s): {', '.join(unknown)}", file=sys.stderr)
         return 2
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     summary = {}
     if not 1 <= args.days <= MAX_DAYS:
         print(f"entraadm-mcp: --days must be 1-{MAX_DAYS}", file=sys.stderr)

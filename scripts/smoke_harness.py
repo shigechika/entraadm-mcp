@@ -434,10 +434,7 @@ async def run_probes(
             args = resolve_tokens(args, reference, today)
             try:
                 payload = await asyncio.wait_for(call(name, args), timeout=probe.timeout)
-            # Both spellings: on Python 3.10 asyncio.TimeoutError is
-            # concurrent.futures.TimeoutError, NOT the builtin, so catching the
-            # builtin alone silently reports timeouts as generic failures there.
-            except (asyncio.TimeoutError, TimeoutError):
+            except TimeoutError:
                 return Result(
                     name, "FAIL", f"timed out after {probe.timeout:g}s", time.monotonic() - started
                 )

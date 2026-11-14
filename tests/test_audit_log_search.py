@@ -427,7 +427,7 @@ def test_result_429_is_rate_limited(graph):
 @respx.mock
 def test_start_future_end_keeps_the_full_lookback(graph):
     route = respx.post(QUERIES_URL).mock(return_value=_created())
-    future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=10)).isoformat()
+    future = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=10)).isoformat()
     out = server.audit_log_search_start(user="someone@example.edu", hours=24, end=future)
     assert out["created"] is True
     sent = _sent(route)
@@ -439,8 +439,8 @@ def test_start_future_end_keeps_the_full_lookback(graph):
 @respx.mock
 def test_start_window_past_standard_retention_carries_a_note(graph):
     respx.post(QUERIES_URL).mock(return_value=_created())
-    start = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=200)).isoformat()
-    end = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=190)).isoformat()
+    start = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=200)).isoformat()
+    end = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=190)).isoformat()
     out = server.audit_log_search_start(user="someone@example.edu", start=start, end=end)
     assert out["created"] is True and "Audit (Premium)" in out["note"]
 
